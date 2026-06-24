@@ -1,0 +1,42 @@
+name: Deploy Release
+
+on:
+  push:
+    branches: ['main']
+    paths: ['UnofficialPatch/UnofficialPatch.ddmod']
+  workflow_dispatch:
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      deploy_release: ${{ steps.deploy_release.outputs.deploy_release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: version
+        run: echo "version=$(jq -r .version UnofficialPatch/UnofficialPatch.ddmod)" >> $GITHUB_OUTPUT
+      - id: deploy_release
+        run: git show-ref --tags --verify --quiet -- "refs/tags/${{ steps.version.outputs.version }}" || echo "deploy_release=true" >> $GITHUB_OUTPUT
+
+  deploy:
+    needs: check-version
+    runs-on: ubuntu-latest
+    if: contains(needs.check-version.outputs.deploy_release, 'true')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Zip Release
+        run: zip -r UnofficialPatch.zip UnofficialPatch
+      - name: Deploy Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ needs.check-version.outputs.version }}
+          tag_name: ${{ needs.check-version.outputs.version }}
+          prerelease: ${{ contains(needs.check-version.outputs.version, '-') }}
+          files: UnofficialPatch.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
