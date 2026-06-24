@@ -1,0 +1,137 @@
+v1.3.1 - GitHub & Cartography Assets Release
+- Added the ability to change level directly in the Level Settings Tool
+- Added the ability to clone a level with a right click in the Level Settings Tool (sets the correct level to clone in the popup)
+- Fixed missing textures appearing sometimes with terrain presets
+- Fixed colors made with Colour And Modify Things from uchideshi34 not being copied
+- Fixed a copy of a mix of assets and text not pasting the text at the correct place
+- Fixed walls being impossible to delete after a copy + undo + redo
+- Fixed menu closing when selecting a roof and changing its settings
+- Fixed potential softlock when pressing echap to close the terrain popup
+- Added pressing Echap to close the terrain popup on slots 9+ wihtout quitting the terrain tool
+- Fixed a vanilla bug that reorders assets in a multiselection
+- Fixed a vanilla bug that messes the selection if you alt tab while making a dragbox
+- Improved FPS count with grid ruler (CTRL + R) activated
+- Made the terrain circle brush and square brush sizes independant
+- Embedded the 9+ terrain slots' data in the map file instead of creating a separate file in the user folder
+- Compatibility with the mod version checker from _Lib
+
+v1.3.0
+
+New features:
+- Added slots 9-16 and 17-24 in the Terrain Tool (compatible with Additional Search Options)
+- Added a terrain preset option
+- Added a copy/paste option by sets of 8 terrain slots
+- Added Crop, Soft Crop, Edge Crop and Symmetry to the existing Free Transform modes (crop modes = only for objects)
+- Added a max opacity slider for the Crop modes so your cropped part can be half transparent
+- Added asset count and pack stats in the Map Gallery
+- Added an option to purge unused packs in the Map Gallery
+- Added an overlay option for objects instead of the default yellow hoverbox
+- Added an overlay option for patterns instead of the default outline
+- Added a way to find the most demanding sub-mods (press F10, wait a few seconds, press F10 again)
+- Added a filter floatbar in the selection tool (togglable in the vanilla floatbar)
+- Added Blending Modes for the Trace Image Tool
+- Added a way to keep a line stick to cardinal points when Snap is disabled (press CTRL while drawing). Works with paths, walls, patterns and roofs. Doesn't work in Edit Points mode and Snap To Grid mode.
+
+Changes and Improvements:
+- Masked paths and walls vanilla line on hover in Overlay mode
+- "Link Sliders" in the Compare Tool is now greyed out if there's only one reference layer
+- Major FPS improvement, especially in the Selection Tool and the Terrain Tool
+- Improved selection area and reduced selection conflicts in Free Transform mode
+- Improved compatibility with Rotate and Jiggle by adding a "Rotate 90°" button on right click on objects in the selection tool, fixing the auto rotate conflict which rotated the asset while the right click menu was displayed
+- Improved Eyedropper recognition when hovering paths and walls
+- Improved Wall overlay and selection
+- Improved the Eyedropper by also taking into account the layer of the asset
+
+Fixes:
+- Fixed a vanilla bug in which changing the layer of two objects on top of each other might cause the smallest one to be unselectable
+- Fixed an issue with the dropdown layer menu closing automatically in the selection tool
+- Fixed Shift + O (overlays) being activated in text boxes
+- Fixed new Trace Image not being enabled by default on saved maps
+- Fixed Compare Tool window not being displayed properly on 4K monitors
+- Fixed selection box handles not working over other assets (especially paths)
+- Fixed Paths Overlay not working correctly with modified paths via Color and Modify Things from uchideshi34
+- Fixed Free Transform not working on vanilla shadows
+- Fixed Free Transformed assets not rotating after a skew/distort/perspective transform
+- Fixed Reset Free Transform resetting to default asset size and rotation even if you had changed it without using FT
+- Fixed Eyedropper working over UI
+- Fixed any shoftcut containing the F key enabling Favorites
+
+
+v1.2.0
+- Improved selection of assets placed over paths (better than in 1.1.4)
+- Improved wall and path detection for the Pattern Bucket Tool
+- Fixed an issue with custom textures needing to be reselected to be applied correctly with the Pattern Bucket Tool
+- Added a Bucket Tool in the Terrain Tool
+- New layout for the Terrain Tool: 3 types of brushes/bucket are now displayed at the top with icon buttons
+- Fixed favorite badge not being displayed at the correct location on walls in the selection tool
+- Hovering a placed asset doesn't display the highlight box anymore if you're outside the canvas or in a menu (vanilla issue)
+- Improved No_Micro_Drag.gd way to snap to mimic the behavior of vanilla DD (snap after a small delay when the asset is not selected)
+- Optimized Map Gallery previews to show less padding around zoomed out maps (saving again is required to update)
+
+
+v1.1.4
+- Fixed paths being selected in Color Picker mode (especially with Color And Modify Things from uchideshi34)
+- Fixed selection of assets placed over paths
+- Fixed a slight issue with the object scaling slider
+- Fixed Eyedropper being activated in several text boxes (again)
+
+
+v1.1.3
+- Added a loading bar when autosaving after a dropped asset
+- Fixed an offset issue with Paste In Place happening after resizing or rotating the base asset
+- Fixed missing controls in the selection tool for Paths
+- Fixed a conflict between favoriting an asset while the favorite pack was loaded and having the "create custom pack from favorites" turned OFF
+- Reduced vanilla lag for large selections in the Scatter Tool library
+- Fixed Universal VTT export exporting as .png files
+- Small phrasing change in the Favorites Warning Popup introduced in v1.1.2
+- Added an Overlays button in the floatbar to quickly enable/disable walls and paths overlays (works also with Shift + O)
+- Added an option in the mod settings to hide or display the Guides button and/or the Overlays button in the floatboar
+
+
+v1.1.2
+- "Create Custom Pack From Favorites" is now turned off by default, you need to manually enable it if you need that option
+- Enabling that option will display a popup reminding the user the pack is strictly for personal use
+- Fixed the non working ON/OFF toggle for that option 
+
+
+v1.1.1
+- Fixed various lag issues (terrain tool, selection tool)
+- Fixed wrong portal position after free transform + wall rotation
+
+
+v1.1.0
+- Fixed asset cycling not working in the Scatter Tool
+- Fixed C closing the compare tool in text boxes and with Ctrl + C and other shortcuts
+- Rework of levels display in the Compare Tool to keep the ascending order as best as possible (might not fully work with lots of levels at once)
+- Added space to the Level Setting Tool down to the bottom of the window
+- Reduced/fixed lag caused by Preview Fix
+- Added an option in the Preferences (Interface tab) to choose the max size for asset preview (when you hover over a thumbnail)
+- Fixed the select tool's rotation slider not displaying the correct rotation of the asset but the rotation of the transform box
+- Fixed the select tool's rotation slider not working with ctrl + shift + z (1°)
+- Debug.json now has linebreaks 
+- Fixed offset snap errors
+- Fixed pattern name tooltip not appearing in the selection tool
+- Fixed wrong selection area for paths, especially with softness set to 0
+- Fixed cursor flickering when hovering over paths
+- Fixed splitting a path turning the smoothness to 0 on the second half
+- Fixed Pan lagging when an asset is selected? Maybe?
+- Fixed arcs ending looped shapes not working
+- Fixed missing segment on arcs ending looped walls
+- Fixed Ruler Guides not being rescaled correctly
+- Fixed Ruler Guides not working with Custom Snap
+- Fixed the Eyedropper shortcut (Enter) activating in textboxes
+- Removed the old scaling mod, and replaced it by "UI Rescaler", a complete rework of the feature:
+	- Many fixes based on user feedback
+	- Now compatible with Enlarge UI.
+	- It can still be found in Preferences but now it also has its own tool in the Settings Tab with more options
+	- Needs a bit of time to apply scale to everthing if you have a lot of mods that add UI features, so you might see a loading popup appear sometimes
+
+
+v1.0.1
+- Fixed stuck click when Save Reminder popup appears
+- Pattern Paint Bucket works everywhere, not just inside loops
+- Added space at the bottom of the Mod Settings panel to avoid unclickable buttons
+- Fixed terrain popup reseting position when clicking on a texture
+
+
+v1.0.0 - Discord Release
