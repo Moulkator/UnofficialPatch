@@ -199,6 +199,9 @@ var wall_tool_portal_fix
 var OverlayToolScript
 var overlay_tool
 
+var SaveBypassScript
+var save_bypass
+
 var WallMoveScript
 var wall_move
 
@@ -822,6 +825,7 @@ func start() -> void:
 		transform_box_fix = TransformBoxFixScript.new()
 		transform_box_fix._g = Global
 		transform_box_fix.ui_util = ui_util
+		transform_box_fix.path_fix = path_fix
 		transform_box_fix.initialize()
 
 	if _debug_enabled("selection_resize"):
@@ -1015,6 +1019,12 @@ func start() -> void:
 		path_fix.overlay_tool = overlay_tool
 		if no_micro_drag != null:
 			no_micro_drag.overlay_tool = overlay_tool
+
+	if _debug_enabled("save_bypass"):
+		SaveBypassScript = ResourceLoader.load(Global.Root + "scripts/save_bypass.gd", "GDScript", true)
+		save_bypass = SaveBypassScript.new()
+		save_bypass._g = Global
+		save_bypass.initialize()
 
 	if mod_settings == null or mod_settings.is_enabled("wall_move_transform"):
 		_load_wall_move()
@@ -2161,6 +2171,8 @@ func _register_debug_mods() -> void:
 		return
 	# Ordre d'enregistrement sans importance — debug_settings trie alpha.
 	# Format : register_mod(id, label, depends_on, settings_id, tooltip)
+	debug_settings.register_mod("save_bypass", "Save Bypass (anti-busy)", [], "",
+		"Fait fonctionner Ctrl+S, le bouton SAVE et le menu\n'Save As' meme quand DD reste bloque sur 'busy' : ecrit\nla map (meme nom, dialogue OS natif pour Save As) sans le\npopup. N'intervient QUE lorsque le blocage est detecte.")
 	# Foundations
 	debug_settings.register_mod("ui_util", "", [], "",
 		"Shared UI helpers used by many other mods.\nDisabling this will break most of them.")

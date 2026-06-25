@@ -1,15 +1,20 @@
-v1.3.1 - GitHub & Cartography Assets Release
+v1.4.0 - GitHub & Cartography Assets Release
 - Added the ability to change level directly in the Level Settings Tool
 - Added the ability to clone a level with a right click in the Level Settings Tool (sets the correct level to clone in the popup)
+- Added a way to show the area covered by the current terrain slot by right clicking on the map in the terrain tool (Area Viewer)
 - Fixed missing textures appearing sometimes with terrain presets
 - Fixed colors made with Colour And Modify Things from uchideshi34 not being copied
 - Fixed a copy of a mix of assets and text not pasting the text at the correct place
 - Fixed walls being impossible to delete after a copy + undo + redo
 - Fixed menu closing when selecting a roof and changing its settings
 - Fixed potential softlock when pressing echap to close the terrain popup
-- Added pressing Echap to close the terrain popup on slots 9+ wihtout quitting the terrain tool
+- Improved selection involving patterns with transparent parts (also works with ColourAndModifyThings from uchideshi34)
+- Improved paths selection
+- Fixed selected asset being unselected when being dragged while on top of another asset
+- Added pressing Escape to close the terrain popup on slots 9+ wihtout quitting the terrain tool
 - Fixed a vanilla bug that reorders assets in a multiselection
 - Fixed a vanilla bug that messes the selection if you alt tab while making a dragbox
+- Fixed a vanilla bug that prevented to save the map ("Dungeondraft is busy")
 - Improved FPS count with grid ruler (CTRL + R) activated
 - Made the terrain circle brush and square brush sizes independant
 - Embedded the 9+ terrain slots' data in the map file instead of creating a separate file in the user folder
