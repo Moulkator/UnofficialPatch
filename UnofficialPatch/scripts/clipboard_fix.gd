@@ -187,7 +187,13 @@ func _cmt_apply_to_pasted(nodes: Array) -> void:
 		return
 
 	# Grouper les nodes collES par type via le classifieur du mod tiers.
-	var by_type := {"objects": [], "paths": [], "pattern_shapes": [], "portals": []}
+	# NOTE : on EXCLUT volontairement "pattern_shapes" et "portals".
+	#  - patterns : la couleur d'un pattern est pilotee par config["colour"]
+	#    (et forcee a blanc pour les tilesets) ; appliquer un record blanchirait
+	#    la couleur DD native du pattern (restauree par le collage DD). A traiter
+	#    a part une fois la semantique couleur pattern clarifiee.
+	#  - portals : non copies par DD de toute facon.
+	var by_type := {"objects": [], "paths": []}
 	for node in nodes:
 		if node == null or not is_instance_valid(node) or not node.has_meta("node_id"):
 			continue

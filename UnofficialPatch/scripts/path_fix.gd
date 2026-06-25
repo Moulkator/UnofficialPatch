@@ -39,6 +39,16 @@ var _hovered_path = null
 var _pending_reselect = null
 var _pending_drag_start := Vector2.ZERO
 var _pending_drag_origin := Vector2.ZERO
+# Override "selection a travers un trou" differe au release : si le press tombe
+# dans la zone de deplacement (corps de la box d'un asset selectionne), on ne
+# selectionne l'asset du dessous QUE si le geste est un clic (aucun drag), pour ne
+# jamais voler un deplacement de l'asset selectionne.
+var _pending_overlay_pat = null
+var _pending_overlay_sel = null
+# Idem pour un PATH clique dans le corps de la box d'un autre asset selectionne :
+# selection differee au release, seulement si clic (pas de drag).
+var _pending_overlay_path = null
+var _pending_overlay_path_sel = null
 
 func initialize() -> void:
 	select_tool = _g.Editor.Tools["SelectTool"]
@@ -107,7 +117,7 @@ func _install_input_listener() -> void:
 	input_listener = Node.new()
 	input_listener.name = "PathFixListener"
 	var listener_script = GDScript.new()
-	listener_script.source_code = "extends Node\nvar handler = null\nfunc _input(event) -> void:\n\tif handler != null:\n\t\thandler._on_input(event)\nfunc _process(delta) -> void:\n\tif handler != null:\n\t\thandler._on_process(delta)\nfunc _deferred_reselect() -> void:\n\tif handler != null:\n\t\thandler._do_deferred_reselect()\nfunc _deferred_panel_notify() -> void:\n\tif handler != null:\n\t\thandler._do_deferred_panel_notify()\n"
+	listener_script.source_code = "extends Node\nvar handler = null\nfunc _input(event) -> void:\n\tif handler != null:\n\t\thandler._on_input(event)\nfunc _process(delta) -> void:\n\tif handler != null:\n\t\thandler._on_process(delta)\nfunc _deferred_reselect() -> void:\n\tif handler != null:\n\t\thandler._do_deferred_reselect()\nfunc _deferred_overlay_select() -> void:\n\tif handler != null:\n\t\thandler._do_deferred_overlay_select()\nfunc _deferred_overlay_path_select() -> void:\n\tif handler != null:\n\t\thandler._do_deferred_overlay_path_select()\nfunc _deferred_panel_notify() -> void:\n\tif handler != null:\n\t\thandler._do_deferred_panel_notify()\n"
 	listener_script.reload()
 	input_listener.set_script(listener_script)
 	input_listener.handler = self
@@ -291,6 +301,24 @@ func _on_input(event) -> void:
 			_drag_threshold_passed = false
 			_left_press_pos = event.position
 		else:
+			# Override "selection a travers un trou" differe : si le geste etait un
+			# CLIC (aucun drag) dans le corps d'une box selectionnee, on selectionne
+			# maintenant l'asset du dessous. Si un DRAG a eu lieu, on ne touche a
+			# rien -> DD a deplace l'asset selectionne (comportement voulu).
+			if _pending_overlay_pat != null:
+				var pend = _pending_overlay_pat
+				_pending_overlay_pat = null
+				if not _drag_threshold_passed and is_instance_valid(pend):
+					_pending_overlay_sel = pend
+					input_listener.call_deferred("_deferred_overlay_select")
+			# Idem pour un path clique dans le corps d'une box : selection au release
+			# seulement si clic (pas de drag).
+			if _pending_overlay_path != null:
+				var pend_p = _pending_overlay_path
+				_pending_overlay_path = null
+				if not _drag_threshold_passed and is_instance_valid(pend_p):
+					_pending_overlay_path_sel = pend_p
+					input_listener.call_deferred("_deferred_overlay_path_select")
 			_left_pressed = false
 			_drag_threshold_passed = false
 	if event is InputEventMouseMotion and _left_pressed and not _drag_threshold_passed:
@@ -300,11 +328,26 @@ func _on_input(event) -> void:
 	# On left click, try to force-select a path
 	if event is InputEventMouseButton and event.button_index == BUTTON_LEFT and event.pressed:
 		if _is_select_tool_active() and not ui_util.is_mouse_over_ui(input_listener):
+			# Poignee de redim/rotation de la box : toujours laisser DD transformer,
+			# ne jamais hijacker au profit d'une selection a travers un trou.
+			if _transform_box_on_handle():
+				pass
+			# Pattern ajoure au-dessus d'un autre pattern : selectionner celui que
+			# l'overlay montre a travers le trou, AVANT que DD ne demarre un Move sur
+			# le pattern du dessus s'il est deja selectionne. _select_overlay_pattern
+			# s'auto-annule si le pattern survole est deja selectionne (vrai Move).
+			elif _select_overlay_pattern():
+				pass
+			# Path clique dans le corps de la box d'un autre asset selectionne :
+			# differe la selection au release (clic vs drag) au lieu de laisser DD
+			# deplacer l'asset selectionne.
+			elif _select_overlay_path():
+				pass
 			# DD a deja calcule son transformMode sur ce press (son _Input passe
 			# avant notre listener) : si != None, il va transformer l'asset
 			# selectionne (move/rotate/resize) -> ne pas detecter le path.
 			# Les methodes de la box servent de repli si l'ordre des handlers varie.
-			if _dd_transform_mode() != 0 or _transform_box_wants_cursor():
+			elif _dd_transform_mode() != 0 or _transform_box_wants_cursor():
 				pass
 			# Sur le trace central, DD pointe le path (priorite path > pattern).
 			# Si un pattern est au-dessus, on selectionne le pattern a la place.
@@ -744,6 +787,19 @@ func _compute_wall_covered(wall, mouse_world: Vector2) -> bool:
 	return false
 
 
+# Vrai si le pattern compte comme COUVRANT le point souris : il faut que son
+# rendu y soit opaque. Un pattern ajoure (grille...) transparent sous le curseur
+# ne couvre donc plus le wall/path dessous. Delegue a overlay_tool._pattern_solid_at
+# (echantillonnage fidele au shader Pattern.shader de DD : texture via l'uniform
+# albedo + rotation autour de 0.5). Repli "couvre" si overlay_tool indisponible
+# (aucune regression vs l'ancien comportement purement geometrique).
+func _pattern_opaque_here(shape, mouse_world) -> bool:
+	if overlay_tool != null and is_instance_valid(overlay_tool) \
+	and overlay_tool.has_method("_pattern_solid_at"):
+		return overlay_tool._pattern_solid_at(shape, mouse_world)
+	return true
+
+
 func _scan_patterns(node, pz: int, depth: int, self_rank: int = 2) -> bool:
 	if depth > 5:
 		return false
@@ -752,7 +808,8 @@ func _scan_patterns(node, pz: int, depth: int, self_rank: int = 2) -> bool:
 		if child == null or not is_instance_valid(child):
 			continue
 		if child is Polygon2D and child.has_method("IsMouseWithin") \
-		and not _aabb_miss(child, mouse_world, 4.0) and child.IsMouseWithin():
+		and not _aabb_miss(child, mouse_world, 4.0) and child.IsMouseWithin() \
+		and _pattern_opaque_here(child, mouse_world):
 			var cl = child.GetLayer() if child.has_method("GetLayer") else _effective_z(child)
 			if _covers_layer(int(cl), 7, pz, self_rank):
 				return true
@@ -1005,6 +1062,125 @@ func _unforce_path_widget() -> void:
 
 
 
+func _select_overlay_pattern() -> bool:
+	# Au clic : DD selectionne le pattern le plus haut sous le curseur via son
+	# IsMouseWithin geometrique (sans alpha). Quand un pattern ajoure (grille...)
+	# est au-dessus, l'overlay surligne deja le pattern visible DESSOUS via son
+	# trou : on force la selection de ce pattern-la plutot que celui du dessus.
+	# Renvoie vrai si gere (au press) -- l'application peut etre differee au release.
+	if overlay_tool == null or not is_instance_valid(overlay_tool):
+		return false
+	var pat = overlay_tool._hover_pattern
+	if pat == null or not is_instance_valid(pat):
+		return false
+	if not select_tool.has_method("SelectThing"):
+		return false
+	# Ne PAS intervenir si l'overlay surligne un pattern DEJA selectionne : c'est
+	# un deplacement/redim normal de ce pattern (curseur sur sa partie pleine),
+	# pas une selection a travers un trou.
+	if _is_thing_selected(pat):
+		return false
+	# Si le press tombe dans le CORPS de la box d'un asset selectionne, un drag de
+	# cet asset est possible : on NE selectionne PAS au press (sinon on vole le
+	# drag). On memorise le pattern et on tranchera au release : selection
+	# seulement si c'etait un clic (aucun drag). DD arme son Move normalement.
+	if _box_move_zone():
+		_pending_overlay_pat = pat
+		return true
+	# Aucun asset deplaçable sous le curseur -> selection immediate (clic simple).
+	_apply_overlay_pattern_selection(pat)
+	return true
+
+
+# Vrai si un Thing (noeud) est dans la selection courante.
+func _is_thing_selected(thing) -> bool:
+	var sel = select_tool.get("Selected")
+	if sel is Array:
+		for s in sel:
+			if s == null or not is_instance_valid(s):
+				continue
+			if s == thing or s.get("Thing") == thing:
+				return true
+	return false
+
+
+# Vrai si le curseur est dans le CORPS de la box de selection (zone Move), ou un
+# drag de l'asset selectionne demarrerait. Exclut coins/anneau (poignees).
+func _box_move_zone() -> bool:
+	var tbox = select_tool.get("transformBox")
+	if tbox == null or not is_instance_valid(tbox) or not tbox.visible:
+		return false
+	return tbox.has_method("IsMouseInside") and tbox.IsMouseInside()
+
+
+# Applique reellement la selection du pattern survole (DeselectAll + SelectThing).
+func _apply_overlay_pattern_selection(pat) -> void:
+	if pat == null or not is_instance_valid(pat):
+		return
+	if not Input.is_key_pressed(KEY_SHIFT):
+		select_tool.DeselectAll()
+	var made = select_tool.SelectThing(pat, true)
+	if select_tool.has_method("EnableTransformBox"):
+		select_tool.EnableTransformBox(true)
+	input_listener.call_deferred("_deferred_panel_notify")
+	# highlighted = notre pattern, pour que le _ContentInput de DD selectionne le
+	# meme objet (Select(highlighted)) au lieu du pattern du dessus.
+	if made != null:
+		select_tool.set("highlighted", made)
+	# Annule un eventuel Move arme par DD sur l'ancien asset (transformMode != None
+	# -> son _ContentInput deplace au lieu de selectionner).
+	if select_tool.get("transformMode") != null:
+		select_tool.set("transformMode", 0)
+
+
+# Differe (idle) : applique l'override apres que DD ait fini de traiter le release.
+func _do_deferred_overlay_select() -> void:
+	var pat = _pending_overlay_sel
+	_pending_overlay_sel = null
+	_apply_overlay_pattern_selection(pat)
+
+
+# Clic sur un PATH situe dans le corps de la box de selection d'un AUTRE asset :
+# DD deplacerait l'asset selectionne (transformMode = Move), donc _try_force_select
+# n'est jamais atteint. On differe au release : selection du path seulement si clic
+# (aucun drag), sinon on laisse DD deplacer l'asset selectionne. Renvoie vrai si
+# pris en charge (defere). Hors zone Move, on renvoie faux -> _try_force_select
+# gere normalement au press.
+# Vrai si un path SELECTIONNABLE (sous le curseur et NON couvert) est survole.
+# Signal pour transform_box_fix : dans ce cas, c'est path_fix qui gere la selection.
+func _has_selectable_path_hover() -> bool:
+	return overlay_tool != null and is_instance_valid(overlay_tool) \
+	and overlay_tool._hover_path != null and is_instance_valid(overlay_tool._hover_path)
+
+
+func _select_overlay_path() -> bool:
+	if overlay_tool == null or not is_instance_valid(overlay_tool):
+		return false
+	var p = overlay_tool._hover_path
+	if p == null or not is_instance_valid(p):
+		return false
+	# Respecter le filtre Paths du SelectTool.
+	var filter = select_tool.get("Filter")
+	if filter is Dictionary and not bool(filter.get("Paths", true)):
+		return false
+	# Deja selectionne -> laisser DD/drag gerer.
+	if _is_thing_selected(p):
+		return false
+	# Seulement si le press tombe dans le corps d'une box (drag possible) : sinon
+	# _try_force_select s'en charge au press, plus reactif.
+	if not _box_move_zone():
+		return false
+	_pending_overlay_path = p
+	return true
+
+
+# Differe (idle) : selectionne le path apres le release.
+func _do_deferred_overlay_path_select() -> void:
+	var p = _pending_overlay_path_sel
+	_pending_overlay_path_sel = null
+	_apply_path_selection(p)
+
+
 func _select_pattern_over_path() -> bool:
 	# Au clic : si DD pointe un path (trace central) avec un pattern au-dessus,
 	# on selectionne le pattern via SelectThing (qui cree le Selectable du bon
@@ -1052,11 +1228,13 @@ func _topmost_pattern_above(path):
 func _find_pattern_above(node, pz, depth):
 	if depth > 5:
 		return null
+	var mouse_world = _g.WorldUI.MousePosition
 	var found = null
 	for child in node.get_children():
 		if child == null or not is_instance_valid(child):
 			continue
-		if child is Polygon2D and child.has_method("IsMouseWithin") and child.IsMouseWithin():
+		if child is Polygon2D and child.has_method("IsMouseWithin") and child.IsMouseWithin() \
+		and _pattern_opaque_here(child, mouse_world):
 			var cl = child.GetLayer() if child.has_method("GetLayer") else _effective_z(child)
 			if _covers_layer(int(cl), 7, pz):
 				found = child
@@ -1235,23 +1413,7 @@ func _try_force_select() -> void:
 		input_listener.call_deferred("_deferred_reselect")
 		return
 
-	if not Input.is_key_pressed(KEY_SHIFT):
-		select_tool.DeselectAll()
-
-	_normalize_pathway_position(child)
-	select_tool.SelectThing(child, true)
-	select_tool.EnableTransformBox(true)
-	input_listener.call_deferred("_deferred_panel_notify")
-
-	var raw = select_tool.RawSelectables
-	if raw:
-		for s in raw:
-			if s == null or not is_instance_valid(s):
-				continue
-			var t = s.get("Thing")
-			if t != null and is_instance_valid(t) and t == child:
-				select_tool.set("highlighted", s)
-				break
+	_apply_path_selection(child)
 
 	_flat_line = child
 	_is_flat_selected = _check_if_flat(child)
@@ -1264,6 +1426,33 @@ func _try_force_select() -> void:
 	_drag_start = mouse_world
 	_drag_origin = child.global_position
 	select_tool.SavePreTransforms()
+
+
+# Selection d'un path (sans la mise en place du drag) : reutilisable par
+# _try_force_select (au press) et par la selection differee (clic dans la box
+# active d'un autre asset, applique au release).
+func _apply_path_selection(child) -> void:
+	if child == null or not is_instance_valid(child):
+		return
+	if not Input.is_key_pressed(KEY_SHIFT):
+		select_tool.DeselectAll()
+	_normalize_pathway_position(child)
+	select_tool.SelectThing(child, true)
+	select_tool.EnableTransformBox(true)
+	input_listener.call_deferred("_deferred_panel_notify")
+	var raw = select_tool.RawSelectables
+	if raw:
+		for s in raw:
+			if s == null or not is_instance_valid(s):
+				continue
+			var t = s.get("Thing")
+			if t != null and is_instance_valid(t) and t == child:
+				select_tool.set("highlighted", s)
+				break
+	# Annule un eventuel Move arme par DD sur l'ancien asset (sinon son _ContentInput
+	# deplace au lieu de selectionner notre path).
+	if select_tool.get("transformMode") != null:
+		select_tool.set("transformMode", 0)
 func _distance_to_line(line: Line2D, world_pos: Vector2) -> float:
 	var local_pos = line.get_global_transform().affine_inverse().xform(world_pos)
 	var pts = line.points
@@ -1351,6 +1540,25 @@ func _transform_box_wants_cursor() -> bool:
 	if tbox.has_method("IsMouseInside") and tbox.IsMouseInside():
 		return true
 	if tbox.has_method("IsMouseInRotateZone") and tbox.IsMouseInRotateZone():
+		return true
+	return false
+
+
+# Vrai UNIQUEMENT si le curseur est sur une POIGNEE de la box (coin = redim, ou
+# anneau de rotation MAIS hors de la box), pas sur son interieur (deplacement).
+# IsMouseInRotateZone() = Rect.Grow(64).HasPoint -> vrai aussi a l'interieur, donc
+# il faut explicitement exclure IsMouseInside(), sinon un clic dans un trou au sein
+# de la box serait pris pour une poignee et bloquerait la selection a travers.
+# Sert a ne jamais hijacker un redim/rotation au profit d'une selection a travers
+# un trou, tout en laissant l'override agir quand le clic tombe dans le corps.
+func _transform_box_on_handle() -> bool:
+	var tbox = select_tool.get("transformBox")
+	if tbox == null or not is_instance_valid(tbox) or not tbox.visible:
+		return false
+	if tbox.has_method("IsMouseOnCorner") and tbox.IsMouseOnCorner() != -1:
+		return true
+	var inside = tbox.has_method("IsMouseInside") and tbox.IsMouseInside()
+	if not inside and tbox.has_method("IsMouseInRotateZone") and tbox.IsMouseInRotateZone():
 		return true
 	return false
 

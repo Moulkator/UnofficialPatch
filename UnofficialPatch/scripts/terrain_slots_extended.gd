@@ -94,6 +94,9 @@ var _prev_was_down := false   # Page Up / KP-
 
 # temporary HUD (current slot + thumbnail), replaced by the panel UI
 var _hud: CanvasLayer = null
+var _hl_hint: CanvasLayer = null        # petite etiquette suivant le curseur en mode viewer
+var _hl_hint_panel = null               # Control interne (visibilite fiable, cf. CanvasLayer.visible)
+var _hl_hint_label = null
 var _hud_panel: Control = null
 var _hud_label: Label = null
 var _hud_thumb: TextureRect = null
@@ -918,6 +921,7 @@ func _tick(delta) -> void:
 		_hide_hud()
 	else:
 		_update_hud()
+	_update_hl_hint()
 
 	# Continuous painting (like TerrainBrush._Update: rate = delta * Intensity).
 	if _painting and _hl_slot < 0 and _on_active_terrain() and not _paint_bucket_owns_input():
@@ -977,6 +981,16 @@ func _on_input(e) -> bool:
 	# In 16-slot mode we intercept the terrain brush painting: vanilla Paint()
 	# would break on channels 8-15 and ignore splat3/splat4.
 	_sync_current_level()
+
+	# Clic droit sur la map : bascule le surlignage des zones peintes pour le slot
+	# COURANT (remplace l'ancienne entree du menu contextuel des slots). Un 2e clic
+	# droit le coupe. Fonctionne meme depuis le mode vanilla : on active notre
+	# shader au besoin pour que le surlignage s'affiche, comme le faisait le menu.
+	if e is InputEventMouseButton and e.button_index == BUTTON_RIGHT and e.pressed:
+		if _is_terrain_tool_active() and not is_picker_open() and not _over_ui():
+			_toggle_map_highlight()
+			return true
+
 	if not _active:
 		return false
 	if not _on_active_terrain():
@@ -1202,6 +1216,47 @@ func _build_hud() -> void:
 func _hide_hud() -> void:
 	if _hud_panel != null:
 		_hud_panel.visible = false
+
+
+# Etiquette "right click: exit area viewer" affichee a cote du curseur tant que
+# le surlignage des zones peintes est actif (clic droit sur la map).
+func _build_hl_hint() -> void:
+	_hl_hint = CanvasLayer.new()
+	_hl_hint.layer = 128
+	var panel = PanelContainer.new()
+	panel.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	var style = StyleBoxFlat.new()
+	style.bg_color = Color(0, 0, 0, 0.72)
+	style.set_border_width_all(1)
+	style.border_color = Color(1, 1, 1, 0.25)
+	style.content_margin_left = 6
+	style.content_margin_right = 6
+	style.content_margin_top = 3
+	style.content_margin_bottom = 3
+	panel.add_stylebox_override("panel", style)
+	_hl_hint_label = Label.new()
+	_hl_hint_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_hl_hint_label.align = Label.ALIGN_CENTER
+	_hl_hint_label.text = "Right click to exit\nthe Area Viewer"
+	panel.add_child(_hl_hint_label)
+	_hl_hint.add_child(panel)
+	_hl_hint_panel = panel
+	panel.visible = false
+	_g.Editor.get_tree().get_root().call_deferred("add_child", _hl_hint)
+
+
+func _update_hl_hint() -> void:
+	var want = _hl_slot >= 0 and _is_terrain_tool_active()
+	if _hl_hint == null:
+		if not want:
+			return
+		_build_hl_hint()
+	if _hl_hint_panel == null or not is_instance_valid(_hl_hint_panel):
+		return
+	_hl_hint_panel.visible = want
+	if want:
+		var mp = _g.Editor.get_tree().get_root().get_mouse_position()
+		_hl_hint_panel.rect_position = mp + Vector2(18, 18)
 
 
 func _update_hud() -> void:
@@ -2697,10 +2752,16 @@ func _on_vanilla_item_selected(index: int) -> void:
 	_deselect_extra_lists()
 
 
+func _hide_hl_hint() -> void:
+	if _hl_hint_panel != null and is_instance_valid(_hl_hint_panel):
+		_hl_hint_panel.visible = false
+
+
 func _clear_highlight() -> void:
 	if _hl_slot >= 0:
 		_hl_slot = -1
 		_apply_highlight_params()
+		_hide_hl_hint()
 
 
 func _deselect_extra_lists() -> void:
@@ -3313,8 +3374,6 @@ func _show_slot_context_menu(slot: int) -> void:
 	menu.add_item("Paste slot", 1)
 	if _slot_clipboard == null or _slot_clipboard == "":
 		menu.set_item_disabled(menu.get_item_index(1), true)
-	menu.add_separator()
-	menu.add_item("Stop highlight" if _hl_slot == slot else "Highlight painted areas", 2)
 	menu.connect("id_pressed", self, "_on_slot_menu_id", [slot])
 	menu.connect("popup_hide", menu, "queue_free")
 	_get_popup_layer().add_child(menu)
@@ -3341,18 +3400,6 @@ func _on_slot_menu_id(id: int, slot: int) -> void:
 	elif id == 1:
 		_apply_slot(slot, _slot_clipboard)
 		print("[Terrain16] Pasted into slot ", slot + 1)
-	elif id == 2:
-		if _hl_slot == slot:
-			_hl_slot = -1
-		else:
-			_hl_slot = slot
-			# Highlight needs our shader running, and slots 17-24 need 24-mode
-			# (their splat is only bound then).
-			if slot >= 16 and not _active24:
-				_on_toggle24(true)
-			elif not _active:
-				_on_toggle(true)
-		_apply_highlight_params()
 
 
 # Push the highlight uniforms onto the current level's terrain material.
@@ -3362,6 +3409,37 @@ func _apply_highlight_params() -> void:
 		mat.set_shader_param("hl_on", _hl_slot >= 0)
 		mat.set_shader_param("hl_slot", _hl_slot)
 	_set_brush_controls_dimmed(_hl_slot >= 0)
+
+
+# Slot que le pinceau peindrait actuellement : le slot etendu selectionne si
+# l'utilisateur en a choisi un, sinon le TerrainID natif courant.
+func _current_paint_slot() -> int:
+	if not _extra_selected and _g != null and _g.get("Editor") != null:
+		var tools = _g.Editor.get("Tools")
+		if tools != null and tools.has("TerrainBrush"):
+			var tb = tools["TerrainBrush"]
+			if tb != null:
+				_paint_slot = int(tb.get("TerrainID"))
+	return _paint_slot
+
+
+# Bascule le surlignage du slot courant depuis un clic droit sur la map.
+func _toggle_map_highlight() -> void:
+	if _hl_slot >= 0:
+		_hl_slot = -1
+		_hide_hl_hint()
+	else:
+		var slot = _current_paint_slot()
+		if slot < 0:
+			return
+		_hl_slot = slot
+		# Le surlignage exige notre shader actif ; les slots 17-24 exigent le mode 24
+		# (leur splat n'est lie qu'a ce moment-la).
+		if slot >= 16 and not _active24:
+			_on_toggle24(true)
+		elif not _active:
+			_on_toggle(true)
+	_apply_highlight_params()
 
 
 # Grey out AND block DD's brush controls (tool buttons, Brush Size, Intensity)

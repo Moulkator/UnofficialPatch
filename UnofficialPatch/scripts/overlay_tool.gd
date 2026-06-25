@@ -1679,8 +1679,14 @@ func _update_path_hover(level, mouse_world):
 	if path_fix != null and is_instance_valid(path_fix):
 		selected_path = path_fix._flat_line
 	var best = null
+	var best_z = -2147483648
 	var children = pathways.get_children()
-	for i in range(children.size() - 1, -1, -1):
+	# Choisir le path de plus HAUT calque (effective-z) parmi ceux sous le curseur,
+	# et non le premier rencontre : deux paths qui se croisent peuvent etre sur des
+	# calques differents, et celui du dessus (z le plus grand) doit gagner. A z egal,
+	# l'enfant le plus tardif (dessine au-dessus) l'emporte -> on parcourt en avant
+	# et on garde avec >=.
+	for i in range(children.size()):
 		var child = children[i]
 		if not (child is Line2D):
 			continue
@@ -1693,9 +1699,12 @@ func _update_path_hover(level, mouse_world):
 			cull_margin = max(64.0, child.width * 0.5 + 16.0)
 		if _aabb_miss(child, mouse_world, cull_margin):
 			continue
-		if _is_mouse_on_path(child, mouse_world):
+		if not _is_mouse_on_path(child, mouse_world):
+			continue
+		var cz = _effective_z(child)
+		if best == null or cz >= best_z:
 			best = child
-			break
+			best_z = cz
 	# Le path est-il couvert par un element au-dessus (objet, light, pattern,
 	# portal, roof) ? Si oui, c'est lui le candidat : pas d'overlay path et
 	# _hover_path nul pour ne pas parasiter la selection. Sinon (path devant),
@@ -1975,6 +1984,11 @@ func _update_pattern_hover(level, mouse_world):
 			var plz = sh.GetLayer() if sh.has_method("GetLayer") else _effective_z(sh)
 			if int(plz) <= int(sel_ceiling):
 				continue
+		# Pattern ajoure (texture a trous : grille, etc.) : si le texel sous le
+		# curseur est transparent, on "voit a travers" -> on poursuit le scan vers
+		# le pattern dessous au lieu de surligner celui du dessus dans son vide.
+		if not _pattern_solid_at(sh, mouse_world):
+			continue
 		best = sh
 		break
 	if best != null:
@@ -1985,6 +1999,84 @@ func _update_pattern_hover(level, mouse_world):
 	else:
 		_clear_pattern_highlight()
 
+
+# Cache Texture -> Image (lockee) pour l'echantillonnage alpha des patterns.
+var _pattern_image_cache = {}
+
+
+# Image lockee pour une texture donnee (decompresse si besoin). null si illisible.
+func _get_pattern_image(tex):
+	if tex == null:
+		return null
+	if _pattern_image_cache.has(tex):
+		return _pattern_image_cache[tex]
+	var img = tex.get_data()
+	if img != null:
+		# get_pixel impossible sur une image compressee (VRAM) -> tenter de
+		# decompresser ; si echec, on memorise null pour ne pas reessayer.
+		if img.is_compressed() and img.decompress() != OK:
+			img = null
+		if img != null:
+			img.lock()
+	_pattern_image_cache[tex] = img
+	return img
+
+
+# Reproduit rotate_uv() du shader Pattern.shader : rotation de l'UV normalise
+# autour du centre du tile (0.5, 0.5).
+func _rotate_uv_05(uv: Vector2, r: float) -> Vector2:
+	var c = cos(r)
+	var s = sin(r)
+	var x = uv.x - 0.5
+	var y = uv.y - 0.5
+	return Vector2(c * x + s * y + 0.5, c * y - s * x + 0.5)
+
+
+# Alpha de la couleur (vertex color) du PatternShape ; 1.0 par defaut.
+func _pattern_color_alpha(shape) -> float:
+	var col = shape.color
+	return col.a if col != null else 1.0
+
+
+# Vrai si le pattern est OPAQUE (ou indeterminable) au point monde donne. Faux
+# UNIQUEMENT si on peut prouver que le rendu est transparent sous le curseur ->
+# permet de "voir a travers" un pattern ajoure (grille...) et de laisser le scan
+# detecter le pattern dessous.
+#
+# DD ne pose PAS la texture sur Polygon2D.texture : elle est passee a l'uniform
+# "albedo" du shader, et l'UV est calcule dans le vertex (Pattern.shader) :
+#   world_uv = VERTEX / textureSize(albedo) ; world_uv = rotate_uv(world_uv, rot)
+# avec VERTEX = position locale = to_local(monde). L'alpha de rendu vaut
+# albedo.a * COLOR.a. Le shader PatternCustomColor (colorables) ne touche pas
+# COLOR.a -> ces patterns sont pleins partout (alpha = couleur du polygone).
+func _pattern_solid_at(shape, mouse_world) -> bool:
+	var mat = shape.material
+	if not (mat is ShaderMaterial) or mat.shader == null:
+		# Pattern uni (icone "Null", Material null) : rendu plein.
+		return _pattern_color_alpha(shape) > 0.1
+	# Colorables : l'alpha de rendu vient de la couleur, pas de la texture.
+	if mat.shader.code.find("redness") != -1:
+		return _pattern_color_alpha(shape) > 0.1
+	var tex = mat.get_shader_param("albedo")
+	if tex == null:
+		return true
+	var img = _get_pattern_image(tex)
+	if img == null:
+		return true
+	var tw = img.get_width()
+	var th = img.get_height()
+	if tw <= 0 or th <= 0:
+		return true
+	# VERTEX = position locale du noeud (espace des points, avant transform globale).
+	var v = shape.to_local(mouse_world)
+	var uv = Vector2(v.x / float(tw), v.y / float(th))
+	var rot = mat.get_shader_param("rotation")
+	uv = _rotate_uv_05(uv, rot if rot != null else 0.0)
+	# texture(albedo, uv) avec repetition (fposmod gere les coords negatives).
+	var px = int(clamp(fposmod(uv.x, 1.0) * tw, 0, tw - 1))
+	var py = int(clamp(fposmod(uv.y, 1.0) * th, 0, th - 1))
+	var a = img.get_pixel(px, py).a * _pattern_color_alpha(shape)
+	return a > 0.1
 
 # Calque "plafond" impose par la selection sous le curseur : plus haut effective-z
 # parmi les objets/portails SELECTIONNES dont l'empreinte contient le point souris.

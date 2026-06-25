@@ -6,7 +6,16 @@
 var _g
 var select_tool
 var ui_util
+var path_fix
 var input_listener: Node
+# Suivi clic-vs-drag : on ne bascule vers l'asset survole QU'AU release et
+# seulement si le geste etait un clic (aucun drag), pour ne JAMAIS voler un
+# deplacement de l'asset deja selectionne.
+var _left_pressed := false
+var _press_pos := Vector2.ZERO
+var _drag_passed := false
+var _pending_switch = null
+var _pending_release_thing = null
 
 func initialize() -> void:
 	select_tool = _g.Editor.Tools["SelectTool"]
@@ -18,7 +27,7 @@ func _install_input_listener() -> void:
 	input_listener = Node.new()
 	input_listener.name = "TransformBoxFixListener"
 	var listener_script = GDScript.new()
-	listener_script.source_code = "extends Node\nvar handler = null\nfunc _input(event) -> void:\n\tif handler != null:\n\t\thandler._on_input(event)\n"
+	listener_script.source_code = "extends Node\nvar handler = null\nfunc _input(event) -> void:\n\tif handler != null:\n\t\thandler._on_input(event)\nfunc _deferred_switch() -> void:\n\tif handler != null:\n\t\thandler._do_deferred_switch()\n"
 	listener_script.reload()
 	input_listener.set_script(listener_script)
 	input_listener.handler = self
@@ -99,54 +108,112 @@ func _is_over_transform_handle() -> bool:
 
 
 func _on_input(event) -> void:
-	if not (event is InputEventMouseButton and event.button_index == BUTTON_LEFT and event.pressed):
+	# Suivi du drag : des que la souris depasse le seuil apres un press gauche.
+	if event is InputEventMouseMotion:
+		if _left_pressed and not _drag_passed and event.position.distance_to(_press_pos) > 4:
+			_drag_passed = true
+		return
+	if not (event is InputEventMouseButton and event.button_index == BUTTON_LEFT):
 		return
 
-	# Skip when the click lands on a UI panel/popup. The input listener fires
-	# globally, so a click inside the SelectTool panel would otherwise reach
-	# this handler — and since DD still reports a highlighted world asset
-	# beneath the panel overlay, we'd deselect on a UI button press.
+	if event.pressed:
+		_left_pressed = true
+		_drag_passed = false
+		_press_pos = event.position
+		_pending_switch = null
+		# Shift : laisser DD gerer (ajout a la selection), pas de basculement.
+		if Input.is_key_pressed(KEY_SHIFT):
+			return
+		# Preparer un eventuel basculement vers l'asset survole DIFFERENT, mais NE
+		# PAS deselectionner maintenant : DD arme son Move sur l'asset selectionne ;
+		# on tranchera au release (clic vs drag).
+		_pending_switch = _switch_target()
+	else:
+		var pend = _pending_switch
+		_pending_switch = null
+		_left_pressed = false
+		var was_drag = _drag_passed
+		_drag_passed = false
+		# Clic (aucun drag) sur un autre asset dans la box -> basculer dessus au
+		# release. Drag -> on ne touche a rien : DD a deplace l'asset selectionne.
+		if pend != null and not was_drag and is_instance_valid(pend):
+			_pending_release_thing = pend
+			input_listener.call_deferred("_deferred_switch")
+
+
+# Renvoie le Thing (noeud) survole par DD, DIFFERENT du/des selectionnes et
+# eligible a un basculement, ou null si aucun basculement ne doit etre prepare.
+# Regroupe toutes les conditions de l'ancien _on_input.
+func _switch_target():
+	# Clic sur un panneau/popup UI : ignorer (le listener est global).
 	if ui_util != null and ui_util.is_mouse_over_ui(input_listener):
-		return
-
-	# Only when SelectTool is active
+		return null
+	# Seulement quand SelectTool est actif.
 	var panel = _g.Editor.Toolset.GetToolPanel("SelectTool")
 	if not (panel and panel is CanvasItem and panel.is_visible_in_tree()):
-		return
-
-	# Only when something is selected
+		return null
+	# Seulement quand quelque chose est selectionne.
 	var raw = select_tool.RawSelectables
 	if raw == null or raw.size() == 0:
-		return
-
-	# Skip when cursor is on/near a transform handle or in the rotation zone.
-	# Without this, grabbing a handle that overlaps a bigger asset beneath the
-	# selection deselects instead of starting the rotate/resize.
+		return null
+	# Sur une poignee (coin/redim) ou l'anneau de rotation : laisser DD transformer.
 	if _is_over_transform_handle():
-		return
-
-	# Check if DD sees a different asset under the mouse
-	# Wrap in safety: highlighted can crash when lights exist
+		return null
+	# Un path non couvert est survole : c'est path_fix qui doit gerer la selection
+	# (DD ne "voit" pas les paths plats et survolerait l'asset DESSOUS). Sans ce
+	# garde-fou, on basculerait vers cet asset au release et on volerait la
+	# selection du path que path_fix vient de poser.
+	if path_fix != null and is_instance_valid(path_fix) \
+	and path_fix.has_method("_has_selectable_path_hover") and path_fix._has_selectable_path_hover():
+		return null
+	# DD voit-il un asset sous la souris ?
 	var highlighted = select_tool.get("highlighted")
 	if highlighted == null:
-		return
+		return null
 	var hover_thing = null
 	if typeof(highlighted) == TYPE_OBJECT and is_instance_valid(highlighted):
 		hover_thing = highlighted.get("Thing")
 	if hover_thing == null:
-		return
+		return null
 	if typeof(hover_thing) == TYPE_OBJECT and not is_instance_valid(hover_thing):
-		return
-
-	# Check if the hovered thing is already selected
+		return null
+	# Deja selectionne -> laisser DD gerer normalement (deplacement).
 	for s in raw:
 		if s == null or not is_instance_valid(s):
 			continue
 		var t = s.get("Thing")
 		if t != null and is_instance_valid(t) and t == hover_thing:
-			return  # Already selected, let DD handle normally
+			return null
+	return hover_thing
 
-	# Different asset under mouse — deselect so DD picks up the new one
+
+# Differe (idle) : bascule la selection vers l'asset survole apres que DD ait fini
+# de traiter le release (evite tout conflit avec son RecordTransforms).
+func _do_deferred_switch() -> void:
+	var thing = _pending_release_thing
+	_pending_release_thing = null
+	if thing == null or not is_instance_valid(thing):
+		return
+	if select_tool == null:
+		return
+	# Re-verifier qu'il n'est pas devenu selectionne entre-temps.
+	var raw = select_tool.RawSelectables
+	if raw != null:
+		for s in raw:
+			if s == null or not is_instance_valid(s):
+				continue
+			var t = s.get("Thing")
+			if t != null and is_instance_valid(t) and t == thing:
+				return
 	if not Input.is_key_pressed(KEY_SHIFT):
 		select_tool.DeselectAll()
-		select_tool.EnableTransformBox(false)
+	select_tool.EnableTransformBox(false)
+	if select_tool.has_method("SelectThing"):
+		var made = select_tool.SelectThing(thing, true)
+		if select_tool.has_method("EnableTransformBox"):
+			select_tool.EnableTransformBox(true)
+		if made != null:
+			select_tool.set("highlighted", made)
+	# Annule un eventuel Move residuel arme par DD sur l'ancien asset.
+	if select_tool.get("transformMode") != null:
+		select_tool.set("transformMode", 0)
