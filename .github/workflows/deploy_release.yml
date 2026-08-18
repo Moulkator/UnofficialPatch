@@ -34,13 +34,17 @@ jobs:
       - name: Copy files recursively
         run: cp -r UnofficialPatch/. UnofficialPatch_${{ needs.check-version.outputs.version }}/
       - name: Zip Release
-        run: zip -r UnofficialPatch_${{ needs.check-version.outputs.version }}.zip UnofficialPatch_${{ needs.check-version.outputs.version }}
+        run: |
+          zip -r UnofficialPatch_${{ needs.check-version.outputs.version }}.zip UnofficialPatch_${{ needs.check-version.outputs.version }}
+          zip -r UnofficialPatch.zip UnofficialPatch_${{ needs.check-version.outputs.version }}
       - name: Deploy Release
         uses: softprops/action-gh-release@v2
         with:
           name: ${{ needs.check-version.outputs.version }}
           tag_name: ${{ needs.check-version.outputs.version }}
           prerelease: ${{ contains(needs.check-version.outputs.version, '-') }}
-          files: UnofficialPatch_${{ needs.check-version.outputs.version }}.zip
+          files: |
+            UnofficialPatch_${{ needs.check-version.outputs.version }}.zip
+            UnofficialPatch.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
