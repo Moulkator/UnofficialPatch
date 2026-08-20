@@ -1641,6 +1641,19 @@ func _try_restore() -> void:
 		_pending_opacity = saved.get("opacity", -1.0)
 
 
+# Called by map_resize_fix after it shifts the trace image on a Left/Top
+# map resize. Updates internal tracking so drag-detection doesn't disable
+# the anchor, and persists the new position.
+func on_map_resized(offset: Vector2) -> void:
+	if _anchor_top_left:
+		_anchored_top_left += offset
+	if _g.World != null and is_instance_valid(_g.World):
+		var trace_img = _g.World.TraceImage
+		if trace_img != null and is_instance_valid(trace_img):
+			_expected_pos = trace_img.position
+	_persist_to_modmapdata()
+
+
 func _apply_pending_position() -> void:
 	if _g.World == null or not is_instance_valid(_g.World):
 		return

@@ -366,6 +366,16 @@ func _on_input(event):
 	if not (event is InputEventMouseButton) or not event.pressed:
 		return
 	
+	# Wheel over the LightTool's native Range slider/spinbox: apply the
+	# variable size steps. Must run before the over-UI early return below,
+	# since the slider IS UI.
+	if (event.button_index == BUTTON_WHEEL_UP or event.button_index == BUTTON_WHEEL_DOWN) \
+			and not Input.is_key_pressed(KEY_CONTROL) \
+			and _wheel_over_lt_range():
+		_do_range_change(_g.Editor.Tools["LightTool"], null, event.button_index == BUTTON_WHEEL_UP)
+		input_listener.get_tree().set_input_as_handled()
+		return
+	
 	# Don't intercept over UI
 	if ui_util and ui_util.is_mouse_over_ui(input_listener):
 		return
@@ -454,14 +464,34 @@ func _on_input(event):
 			_sync_rotation_from_preview()
 			input_listener.get_tree().set_input_as_handled()
 		return
-	# Shift+scroll = scale par steps de 0.1 sur le Range du LightTool.
+	# Shift+scroll = scale on the LightTool Range, variable steps.
 	if shift_held:
-		_do_range_step(lt, up, 0.1)
+		_do_range_change(lt, preview, up)
 		input_listener.get_tree().set_input_as_handled()
 		return
 	# Plain scroll : on n'intercepte pas, DD gere son comportement natif (zoom).
 
 
+# Variable wheel step for light size: below 1.0 -> 0.1, from 1.0 to 2.0
+# -> 0.2, above 2.0 -> 0.5. Direction-aware at zone boundaries so scrolling
+# down from exactly 1.0 / 2.0 uses the lower zone's step.
+func _size_wheel_step(current: float, up: bool) -> float:
+	if up:
+		if current < 0.999:
+			return 0.1
+		elif current < 1.999:
+			return 0.2
+		return 0.5
+	if current <= 1.001:
+		return 0.1
+	elif current <= 2.001:
+		return 0.2
+	return 0.5
+
+
+# Wheel step on the LightTool Range control, using the variable size steps
+# above. Result is snapped to the 0.1 grid so off-grid values (e.g. from
+# slider drags) realign on the first wheel notch.
 func _do_range_change(lt, preview, up):
 	var range_ctrl = lt.get("Range")
 	if not (range_ctrl and range_ctrl is Range):
@@ -470,30 +500,35 @@ func _do_range_change(lt, preview, up):
 	if range_ctrl.min_value > 0.1:
 		range_ctrl.min_value = 0.1
 	var current = range_ctrl.value
-	var step = max(current * 0.15, 0.1)
-	if up:
-		current += step
-	else:
-		current -= step
+	var step = _size_wheel_step(current, up)
+	if not up:
+		step = -step
+	current = stepify(current + step, 0.1)
 	current = clamp(current, range_ctrl.min_value, range_ctrl.max_value)
 	range_ctrl.value = current
 
 
-# Additive step on light range (used in OFF mode for Shift+wheel = scale
-# by 0.1). Differs from _do_range_change which uses a 15% relative step.
-func _do_range_step(lt, up: bool, step: float) -> void:
+# True when the mouse hovers the LightTool's native Range slider/spinbox.
+# Hit-tests the parent HBox (slider + spinbox) when available. Uses the
+# Control's own get_global_mouse_position() so both sides of the test are
+# in the same (logical) coordinate space, Retina included.
+func _wheel_over_lt_range() -> bool:
+	var tools = _g.Editor.get("Tools")
+	if not (tools is Dictionary):
+		return false
+	var lt = tools.get("LightTool")
+	if lt == null or not is_instance_valid(lt):
+		return false
 	var range_ctrl = lt.get("Range")
-	if not (range_ctrl and range_ctrl is Range):
-		return
-	if range_ctrl.min_value > 0.1:
-		range_ctrl.min_value = 0.1
-	var current = range_ctrl.value
-	if up:
-		current += step
-	else:
-		current -= step
-	current = clamp(current, range_ctrl.min_value, range_ctrl.max_value)
-	range_ctrl.value = current
+	if not is_instance_valid(range_ctrl) or not (range_ctrl is Control):
+		return false
+	if not range_ctrl.is_visible_in_tree():
+		return false
+	var target = range_ctrl
+	var parent = range_ctrl.get_parent()
+	if parent is HBoxContainer:
+		target = parent
+	return target.get_global_rect().has_point(target.get_global_mouse_position())
 
 
 func _do_style_cycle(lt, preview, up):

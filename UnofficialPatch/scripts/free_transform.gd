@@ -155,6 +155,11 @@ var _warning_dialog : Node = null
 var _popup_layer    : Node = null
 # Matériaux shader distort/perspective — indexés par instance_id (String)
 var _ft_materials   : Dictionary = {}
+# Cache des shaders fusionnés (compat CMT) : hash du code source -> Shader
+# compilé. CMT crée un NOUVEAU ShaderMaterial à chaque changement de réglage,
+# mais le Shader sous-jacent est partagé — sans cache on recompilerait le
+# shader fusionné à chaque tick de slider.
+var _ft_merged_shader_cache : Dictionary = {}
 
 # ── Crop (masque polygonal) ────────────────────────────────────────────────
 # Props uniquement. Polygone stocké par node dans ModMapData["_ft_crop"]
@@ -336,6 +341,55 @@ void fragment(){
 """
 
 
+# ── Fusion warp <-> shaders étrangers (compat Colour and Modify Things) ─────
+# Quand le sprite porte déjà un ShaderMaterial de CMT (universalshader ou
+# colorable_hsl), remplacer le material tuerait les réglages couleur/HSL.
+# On injecte donc le warp bilinéaire DANS le code du shader étranger :
+#   1. uniforms/varying/fonctions ci-dessous (tout est préfixé ft_ pour
+#      éviter les collisions de noms),
+#   2. VERTEX warpé en tête de vertex() (créé s'il n'existe pas),
+#   3. dans fragment(), chaque lecture de UV est remplacée par l'UV warpé
+#      (calculé une seule fois en tête de fonction).
+# Mêmes maths que DISTORT_SHADER_SRC.
+const FT_WARP_MERGE_HEADER = """uniform vec2 ft_corner_tl;
+uniform vec2 ft_corner_tr;
+uniform vec2 ft_corner_br;
+uniform vec2 ft_corner_bl;
+uniform vec2 ft_uv_min = vec2(0.0,0.0);
+uniform vec2 ft_uv_max = vec2(1.0,1.0);
+varying vec2 ft_v_local;
+float ft_cr(vec2 a,vec2 b){return a.x*b.y-a.y*b.x;}
+vec2 ft_warp_uv(vec2 p){
+\tvec2 a=ft_corner_tl,b=ft_corner_tr,c=ft_corner_br,d=ft_corner_bl;
+\tvec2 nrm_ctr=(a+b+c+d)*0.25;
+\tfloat nrm_s=max(max(length(b-a),length(d-a)),1e-3);
+\ta=(a-nrm_ctr)/nrm_s;b=(b-nrm_ctr)/nrm_s;c=(c-nrm_ctr)/nrm_s;d=(d-nrm_ctr)/nrm_s;p=(p-nrm_ctr)/nrm_s;
+\tvec2 e=b-a,f=d-a,g=a-b+c-d,h=p-a;
+\tfloat k2=ft_cr(g,f),k1=ft_cr(e,f)+ft_cr(h,g),k0=ft_cr(h,e);
+\tfloat v;
+\tif(abs(k2)<1e-5){v=-k0/k1;}
+\telse{
+\t\tfloat sq=sqrt(max(k1*k1-4.0*k0*k2,0.0));
+\t\tfloat qq=-0.5*(k1+(k1>=0.0?sq:-sq));
+\t\tfloat v1=qq/k2;
+\t\tfloat v2=abs(qq)>1e-12?k0/qq:v1;
+\t\tv=(v1>=-0.001&&v1<=1.001)?v1:v2;
+\t}
+\tvec2 den=e+g*v;
+\tfloat u=abs(den.x)>abs(den.y)?(h.x-f.x*v)/den.x:(h.y-f.y*v)/den.y;
+\treturn ft_uv_min+clamp(vec2(u,v),0.0,1.0)*(ft_uv_max-ft_uv_min);
+}
+"""
+
+const FT_WARP_MERGE_VERTEX_BODY = """
+\tvec2 ft_t=(UV-ft_uv_min)/max(ft_uv_max-ft_uv_min,vec2(0.0001));
+\tVERTEX=mix(mix(ft_corner_tl,ft_corner_tr,ft_t.x),mix(ft_corner_bl,ft_corner_br,ft_t.x),ft_t.y);
+\tft_v_local=VERTEX;
+"""
+
+const FT_WARP_MERGE_VERTEX_FN = "void vertex(){" + FT_WARP_MERGE_VERTEX_BODY + "}\n"
+
+
 # Shader pour patterns : warp bilinéaire inverse dans le fragment,
 # reproduit fidèlement le pipeline DD : textureSize(), rotation UV, wear, COLOR *=.
 const PATTERN_DISTORT_SHADER_SRC = """shader_type canvas_item;
@@ -479,7 +533,7 @@ void fragment(){
 # ══ Setup ══════════════════════════════════════════════════════════════════
 
 func initialize() -> void:
-	print("[FreeTransform] Initialisation")
+	print("[FreeTransform] Initialisation [BUILD: CMT-DISABLE-HEAL-1]")
 	# Register ourselves so other mods can query the enabled state and
 	# adapt their UI / input handling accordingly (e.g. select_rotation
 	# hides its rotation slider while FT is active).
@@ -2816,10 +2870,63 @@ func _selection_has_pattern() -> bool:
 	return false
 
 
+# True when nd is a portal anchored to one of the walls captured for the
+# current handle drag. Such portals are driven BY their wall and must not be
+# transformed independently.
+func _is_portal_of_dragged_wall(nd: Node) -> bool:
+	if not _wall_drag_active: return false
+	if not _is_portal(nd): return false
+	if _is_freestanding_portal(nd): return false
+	var wall = _get_portal_wall(nd)
+	if wall == null: return false
+	for w in _wall_drag_walls:
+		if w == wall: return true
+	return false
+
+
+# ── Wall.Points ↔ Wall.pointsClosed ────────────────────────────────────────
+# DD keeps a second copy of a LOOPED wall's outline in the private
+# `pointsClosed` array (Points + Points[0] appended). It is built only by
+# Wall.Set() and shifted by Wall.Offset() — RemakeLines() does NOT rebuild
+# it. PortalTool.FindBestLocation() → Wall.FindPortalSpot() reads
+# `Loop ? pointsClosed : Points`, so once we write Points directly the
+# PortalTool keeps snapping new portals onto the wall's OLD outline.
+# Every direct Points write must go through this helper. Godot's Mono
+# property bridge reaches private auto-properties, so we can write the
+# cache back ourselves; non-looped walls need nothing.
+func _set_wall_points(wall, pts) -> void:
+	wall.set("Points", pts)
+	if wall.get("Loop") != true:
+		return
+	if pts == null or pts.size() < 2:
+		return
+	var closed := PoolVector2Array()
+	for p in pts:
+		closed.append(p)
+	closed.append(pts[0])
+	wall.set("pointsClosed", closed)
+	# One-shot sanity check: if the private property turns out to be
+	# unreachable, say so once instead of silently leaving portals
+	# snapping to stale geometry.
+	if not Engine.has_meta("_up_pointsclosed_checked"):
+		Engine.set_meta("_up_pointsclosed_checked", true)
+		var back = wall.get("pointsClosed")
+		if back == null or back.size() != closed.size():
+			printerr("[UnofficialPatch] Wall.pointsClosed is not writable from GDScript; ")
+			printerr("[UnofficialPatch] portals may snap to stale geometry on looped walls.")
+
+
 func _all_portals() -> bool:
 	# Sélection vide (ex: walls-only) → false, sinon les branches
 	# portals (hit test, handles, pivots) s'appliqueraient à tort.
 	if _selected_objects.empty():
+		return false
+	# Idem quand des walls accompagnent les portals : c'est une sélection
+	# de GROUPE, pas une sélection de portals. Les modes dédiés
+	# (walk/slide/offset) et la suppression de la bande de rotation n'ont
+	# alors plus de sens — l'utilisateur veut transformer l'ensemble, et
+	# le portal suit son mur.
+	if not _walls_in_selection.empty():
 		return false
 	for nd in _selected_objects:
 		if is_instance_valid(nd) and not _is_portal(nd):
@@ -2932,6 +3039,18 @@ func _apply_portal_radius_correction(nd: Node, old_radius: float, old_tex_w: flo
 
 func _is_portal(nd: Node) -> bool:
 	return nd.get("Radius") != null and nd.get("WallID") != null
+
+
+# A freestanding portal is a portal that isn't anchored to a wall (WallID == -1).
+# It behaves like a regular prop: it owns its world position and rotation, and
+# nothing re-fits it to a wall. Wall-anchored portals, by contrast, are driven by
+# their wall (RemakeLines re-places and re-orients them), which is why the two
+# kinds must be transformed differently.
+func _is_freestanding_portal(nd: Node) -> bool:
+	if not _is_portal(nd):
+		return false
+	var wall_id = nd.get("WallID")
+	return wall_id == null or int(wall_id) == -1
 
 
 func _is_wall(nd: Node) -> bool:
@@ -3378,6 +3497,11 @@ func _get_portal_wall(portal: Node) -> Node:
 # ══ Géométrie ══════════════════════════════════════════════════════════════
 
 func _mouse_world(vp: Node) -> Vector2:
+	# macOS fix: prefer DD's reference world mouse position; the manual
+	# conversion (viewport mouse + inverse canvas transform) drifts by a
+	# screen offset on some configs (Retina/DPI/UI scaling).
+	if _g != null and _g.get("WorldUI") != null:
+		return _g.WorldUI.MousePosition
 	return vp.canvas_transform.affine_inverse().xform(vp.get_mouse_position())
 
 
@@ -3389,6 +3513,20 @@ func _get_tex_size(node: Node2D) -> Vector2:
 		var bb = _get_path_local_aabb(node)
 		return bb.size
 	var PADDING = 48.0
+	# IMPÉRATIF : passer par la propriété C# "Sprite" du Prop, pas par « le
+	# premier enfant Sprite ». Les mods d'ombres (DropShadowObjects) insèrent
+	# leur sprite d'ombre en child 0 (move_child(shadow, 0)) et peuvent lui
+	# donner une texture bakée de taille différente : la box FT était alors
+	# calculée sur l'ombre, d'où un asset qui saute ou change de taille dès
+	# qu'on tire une poignée.
+	var main = _get_sprite_node(node)
+	if main != null:
+		var mtex = main.get("texture")
+		if mtex != null:
+			var msz = mtex.get_size()
+			var mrr = main.get("region_rect")
+			if mrr is Rect2 and mrr.size.length() > 0.0: msz = mrr.size
+			return msz + Vector2(PADDING, PADDING)
 	for ch in node.get_children():
 		if not (ch is Sprite): continue
 		var tex = ch.get("texture")
@@ -3467,6 +3605,58 @@ func _prop_corners(node: Node2D) -> Array:
 		_local_to_world(node, Vector2( sw, -sh) + soff),
 		_local_to_world(node, Vector2( sw,  sh) + soff),
 		_local_to_world(node, Vector2(-sw,  sh) + soff),
+	]
+
+
+# Coins en espace NODE, dans le même ordre que _prop_corners (tl, tr, br, bl)
+# et surtout dérivés de la MÊME source : si le node porte des coins distort,
+# ceux-ci décrivent un quadrilatère qui n'est plus le rectangle ±hw/±hh.
+# Utilisé par le scale d'un objet cisaillé, qui doit apparier un pivot monde
+# (pris dans st.corners) avec son pivot local — les mélanger reposait l'asset
+# ailleurs dès qu'un distort/perspective/skew avait précédé le scale.
+func _prop_local_corners(node: Node2D) -> Array:
+	if _g.ModMapData.has("_ft_distort"):
+		var id = _ft_node_key(node)
+		if _g.ModMapData["_ft_distort"].has(id):
+			var raw = _g.ModMapData["_ft_distort"][id]
+			var lc: Array
+			if raw.size() == 8:
+				lc = [Vector2(raw[0],raw[1]), Vector2(raw[2],raw[3]),
+				      Vector2(raw[4],raw[5]), Vector2(raw[6],raw[7])]
+			else:
+				lc = raw
+			if _is_pattern(node):
+				return [lc[0], lc[1], lc[2], lc[3]]
+			var sprite = _get_sprite_node(node)
+			var tex = null; var rr = null
+			if sprite != null:
+				tex = sprite.get("texture")
+				rr  = sprite.get("region_rect")
+			var real_w: float; var real_h: float
+			if tex != null and rr is Rect2 and rr.size.length() > 0.0:
+				real_w = rr.size.x; real_h = rr.size.y
+			elif tex != null:
+				real_w = tex.get_size().x; real_h = tex.get_size().y
+			else:
+				real_w = 128.0; real_h = 128.0
+			var PADDING_L = 48.0
+			var ix = (real_w + PADDING_L) / real_w
+			var iy = (real_h + PADDING_L) / real_h
+			var soff_d = _get_visual_offset(node)
+			return [
+				Vector2(lc[0].x * ix, lc[0].y * iy) + soff_d,
+				Vector2(lc[1].x * ix, lc[1].y * iy) + soff_d,
+				Vector2(lc[2].x * ix, lc[2].y * iy) + soff_d,
+				Vector2(lc[3].x * ix, lc[3].y * iy) + soff_d,
+			]
+	var ts = _get_tex_size(node)
+	var sw = ts.x * 0.5; var sh = ts.y * 0.5
+	var soff = _get_visual_offset(node)
+	return [
+		Vector2(-sw, -sh) + soff,
+		Vector2( sw, -sh) + soff,
+		Vector2( sw,  sh) + soff,
+		Vector2(-sw,  sh) + soff,
 	]
 
 
@@ -3864,6 +4054,12 @@ func _start_handle_drag(handle_idx: int, wp: Vector2) -> void:
 	_drag_states.clear()
 	for nd in _selected_objects:
 		if not is_instance_valid(nd): continue
+		# Portal anchored to a wall we're about to drag: skip it. The wall
+		# transform already moves and re-orients its child portals
+		# (_apply_transform_to_wall), so keeping the portal in _drag_states
+		# applied the same rotation/translation a second time — it spun and
+		# orbited at double speed while the wall turned once.
+		if _is_portal_of_dragged_wall(nd): continue
 		var wall_arc = _build_wall_arc(nd) if _is_portal(nd) else null
 		var arc_rot_start = 0.0
 		if wall_arc != null and not wall_arc.empty():
@@ -3873,6 +4069,7 @@ func _start_handle_drag(handle_idx: int, wp: Vector2) -> void:
 			"node": nd, "pos": nd.position, "rot": nd.rotation,
 			"scale": nd.scale, "tex_size": _get_tex_size(nd),
 			"corners": _prop_corners(nd),
+			"local_corners": _prop_local_corners(nd),
 			"node_transform": nd.transform,
 			"portal_radius": nd.get("Radius") if _is_portal(nd) else null,
 			"sprite_pos": nd.get("Sprite").position if nd.get("Sprite") != null else null,
@@ -4219,31 +4416,39 @@ func _update_handle_drag(wp: Vector2, vp: Node) -> void:
 				pivot_world = st.node_transform.origin
 				pivot_local = Vector2(-soff.x, -soff.y)
 			else:
+				# Pivot local pris dans le MÊME quadrilatère que le pivot monde.
+				# Avec des coins distort le contour n'est plus le rectangle
+				# ±hw/±hh : apparier st.corners (déformé) avec un pivot local
+				# rectangulaire décalait new_origin, d'où l'asset qui se
+				# repose ailleurs quand on tire un côté en Scale après un
+				# skew/distort/perspective.
+				var lcn = st.get("local_corners", [])
+				var use_lcn = lcn is Array and lcn.size() == 4
 				match _active_handle:
 					0:
 						pivot_world = st.corners[2]
-						pivot_local = Vector2(hw - soff.x, hh - soff.y)
+						pivot_local = lcn[2] if use_lcn else Vector2(hw - soff.x, hh - soff.y)
 					2:
 						pivot_world = st.corners[3]
-						pivot_local = Vector2(-hw - soff.x, hh - soff.y)
+						pivot_local = lcn[3] if use_lcn else Vector2(-hw - soff.x, hh - soff.y)
 					4:
 						pivot_world = st.corners[0]
-						pivot_local = Vector2(-hw - soff.x, -hh - soff.y)
+						pivot_local = lcn[0] if use_lcn else Vector2(-hw - soff.x, -hh - soff.y)
 					6:
 						pivot_world = st.corners[1]
-						pivot_local = Vector2(hw - soff.x, -hh - soff.y)
+						pivot_local = lcn[1] if use_lcn else Vector2(hw - soff.x, -hh - soff.y)
 					1:
 						pivot_world = (st.corners[2] + st.corners[3]) * 0.5
-						pivot_local = Vector2(-soff.x, hh - soff.y)
+						pivot_local = ((lcn[2] + lcn[3]) * 0.5) if use_lcn else Vector2(-soff.x, hh - soff.y)
 					5:
 						pivot_world = (st.corners[0] + st.corners[1]) * 0.5
-						pivot_local = Vector2(-soff.x, -hh - soff.y)
+						pivot_local = ((lcn[0] + lcn[1]) * 0.5) if use_lcn else Vector2(-soff.x, -hh - soff.y)
 					3:
 						pivot_world = (st.corners[0] + st.corners[3]) * 0.5
-						pivot_local = Vector2(-hw - soff.x, -soff.y)
+						pivot_local = ((lcn[0] + lcn[3]) * 0.5) if use_lcn else Vector2(-hw - soff.x, -soff.y)
 					7:
 						pivot_world = (st.corners[1] + st.corners[2]) * 0.5
-						pivot_local = Vector2(hw - soff.x, -soff.y)
+						pivot_local = ((lcn[1] + lcn[2]) * 0.5) if use_lcn else Vector2(hw - soff.x, -soff.y)
 					_:
 						pivot_world = st.node_transform.origin
 						pivot_local = Vector2(-soff.x, -soff.y)
@@ -4480,6 +4685,12 @@ func _portal_offset_key(portal: Node) -> String:
 	var dist    = portal.get("WallDistance")
 	var idx     = portal.get("WallPointIndex")
 	if wall_id == null: return ""
+	# Freestanding portals (WallID == -1) share the same WallDistance /
+	# WallPointIndex defaults, so they would all collapse onto one key and
+	# clobber each other's stored rotation. They also don't need the store:
+	# nothing re-fits them to a wall, and portal_tool_fix already persists
+	# their rotation across save/load. Keep them out entirely.
+	if int(wall_id) == -1: return ""
 	return str(wall_id) + "_" + str(idx) + "_" + str(stepify(float(dist), 0.1))
 
 
@@ -5274,12 +5485,20 @@ func _get_shadow_sprite(node):
 		return null
 	if node.get_child_count() < 1:
 		return null
-	var sh = node.get_child(0)
-	if sh == null or not (sh is Sprite):
-		return null
-	if sh == _get_sprite_node(node):
-		return null
-	return sh
+	var main = _get_sprite_node(node)
+	# L'ombre vanilla se distingue par show_behind_parent (Prop._EnterTree la
+	# crée ainsi). Les sprites d'ombre des mods tiers sont eux aussi enfants du
+	# Prop — DropShadowObjects place le sien en child 0 avec
+	# show_behind_parent = false — donc un simple get_child(0) attrapait le
+	# mauvais nœud : FT écrasait le material du mod et laissait l'ombre vanilla
+	# non déformée.
+	for i in range(node.get_child_count()):
+		var ch = node.get_child(i)
+		if ch == null or not (ch is Sprite) or ch == main:
+			continue
+		if ch.show_behind_parent:
+			return ch
+	return null
 
 
 func _shadow_capture_orig(node, shadow) -> void:
@@ -5688,7 +5907,153 @@ func _remove_distort_pattern(node: Node2D) -> void:
 # Convertit des coins monde → espace local Sprite, puis applique le shader.
 # Utilise VisualServer.canvas_item_set_material() pour éviter d'émettre
 # _change_notify("material") qui fait crasher SelectTool.get_Selectables().
-func _apply_distort_shader(node: Node2D, world_corners: Array) -> void:
+# Empreinte de la config CMT (Colour and Modify Things) d'un node — "" si
+# aucune. Lecture SEULE dans le store partagé de CMT (UchideshiNodeData, écrit
+# par son CustomDataManager) : aucun couplage de code, juste ModMapData.
+# Sert à détecter une désactivation CMT que sa propre garde ne nettoie pas
+# (is_node_using_universal_shader compare l'instance de Shader, et notre
+# shader FUSIONNÉ n'est pas la sienne -> CMT ne touche pas au material, donc
+# aucun swap n'est observable ; seule sa CONFIG bouge).
+func _ft_cmt_data_fingerprint(node) -> String:
+	if node == null or not is_instance_valid(node) or not node.has_meta("node_id"):
+		return ""
+	var store = _g.ModMapData.get("UchideshiNodeData", null)
+	if not (store is Dictionary) or not store.has("data"):
+		return ""
+	var key = "node-id-" + str(node.get_meta("node_id"))
+	if not store["data"].has(key):
+		return ""
+	return JSON.print(store["data"][key])
+
+
+func _ft_get_merged_warp_shader(src_code: String):
+	# Retourne le Shader warp fusionné pour ce code source (ou null si la
+	# fusion échoue). Mis en cache par hash : CMT ne possède que 2-3 shaders
+	# distincts (universalshader, colorable_hsl), le cache reste minuscule.
+	var ck = str(src_code.hash()) + "_" + str(src_code.length())
+	if _ft_merged_shader_cache.has(ck):
+		return _ft_merged_shader_cache[ck]
+	var code = _ft_merge_warp_into_shader(src_code)
+	var sh = null
+	if code != "":
+		sh = Shader.new()
+		sh.code = code
+	_ft_merged_shader_cache[ck] = sh
+	return sh
+
+
+func _ft_merge_warp_into_shader(src_code: String) -> String:
+	# Injecte le warp bilinéaire FT dans un shader canvas_item étranger.
+	# Retourne "" si la structure du shader n'est pas reconnue (le fallback
+	# est alors le remplacement classique du material).
+	if src_code.find("void fragment") < 0:
+		return ""
+	var code = src_code
+
+	# ── 1. Header (uniforms + varying + fonctions ft_*) : inséré avant la
+	# première déclaration top-level, donc après shader_type/render_mode.
+	var ins = -1
+	for tok in ["\nuniform ", "\nvarying ", "\nconst ", "\nvoid "]:
+		var p = code.find(tok)
+		if p >= 0 and (ins < 0 or p < ins):
+			ins = p
+	if ins < 0:
+		var st = code.find("shader_type")
+		if st < 0:
+			return ""
+		ins = code.find(";", st)
+		if ins < 0:
+			return ""
+		ins += 1
+	var header = FT_WARP_MERGE_HEADER
+	if code.find("void vertex") < 0:
+		header += FT_WARP_MERGE_VERTEX_FN
+	code = code.insert(ins, "\n" + header + "\n")
+
+	# ── 2. Warp du VERTEX en tête du vertex() existant (le vertex ajouté par
+	# le header contient déjà le warp — le garde-fou évite le doublon).
+	if code.find("ft_v_local=VERTEX") < 0:
+		var vp = code.find("void vertex")
+		if vp < 0:
+			return ""
+		var vb = code.find("{", vp)
+		if vb < 0:
+			return ""
+		code = code.insert(vb + 1, FT_WARP_MERGE_VERTEX_BODY)
+
+	# ── 3. Fragment : remplace chaque lecture de UV par l'UV warpé, calculé
+	# une seule fois. \bUV\b ne touche ni SCREEN_UV ni world_uv/path_uv/etc.
+	var fp = code.find("void fragment")
+	if fp < 0:
+		return ""
+	var fb = code.find("{", fp)
+	if fb < 0:
+		return ""
+	var fe = _ft_find_matching_brace(code, fb)
+	if fe < 0:
+		return ""
+	var body = code.substr(fb + 1, fe - fb - 1)
+	var rx = RegEx.new()
+	if rx.compile("\\bUV\\b") != OK:
+		return ""
+	body = rx.sub(body, "ft_uv", true)
+	body = "\n\tvec2 ft_uv=ft_warp_uv(ft_v_local);" + body
+	return code.substr(0, fb + 1) + body + code.substr(fe, code.length() - fe)
+
+
+func _ft_find_matching_brace(code: String, open_idx: int) -> int:
+	# Index de l'accolade fermante correspondante, en ignorant les
+	# commentaires // et /* */. -1 si non trouvée.
+	var depth = 0
+	var i = open_idx
+	var n = code.length()
+	while i < n:
+		var c = code[i]
+		if c == "/" and i + 1 < n and code[i + 1] == "/":
+			var nl = code.find("\n", i)
+			if nl < 0:
+				return -1
+			i = nl + 1
+			continue
+		if c == "/" and i + 1 < n and code[i + 1] == "*":
+			var ce = code.find("*/", i + 2)
+			if ce < 0:
+				return -1
+			i = ce + 2
+			continue
+		if c == "{":
+			depth += 1
+		elif c == "}":
+			depth -= 1
+			if depth == 0:
+				return i
+		i += 1
+	return -1
+
+
+func _ft_copy_shader_params(src_mat, dst_mat) -> void:
+	# Recopie tous les uniforms explicitement définis du material source vers
+	# le material fusionné (les non-définis gardent les défauts du shader,
+	# conservés à l'identique dans le code fusionné).
+	if src_mat == null or dst_mat == null or not (src_mat is ShaderMaterial):
+		return
+	if src_mat.shader == null:
+		return
+	var plist = VisualServer.shader_get_param_list(src_mat.shader.get_rid())
+	for p in plist:
+		var pname = str(p.get("name", ""))
+		if pname == "":
+			continue
+		if pname.begins_with("shader_param/"):
+			pname = pname.substr(13, pname.length() - 13)
+		if pname.begins_with("ft_"):
+			continue
+		var v = src_mat.get_shader_param(pname)
+		if v != null:
+			dst_mat.set_shader_param(pname, v)
+
+
+func _apply_distort_shader(node: Node2D, world_corners: Array, shader_corners = null) -> void:
 	# Crop et distort sont mutuellement exclusifs sur un même node.
 	var _ck = _ft_node_key(node)
 	if _ck != "" and _g.ModMapData.has("_ft_crop") and _g.ModMapData["_ft_crop"].has(_ck):
@@ -5697,35 +6062,44 @@ func _apply_distort_shader(node: Node2D, world_corners: Array) -> void:
 	var sprite = _get_sprite_node(node)
 	if sprite == null: return
 
-	# Coins monde → espace local du Sprite (coordonnées paddées)
-	var sprite_world_inv = (node.transform * sprite.transform).affine_inverse()
-	var lc_padded = []
-	for wc in world_corners:
-		lc_padded.append(sprite_world_inv.xform(wc))
-
-	# Le vertex shader Godot mappe UV 0→1 sur les vertices du Sprite qui sont à ±real_size/2.
-	# Nos coins locaux sont à ±(real+48)/2 (padding de _get_tex_size).
-	# Il faut réduire les coins locaux par le ratio real/total pour que les vertices
-	# correspondent à la zone de texture réelle et non à la zone paddée.
-	var tex = sprite.get("texture")
-	var rr  = sprite.get("region_rect")
-	var real_w: float
-	var real_h: float
-	if tex != null and rr is Rect2 and rr.size.length() > 0.0:
-		real_w = rr.size.x; real_h = rr.size.y
-	elif tex != null:
-		real_w = tex.get_size().x; real_h = tex.get_size().y
-	else:
-		real_w = 128.0; real_h = 128.0
-	var PADDING = 48.0
-	var sx = real_w / (real_w + PADDING)   # ratio X : réel / total
-	var sy = real_h / (real_h + PADDING)   # ratio Y : réel / total
-
-	# Dans l'espace local du Sprite, le centre est toujours (0,0).
-	# lc_shader[i] = lc_padded[i] * (real/total) — réduit vers le centre.
 	var lc = []
-	for p in lc_padded:
-		lc.append(Vector2(p.x * sx, p.y * sy))
+	if shader_corners is Array and shader_corners.size() == 4:
+		# Coins DÉJÀ en espace shader (±real/2), tels que stockés dans
+		# _ft_distort : réinstallation directe, AUCUNE reconversion. La
+		# reconversion monde→local→ratio de padding n'est PAS un aller-retour
+		# exact (elle re-multiplie par real/(real+48)) : chaque passage
+		# rétrécissait les coins stockés — visible en boucle dès qu'un rebuild
+		# était déclenché (ex. swap de material par le highlight de survol).
+		lc = shader_corners
+	else:
+		# Coins monde → espace local du Sprite (coordonnées paddées)
+		var sprite_world_inv = (node.transform * sprite.transform).affine_inverse()
+		var lc_padded = []
+		for wc in world_corners:
+			lc_padded.append(sprite_world_inv.xform(wc))
+
+		# Le vertex shader Godot mappe UV 0→1 sur les vertices du Sprite qui sont à ±real_size/2.
+		# Nos coins locaux sont à ±(real+48)/2 (padding de _get_tex_size).
+		# Il faut réduire les coins locaux par le ratio real/total pour que les vertices
+		# correspondent à la zone de texture réelle et non à la zone paddée.
+		var tex = sprite.get("texture")
+		var rr  = sprite.get("region_rect")
+		var real_w: float
+		var real_h: float
+		if tex != null and rr is Rect2 and rr.size.length() > 0.0:
+			real_w = rr.size.x; real_h = rr.size.y
+		elif tex != null:
+			real_w = tex.get_size().x; real_h = tex.get_size().y
+		else:
+			real_w = 128.0; real_h = 128.0
+		var PADDING = 48.0
+		var sx = real_w / (real_w + PADDING)   # ratio X : réel / total
+		var sy = real_h / (real_h + PADDING)   # ratio Y : réel / total
+
+		# Dans l'espace local du Sprite, le centre est toujours (0,0).
+		# lc_shader[i] = lc_padded[i] * (real/total) — réduit vers le centre.
+		for p in lc_padded:
+			lc.append(Vector2(p.x * sx, p.y * sy))
 
 	# Récupère ou crée le ShaderMaterial
 	# On stocke le mat dans une variable GDScript propre au script pour éviter
@@ -5737,9 +6111,11 @@ func _apply_distort_shader(node: Node2D, world_corners: Array) -> void:
 
 		# Sauvegarde le matériau original pour pouvoir le restaurer
 		var original_mat = sprite.material
-		# (ne pas sauvegarder notre propre shader si on re-installe pour un autre mode)
+		# (ne pas sauvegarder notre propre shader si on re-installe pour un autre
+		# mode — mais on récupère l'original qu'il avait mémorisé, ex. le
+		# material CMT, pour ne pas le perdre)
 		if original_mat is ShaderMaterial and original_mat.has_meta("_ft_warp") and original_mat.get_meta("_ft_warp") == true:
-			original_mat = null
+			original_mat = original_mat.get_meta("_ft_orig_mat") if original_mat.has_meta("_ft_orig_mat") else null
 
 		# Détecte si le sprite a déjà un shader custom color (tint_r)
 		var has_custom_color = false
@@ -5759,36 +6135,64 @@ func _apply_distort_shader(node: Node2D, world_corners: Array) -> void:
 				var ms = original_mat.get_shader_param("min_saturation")
 				if ms != null: min_sat = ms
 
-		sh.code = DISTORT_SHADER_CUSTOM_COLOR_SRC if has_custom_color else DISTORT_SHADER_SRC
-		mat.shader = sh
-		mat.set_meta("_ft_warp", true)
+		# Compat CMT (Colour and Modify Things) : si le material courant vient
+		# de CMT (universalshader → apply_grayscale, colorable_hsl → apply_hsl),
+		# on FUSIONNE le warp dans son code au lieu de le remplacer — les
+		# réglages couleur/HSL restent visibles pendant distort/perspective/skew.
+		var merged_sh = null
+		if original_mat is ShaderMaterial and original_mat.shader != null:
+			var src_m = original_mat.shader.code
+			if ("apply_grayscale" in src_m) or ("apply_hsl" in src_m):
+				merged_sh = _ft_get_merged_warp_shader(src_m)
 
-		if has_custom_color:
-			mat.set_shader_param("tint_r",        tint_r_val)
-			mat.set_shader_param("min_redness",   min_redness)
-			mat.set_shader_param("red_tolerance", red_tol)
-			mat.set_shader_param("min_saturation",min_sat)
+		if merged_sh != null:
+			mat.shader = merged_sh
+			mat.set_meta("_ft_warp", true)
+			mat.set_meta("_ft_merged", true)
+			# Recopie tous les uniforms du material CMT (couleurs, HSL, textures…)
+			_ft_copy_shader_params(original_mat, mat)
+			# Empreinte de la config CMT au moment de la fusion : la boucle de
+			# heal la compare pour détecter une désactivation CMT sans swap de
+			# material (cf. _ft_cmt_data_fingerprint).
+			mat.set_meta("_ft_cmt_fp", _ft_cmt_data_fingerprint(node))
+		else:
+			sh.code = DISTORT_SHADER_CUSTOM_COLOR_SRC if has_custom_color else DISTORT_SHADER_SRC
+			mat.shader = sh
+			mat.set_meta("_ft_warp", true)
 
-		# UV région : texture réelle (ou region_rect si sprite sheet)
+			if has_custom_color:
+				mat.set_shader_param("tint_r",        tint_r_val)
+				mat.set_shader_param("min_redness",   min_redness)
+				mat.set_shader_param("red_tolerance", red_tol)
+				mat.set_shader_param("min_saturation",min_sat)
+
+		# Mémorise l'original SUR le mat aussi : si l'entrée _ft_materials est
+		# perdue (rebuild après swap CMT), on peut encore retrouver l'original.
+		mat.set_meta("_ft_orig_mat", original_mat)
+
+		# UV région : texture réelle (ou region_rect si sprite sheet).
+		# Noms préfixés ft_ dans la variante fusionnée (collision-proof).
+		var _uvp = "ft_" if merged_sh != null else ""
 		var uv_tex = sprite.get("texture")
 		var uv_rr  = sprite.get("region_rect")
 		if uv_tex != null and uv_rr is Rect2 and uv_rr.size.length() > 0.0:
 			var ts = uv_tex.get_size()
-			mat.set_shader_param("uv_min", Vector2(uv_rr.position.x / ts.x, uv_rr.position.y / ts.y))
-			mat.set_shader_param("uv_max", Vector2((uv_rr.position.x + uv_rr.size.x) / ts.x,
-			                                       (uv_rr.position.y + uv_rr.size.y) / ts.y))
+			mat.set_shader_param(_uvp + "uv_min", Vector2(uv_rr.position.x / ts.x, uv_rr.position.y / ts.y))
+			mat.set_shader_param(_uvp + "uv_max", Vector2((uv_rr.position.x + uv_rr.size.x) / ts.x,
+			                                              (uv_rr.position.y + uv_rr.size.y) / ts.y))
 		else:
-			mat.set_shader_param("uv_min", Vector2.ZERO)
-			mat.set_shader_param("uv_max", Vector2.ONE)
+			mat.set_shader_param(_uvp + "uv_min", Vector2.ZERO)
+			mat.set_shader_param(_uvp + "uv_max", Vector2.ONE)
 
 		_ft_materials[id] = {"warp": mat, "original": original_mat}
 		sprite.material = mat
 
 	var mat = _ft_materials[id]["warp"]
-	mat.set_shader_param("corner_tl", lc[0])
-	mat.set_shader_param("corner_tr", lc[1])
-	mat.set_shader_param("corner_br", lc[2])
-	mat.set_shader_param("corner_bl", lc[3])
+	var _cpfx = "ft_" if (mat is ShaderMaterial and mat.has_meta("_ft_merged")) else ""
+	mat.set_shader_param(_cpfx + "corner_tl", lc[0])
+	mat.set_shader_param(_cpfx + "corner_tr", lc[1])
+	mat.set_shader_param(_cpfx + "corner_br", lc[2])
+	mat.set_shader_param(_cpfx + "corner_bl", lc[3])
 
 	# Stocke les coins en local pour persistance entre drags
 	_store_distort_corners(node, lc)
@@ -5890,14 +6294,45 @@ func _restore_distort_from_store(select_active: bool = true) -> void:
 				wc.append(c + nd.position)
 			_apply_distort_pattern(nd, wc)
 		else:
-			if _ft_materials.has(key): continue  # shader déjà installé
 			var sprite = _get_sprite_node(nd)
 			if sprite == null: continue
-			var to_world = nd.transform * sprite.transform
-			var wc = []
-			for c in lc:
-				wc.append(to_world.xform(c))
-			_apply_distort_shader(nd, wc)
+			if _ft_materials.has(key):
+				var cur = sprite.material
+				if cur == _ft_materials[key].get("warp"):
+					# Shader encore en place. Cas particulier : material FUSIONNÉ
+					# dont la config CMT a changé SANS swap — c'est la
+					# désactivation CMT, dont la garde échoue sur notre shader
+					# fusionné (elle compare les instances de Shader) : CMT ne
+					# nettoie pas le material, donc rien à détecter côté swap.
+					# L'empreinte de config stockée à la fusion nous le dit ; on
+					# repart alors d'un material NU et on rebâtit un warp non
+					# fusionné (couleurs d'origine). Les materials d'avant cette
+					# version n'ont pas d'empreinte -> comportement inchangé.
+					var fp_stale = false
+					if cur is ShaderMaterial and cur.has_meta("_ft_merged") and cur.has_meta("_ft_cmt_fp"):
+						fp_stale = cur.get_meta("_ft_cmt_fp") != _ft_cmt_data_fingerprint(nd)
+					if not fp_stale:
+						continue  # shader encore en place, config CMT inchangée
+					sprite.material = null
+					cur = null  # tombe dans le rebuild ci-dessous (swap reconnu: null)
+				# Le material du sprite n'est plus notre warp. On ne rebâtit que
+				# sur un swap RECONNU : null (reset CMT/DD) ou shader CMT /
+				# custom color (CMT crée un NOUVEAU ShaderMaterial à chaque
+				# changement de réglage). Tout autre material est transitoire —
+				# le highlight de survol de DD remplace lui aussi le material et
+				# restaure le nôtre de lui-même au unhover ; rebâtir pendant le
+				# survol écraserait le highlight et churnait à chaque frame.
+				var recognized = (cur == null)
+				if not recognized and cur is ShaderMaterial and cur.shader != null:
+					var cc = cur.shader.code
+					if ("apply_grayscale" in cc) or ("apply_hsl" in cc) or ("tint_r" in cc):
+						recognized = true
+				if not recognized:
+					continue
+				_ft_materials.erase(key)
+			# Réinstalle avec les coins stockés TELS QUELS (espace shader) —
+			# jamais via la reconversion monde (non idempotente, cf. plus haut).
+			_apply_distort_shader(nd, [], lc)
 	for key in dead_keys:
 		store.erase(key)
 		_ft_materials.erase(key)
@@ -7584,6 +8019,136 @@ func _on_path_warning_choice(id: int) -> void:
 	_pending_mode = ""
 
 
+# ══ Options du menu contextuel, calculees SANS que FT soit actif ═══════════
+# Consomme par ft_context.gd pour son sous-menu : lui n'a pas acces a la
+# selection FT (_selected_objects n'est peuple que quand FT tourne) ni aux
+# regles de disponibilite des modes. Retourne [{label, id}] avec {_sep=true}
+# pour les separateurs ; les ids sont ceux de _on_transform_menu_id().
+const _FT_TRANSFORM_MARK_KEYS = [
+	"_ft_distort", "_ft_crop", "_ft_edgecrop", "_ft_transforms", "_ft_orig_xform",
+	"_ft_width_warp", "_ft_pattern_orig", "_portal_offsets", "_ft_wall_reset",
+	"_ft_path_reset",
+]
+
+
+func get_context_menu_options() -> Array:
+	var out := []
+	var props := []
+	var tree = _g.World.get_tree() if _g.World != null else null
+	if tree == null or tree.root == null:
+		return out
+	var vp = tree.root.get_node_or_null(_viewport_path)
+	if vp != null:
+		var world = vp.get_node_or_null("World")
+		if world != null:
+			var fresh : Array = []
+			_collect_selected_props(world, fresh, 0)
+			if _select_tool != null:
+				var sel = _select_tool.get("Selected")
+				if sel != null:
+					for nd in sel:
+						if is_instance_valid(nd) and (_is_pattern(nd) or _is_path(nd)) and not fresh.has(nd):
+							fresh.append(nd)
+			for nd in fresh:
+				if _is_roof(nd) or _is_light(nd):
+					continue
+				if _is_path(nd):
+					props.append(nd)
+				elif not (nd is Line2D) and not _is_wall(nd):
+					props.append(nd)
+	var walls := _selected_walls()
+	var lights := _selected_lights()
+
+	if props.empty() and walls.empty():
+		# Lights seules : seules les symetries s'appliquent.
+		if lights.empty():
+			return out
+		out.append({label = "Horizontal Symmetry", id = 20})
+		out.append({label = "Vertical Symmetry", id = 21})
+		return out
+
+	if props.empty():
+		# Walls seuls.
+		var labels_w = {0: "Scale", 1: "Skew", 2: "Distort", 3: "Perspective"}
+		for mid in [0, 1, 2, 3]:
+			out.append({label = labels_w[mid], id = mid})
+		out.append({_sep = true, label = "", id = -1})
+		out.append({label = "Horizontal Symmetry", id = 20})
+		out.append({label = "Vertical Symmetry", id = 21})
+		if _selection_has_ft_transform(walls):
+			out.append({_sep = true, label = "", id = -1})
+			out.append({label = "Reset Transform", id = 22})
+		return out
+
+	if walls.empty() and _all_portals_in(props):
+		out.append({label = "Scale", id = 0})
+		out.append({label = "Slide", id = 13})
+		out.append({label = "Offset", id = 12})
+		out.append({_sep = true, label = "", id = -1})
+		out.append({label = "Horizontal Symmetry", id = 20})
+		out.append({label = "Vertical Symmetry", id = 21})
+		if _selection_has_ft_transform(props):
+			out.append({_sep = true, label = "", id = -1})
+			out.append({label = "Reset transform", id = 10})
+		return out
+
+	var labels = {0: "Scale", 1: "Skew", 2: "Distort", 3: "Perspective", 4: "Crop", 5: "Soft Crop", 6: "Edge Crop"}
+	var all_paths = true
+	var has_path = false
+	for nd in props:
+		if _is_path(nd):
+			has_path = true
+		elif is_instance_valid(nd):
+			all_paths = false
+	if not has_path:
+		all_paths = false
+	var modes = [0, 1, 2, 3]
+	# Crop : un seul prop simple selectionne, comme dans _show_transform_menu_at.
+	if not all_paths and props.size() == 1 and _is_plain_prop(props[0]):
+		modes = [0, 1, 2, 3, 4, 5, 6]
+	for mid in modes:
+		if mid == 4:
+			out.append({_sep = true, label = "", id = -1})
+		out.append({label = labels[mid], id = mid})
+	out.append({_sep = true, label = "", id = -1})
+	out.append({label = "Horizontal Symmetry", id = 20})
+	out.append({label = "Vertical Symmetry", id = 21})
+	var resettable = props.duplicate()
+	for w in walls:
+		resettable.append(w)
+	if _selection_has_ft_transform(resettable):
+		out.append({_sep = true, label = "", id = -1})
+		out.append({label = "Reset transform", id = 10})
+	return out
+
+
+func _all_portals_in(props: Array) -> bool:
+	if props.empty():
+		return false
+	for nd in props:
+		if is_instance_valid(nd) and not _is_portal(nd):
+			return false
+	return true
+
+
+# Vrai des qu'un des assets porte une donnee FT persistee : c'est ce que
+# Reset defait, donc l'entree n'a de sens que dans ce cas.
+func _selection_has_ft_transform(nodes: Array) -> bool:
+	if _g == null or _g.ModMapData == null or not (_g.ModMapData is Dictionary):
+		return false
+	for nd in nodes:
+		if nd == null or not is_instance_valid(nd):
+			continue
+		var key = _ft_node_key(nd)
+		if key == "":
+			continue
+		for store_key in _FT_TRANSFORM_MARK_KEYS:
+			var store = _g.ModMapData.get(store_key)
+			if store is Dictionary and store.has(key):
+				return true
+	return false
+
+
 func _show_transform_menu() -> void:
 	var mouse_pos = _g.World.get_tree().root.get_mouse_position()
 	_show_transform_menu_at(mouse_pos)
@@ -7653,6 +8218,10 @@ func _show_transform_menu_at(pos: Vector2) -> void:
 		if not all_paths and _selected_objects.size() == 1 and _is_plain_prop(_selected_objects[0]):
 			modes = [0, 1, 2, 3, 4, 5, 6]
 		for mid in modes:
+			# Les modes Crop forment un bloc a part (ils n'agissent que sur un
+			# prop simple) : separateur juste au-dessus.
+			if mid == 4:
+				menu.add_separator()
 			var prefix = "» " if mid == cur_id else "  "
 			menu.add_item(prefix + labels[mid], mid)
 
@@ -7842,9 +8411,11 @@ func _flip_selection(horizontal: bool) -> void:
 	for nd in flippable:
 		if not is_instance_valid(nd):
 			continue
-		if _is_portal(nd):
-			# Portal : flip LOCAL (reste collé au mur). H → scale.x, V → scale.y.
-			# Le Radius utilise abs(scale.x), donc la taille ne change pas.
+		if _is_portal(nd) and not _is_freestanding_portal(nd):
+			# Wall-anchored portal : flip LOCAL (reste collé au mur).
+			# H → scale.x, V → scale.y. Le Radius utilise abs(scale.x), donc
+			# la taille ne change pas. La position n'est PAS miroirée : le
+			# portal est piloté par son mur, un miroir monde le décollerait.
 			var sc = nd.scale
 			if horizontal:
 				sc.x = -sc.x
@@ -7956,6 +8527,7 @@ func _flip_selection(horizontal: bool) -> void:
 				"snap": pre,
 				"portal_scales": _capture_portal_scales(w),
 				"width_warp": _ft_width_profile_copy(w),
+				"shadow_dir": _drop_shadow_dir(w),
 			})
 			dsw._apply_transform_to_wall(w, pre, R)
 			var rot_map = pre.get("portal_rots", {})
@@ -7969,11 +8541,13 @@ func _flip_selection(horizontal: bool) -> void:
 				portal.scale = psc
 			if w.has_method("RemakeLines"):
 				w.RemakeLines()
+			_swap_drop_shadow_side(w)
 			wall_entries_after.append({
 				"wall": w,
 				"snap": dsw._snapshot_wall(w),
 				"portal_scales": _capture_portal_scales(w),
 				"width_warp": _ft_width_profile_copy(w),
+				"shadow_dir": _drop_shadow_dir(w),
 			})
 
 	_save_ft_data()
@@ -7982,6 +8556,74 @@ func _flip_selection(horizontal: bool) -> void:
 			wall_entries_before, wall_entries_after)
 	_save_ft_data()
 	print("[FreeTransform] Symmetry %s appliquée (%d prop(s), %d wall(s), %d light(s))" % [("Horizontal" if horizontal else "Vertical"), flippable.size(), sel_walls.size(), sel_lights.size()])
+
+
+# Le mod tiers Drop Shadow (DropShadowWalls.gd) choisit le côté de son ombre
+# à partir de la normale gauche des points du wall — perp(dir) = (−dir.y,
+# dir.x). Une réflexion inverse la chiralité : à ordre de points identique,
+# cette normale désigne désormais le côté OPPOSÉ, donc l'ombre saute de
+# l'autre côté alors que le bouton affiche toujours Side A.
+#
+# Les paths n'ont pas ce problème : leur miroir inverse déjà l'ordre des
+# points (voir plus haut) pour préserver le côté monde. On ne peut pas faire
+# pareil sur un wall — les portails attachés indexent les segments via
+# WallPointIndex / WallDistance, qu'une inversion invaliderait. On échange
+# donc le côté stocké, ce qui revient au même visuellement : le bouton
+# bascule sur Side B, ce qu'il décrit honnêtement puisque le côté a bien
+# changé dans le repère du mur.
+#
+# Le mod surveille le hash des points et reconstruit son ombre tout seul
+# après la déformation : il suffit d'écrire la config avant qu'il ne passe.
+const _DROP_SHADOW_DATA_KEY = "DropShadow"
+
+
+func _drop_shadow_cfg(wall):
+	if wall == null or not is_instance_valid(wall) or not wall.has_meta("node_id"):
+		return null
+	if _g == null or _g.ModMapData == null or not (_g.ModMapData is Dictionary):
+		return null
+	var store = _g.ModMapData.get(_DROP_SHADOW_DATA_KEY)
+	if not (store is Dictionary):
+		return null
+	var nid = str(wall.get_meta("node_id"))
+	if not store.has(nid):
+		return null
+	var cfg = store[nid]
+	if not (cfg is Dictionary) or not cfg.has("direction"):
+		return null
+	return cfg
+
+
+# -1 = pas d'ombre sur ce wall (ou mod absent) : rien à restaurer plus tard.
+func _drop_shadow_dir(wall) -> int:
+	var cfg = _drop_shadow_cfg(wall)
+	if cfg == null:
+		return -1
+	return int(cfg["direction"])
+
+
+# Restaure un côté capturé (undo/redo d'une symétrie, Reset Transform). Le mod
+# reconstruit son ombre de lui-même puisque les points du wall changent dans la
+# même opération.
+func _set_drop_shadow_dir(wall, value: int) -> void:
+	if value < 0:
+		return
+	var cfg = _drop_shadow_cfg(wall)
+	if cfg == null or int(cfg["direction"]) == value:
+		return
+	cfg["direction"] = value
+
+
+func _swap_drop_shadow_side(wall) -> void:
+	var cfg = _drop_shadow_cfg(wall)
+	if cfg == null:
+		return
+	# 0 = Side A, 1 = Side B, 2 = Both (rien à échanger).
+	var dir_value = int(cfg["direction"])
+	if dir_value == 0:
+		cfg["direction"] = 1
+	elif dir_value == 1:
+		cfg["direction"] = 0
 
 
 # Walls actuellement sélectionnés dans DD, via DragSelectWalls (qui expose
@@ -8057,7 +8699,15 @@ func _store_wall_reset(wall) -> void:
 			portals[str(int(portal.get_meta("node_id")))] = [
 				portal.position.x, portal.position.y, portal.rotation,
 				portal.Direction.x, portal.Direction.y]
-	_g.ModMapData["_ft_wall_reset"][key] = {"pts": flat, "portals": portals}
+	# Le côté d'ombre d'origine est capturé ici, avant toute déformation :
+	# _store_wall_reset ne s'exécute qu'une fois par wall (early return si la
+	# clé existe), donc un nombre impair de symétries suivi d'un Reset retrouve
+	# bien le côté de départ.
+	_g.ModMapData["_ft_wall_reset"][key] = {
+		"pts": flat,
+		"portals": portals,
+		"shadow_dir": _drop_shadow_dir(wall),
+	}
 
 
 # Store "_ft_path_reset" : EditPoints d'origine (monde, aplatis) d'un
@@ -8107,11 +8757,13 @@ func _reset_walls_transform() -> void:
 			"snap": dsw._snapshot_wall(w),
 			"portal_scales": _capture_portal_scales(w),
 			"width_warp": _ft_width_profile_copy(w),
+			"shadow_dir": _drop_shadow_dir(w),
 		})
+		_set_drop_shadow_dir(w, int(data.get("shadow_dir", -1)))
 		var pts = PoolVector2Array()
 		for i in range(0, flat.size(), 2):
 			pts.append(Vector2(flat[i], flat[i + 1]))
-		w.set("Points", pts)
+		_set_wall_points(w, pts)
 		var pmap = data.get("portals", {})
 		var plist = w.get("Portals")
 		if plist != null:
@@ -8136,6 +8788,7 @@ func _reset_walls_transform() -> void:
 			"snap": dsw._snapshot_wall(w),
 			"portal_scales": _capture_portal_scales(w),
 			"width_warp": null,
+			"shadow_dir": _drop_shadow_dir(w),
 		})
 		count += 1
 	if count > 0:
@@ -8594,7 +9247,7 @@ func _apply_warp_to_wall(wall, snap: Dictionary, src: Array, nc: Array) -> void:
 	var new_pts = PoolVector2Array()
 	for p in pts0:
 		new_pts.append(_warp_point(p, src, nc))
-	wall.set("Points", new_pts)
+	_set_wall_points(wall, new_pts)
 
 	var children = snap.get("children", {})
 	var pre_profile = _wall_drag_wprofile.get(wall)
@@ -8697,6 +9350,9 @@ func _restore_flip_combined(unified: Dictionary, wall_entries: Array) -> void:
 		if w == null or not is_instance_valid(w):
 			continue
 		dsw._restore_wall_state(w, e["snap"])
+		# Côté de l'ombre Drop Shadow : suit l'état restauré, sinon un undo de
+		# symétrie remettrait la géométrie d'origine avec le côté échangé.
+		_set_drop_shadow_dir(w, int(e.get("shadow_dir", -1)))
 		var scales = e.get("portal_scales", {})
 		for portal in scales:
 			if is_instance_valid(portal):

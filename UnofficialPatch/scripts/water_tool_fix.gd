@@ -4,6 +4,9 @@
 # Fixes nested island bug: drawing water inside a hole detaches sibling holes
 # from their outer polygon (DFS grouping bug in WaterMesh.UpdateMesh_TriangleNet),
 # flooding unrelated interiors. Fixed by flattening the PolyTree via Save()/Load().
+# Hides the brush cursor while a color picker popup is open: WorldUI already
+# supports this (colorPickerActive + OnColorPickerVisible/Hidden handlers) but
+# the WaterBrush ColorPalettes never connect their picker popups to it.
 
 var _g
 
@@ -20,6 +23,10 @@ var _tree_sig = {}
 var _tree_stable = {}
 var _last_map_w = 0
 var _last_map_h = 0
+# Color picker popups (PopupPanel) of the panel's ColorPalettes, and the
+# instance id of the WorldUI they are currently connected to
+var _picker_popups = []
+var _picker_hooked_ui_id = 0
 var TILE_SIZE = 256.0
 
 # Animated shader: uses map bounds to disable distortion near edges
@@ -119,6 +126,7 @@ func update(delta):
 					_apply_shader()
 	if _button == null and _water_panel.visible:
 		_create_button()
+	_hook_color_pickers()
 	if _mat != null and not _animation_disabled:
 		# Detect map size changes
 		var world = _g.World
@@ -133,6 +141,53 @@ func update(delta):
 		if not _bounds_set:
 			_update_bounds()
 	_watch_nested_islands()
+
+
+# --- Hide brush cursor while a color picker is open ------------------------
+# WorldUI._Draw() skips everything when its private colorPickerActive flag is
+# set; the flag is toggled by the private handlers OnColorPickerVisible /
+# OnColorPickerHidden (connectable by name, like ColorPalette does with its
+# own private handlers). We wire the picker PopupPanel of each ColorPalette
+# in the water panel to those handlers, and re-wire when WorldUI is recreated
+# on map reload (old connections die with the freed instance).
+
+func _hook_color_pickers():
+	# Prune popups freed with a rebuilt panel, if that ever happens
+	for i in range(_picker_popups.size() - 1, -1, -1):
+		if not is_instance_valid(_picker_popups[i]):
+			_picker_popups.remove(i)
+	if _picker_popups.empty():
+		_find_picker_popups(_water_panel)
+		if _picker_popups.empty():
+			return
+	var ui = _g.get("WorldUI")
+	if ui == null or not is_instance_valid(ui):
+		_picker_hooked_ui_id = 0
+		return
+	var uid = ui.get_instance_id()
+	if uid == _picker_hooked_ui_id:
+		return
+	for popup in _picker_popups:
+		if not popup.is_connected("about_to_show", ui, "OnColorPickerVisible"):
+			popup.connect("about_to_show", ui, "OnColorPickerVisible")
+		if not popup.is_connected("popup_hide", ui, "OnColorPickerHidden"):
+			popup.connect("popup_hide", ui, "OnColorPickerHidden")
+	_picker_hooked_ui_id = uid
+	print("[WaterFix] %d color picker popup(s) hooked to WorldUI cursor hiding" % _picker_popups.size())
+
+
+func _find_picker_popups(node):
+	# ColorPalette is an HBoxContainer declaring a custom "color_changed"
+	# signal; its color picker popup is its only PopupPanel child (the preset
+	# list is a plain Popup, the context menu a PopupMenu)
+	if node == null:
+		return
+	for child in node.get_children():
+		if child is HBoxContainer and child.has_signal("color_changed"):
+			for sub in child.get_children():
+				if sub is PopupPanel:
+					_picker_popups.append(sub)
+		_find_picker_popups(child)
 
 
 # --- Fix "îlots imbriqués" -------------------------------------------------

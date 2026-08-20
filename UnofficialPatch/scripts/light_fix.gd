@@ -168,8 +168,12 @@ func _notification(what):
 	if what == NOTIFICATION_INTERNAL_PROCESS and handler != null:
 		handler._apply_pending_cursor()
 func _input(event):
-	if handler != null and event is InputEventMouseMotion:
+	if handler == null:
+		return
+	if event is InputEventMouseMotion:
 		handler._apply_pending_cursor()
+	elif event is InputEventMouseButton:
+		handler._on_wheel_input(event)
 """
 	script.reload()
 	_cursor_node = Node.new()
@@ -207,6 +211,69 @@ func _apply_pending_cursor() -> void:
 	if _cursor_active:
 		Input.set_custom_mouse_cursor(null, Input.CURSOR_ARROW)
 		_cursor_active = false
+
+
+# ==================== WHEEL OVER RANGE CONTROLS ====================
+
+# Variable wheel step for light size: below 1.0 -> 0.1, from 1.0 to 2.0
+# -> 0.2, above 2.0 -> 0.5. Direction-aware at zone boundaries so scrolling
+# down from exactly 1.0 / 2.0 uses the lower zone's step.
+func _size_wheel_step(current: float, up: bool) -> float:
+	if up:
+		if current < 0.999:
+			return 0.1
+		elif current < 1.999:
+			return 0.2
+		return 0.5
+	if current <= 1.001:
+		return 0.1
+	elif current <= 2.001:
+		return 0.2
+	return 0.5
+
+
+# True when the mouse hovers our injected Range slider or spinbox. Uses the
+# Control's own get_global_mouse_position() so both sides of the test are
+# in the same (logical) coordinate space, Retina included.
+func _wheel_over_range_controls() -> bool:
+	for c in [_range_slider, _range_spin]:
+		if c != null and is_instance_valid(c) and c.is_visible_in_tree():
+			if c.get_global_rect().has_point(c.get_global_mouse_position()):
+				return true
+	return false
+
+
+# Called by the cursor node's _input for every mouse button event. Applies
+# the variable size steps when scrolling over the Range slider/spinbox, and
+# consumes the event so neither the slider's native wheel handling (0.001
+# log-space steps via slider_scroll_fix) nor the SpinBox's fixed 0.1 steps
+# fire. Result is snapped to the 0.1 grid.
+func _on_wheel_input(event) -> void:
+	if not (event is InputEventMouseButton) or not event.pressed:
+		return
+	if event.button_index != BUTTON_WHEEL_UP and event.button_index != BUTTON_WHEEL_DOWN:
+		return
+	if Input.is_key_pressed(KEY_CONTROL):
+		return
+	if _range_spin == null or not is_instance_valid(_range_spin):
+		return
+	if not _wheel_over_range_controls():
+		return
+	var up = event.button_index == BUTTON_WHEEL_UP
+	var current = _range_spin.value
+	var step = _size_wheel_step(current, up)
+	if not up:
+		step = -step
+	var value = stepify(current + step, 0.1)
+	value = clamp(value, _range_spin.min_value, _range_spin.max_value)
+	_updating_ui = true
+	_range_spin.value = value
+	if _range_slider != null and is_instance_valid(_range_slider):
+		_range_slider.value = _range_to_slider(value)
+	_updating_ui = false
+	_apply_range_with_undo(value)
+	if _cursor_node != null and is_instance_valid(_cursor_node) and _cursor_node.is_inside_tree():
+		_cursor_node.get_tree().set_input_as_handled()
 
 
 # ==================== UI INJECTION ====================

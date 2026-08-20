@@ -925,6 +925,15 @@ func register_anchor_external(t: Control, pos: Vector2, align_mode: int) -> void
 	print("[TextToolFix] Registered pasted text mode=%d ax=%.1f" % [align_mode, ax])
 
 
+# Called by map_resize_fix after a Left map resize: all texts were shifted
+# horizontally by DD (Texts.Resize), so the stored world-coord anchor X of
+# every text must shift by the same amount.
+func on_map_resized(offset_x: float) -> void:
+	for id in _anchors:
+		_anchors[id]["x"] += offset_x
+	print("[TextToolFix] Shifted %d text anchors by %.0f px after map resize" % [_anchors.size(), offset_x])
+
+
 func update_anchor_after_move(t: Control) -> void:
 	# Called from text_transform after group move
 	if not is_instance_valid(t): return
@@ -1041,6 +1050,12 @@ func _is_select_tool_active(tree) -> bool:
 	return tb != null and tb.visible
 
 func _to_world(viewport) -> Vector2:
+	# Source de verite : WorldUI.MousePosition, la position monde utilisee par
+	# tous les outils natifs de DD. La conversion manuelle (mouse viewport +
+	# inverse du canvas transform) derive d'un offset ecran sur certaines
+	# configs (Retina/DPI/UI scaling) -> texte place tres a droite du clic.
+	if _g != null and _g.get("WorldUI") != null:
+		return _g.WorldUI.MousePosition
 	return viewport.canvas_transform.affine_inverse().xform(viewport.get_mouse_position())
 
 func _rect_of(t: Control) -> Rect2:

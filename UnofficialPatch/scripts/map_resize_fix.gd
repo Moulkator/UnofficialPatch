@@ -4,6 +4,9 @@
 # Fix 1: Map resize limit raised from 128x128 to 200x200.
 # Fix 2: Terrain splat cropped from wrong side on negative Left/Top resize.
 # Fix 3: Cave walls/mesh offset on negative Left/Top resize.
+# Fix 4: Trace image not shifted when tiles are added/removed on Left/Top.
+# Fix 5: text_tool_fix anchor X coords go stale on Left resize, snapping
+#        texts back horizontally after DD moved them correctly.
 # Feature: "Target Size" mode — enter desired dimensions + anchor direction.
 
 var _g
@@ -1089,6 +1092,15 @@ func _on_ok_pressed():
 	var old_w = _g.World.Width
 	var old_h = _g.World.Height
 
+	# Fix 4: snapshot trace image position before resize (DD never shifts it)
+	var trace_img = null
+	var trace_pre_pos = Vector2.ZERO
+	if (left != 0 or top != 0) and _g.World.get("TraceImage") != null:
+		var _ti = _g.World.TraceImage
+		if _ti != null and is_instance_valid(_ti) and _ti.texture != null:
+			trace_img = _ti
+			trace_pre_pos = _ti.position
+
 	if fix:
 		var levels = _g.World.get("levels")
 		if levels != null:
@@ -1118,12 +1130,51 @@ func _on_ok_pressed():
 			_fix_splats(lvls, sp1s, sp2s, tws, ths, left, top)
 		_fix_caves(cave_snaps, old_w, old_h, left, top)
 
+	# Fix 4: shift the trace image so it stays aligned with the map content
+	if trace_img != null and is_instance_valid(trace_img):
+		_fix_trace_image(trace_img, trace_pre_pos, left, top)
+
 	# Let terrain_slots_extended remap its extended splats (3..6) the same way
 	# (DD only repositions the native splat/splat2).
 	if Engine.has_meta("terrain_slots_extended_singleton"):
 		var _tse = Engine.get_meta("terrain_slots_extended_singleton")
 		if _tse != null and is_instance_valid(_tse) and _tse.has_method("on_map_resized"):
 			_tse.on_map_resized(left, top, old_w, old_h)
+
+	# Fix 5: DD's Texts.Resize shifts texts correctly, but text_tool_fix keeps
+	# per-text anchor X in world coords -- shift those too, or _apply_alignment
+	# will snap the texts back to their pre-resize X.
+	if left != 0 and _g.get("ModMapData") is Dictionary:
+		var _ttf = _g.ModMapData.get("_ttf_handler")
+		if _ttf != null and is_instance_valid(_ttf) and _ttf.has_method("on_map_resized"):
+			_ttf.on_map_resized(left * _g.WorldUI.CellSize.x)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Fix 4 – trace image offset on Left/Top resize
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Dungeondraft keeps the trace image at its absolute position when tiles are
+# added or removed on the Left/Top edges, while all map content shifts by
+# (left, top) * CellSize. Re-apply that same offset to the trace image.
+func _fix_trace_image(trace_img, pre_pos: Vector2, left: int, top: int):
+	# If DD (or another mod) already moved it during the resize, don't touch it.
+	if trace_img.position.distance_to(pre_pos) > 0.5:
+		print("[MapResizeFix] Trace image already repositioned, skipping")
+		return
+	var cell = _g.WorldUI.CellSize
+	var offset = Vector2(left * cell.x, top * cell.y)
+	if offset == Vector2.ZERO:
+		return
+	trace_img.position = pre_pos + offset
+	print("[MapResizeFix] Trace image shifted by ", offset)
+	# Keep trace_extended's anchor/drag-detection state in sync
+	if Engine.has_meta("up_trace_listener"):
+		var listener = Engine.get_meta("up_trace_listener")
+		if listener != null and is_instance_valid(listener):
+			var handler = listener.get("handler")
+			if handler != null and handler.has_method("on_map_resized"):
+				handler.on_map_resized(offset)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

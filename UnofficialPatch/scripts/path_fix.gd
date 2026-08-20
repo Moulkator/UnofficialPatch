@@ -1073,6 +1073,10 @@ func _select_overlay_pattern() -> bool:
 	var pat = overlay_tool._hover_pattern
 	if pat == null or not is_instance_valid(pat):
 		return false
+	# Respecter le filtre de calques et la visibilite : ne pas forcer la
+	# selection d'un pattern que le pick natif de DD refuserait.
+	if _layer_pick_blocked(pat):
+		return false
 	if not select_tool.has_method("SelectThing"):
 		return false
 	# Ne PAS intervenir si l'overlay surligne un pattern DEJA selectionne : c'est
@@ -1090,6 +1094,21 @@ func _select_overlay_pattern() -> bool:
 	# Aucun asset deplaçable sous le curseur -> selection immediate (clic simple).
 	_apply_overlay_pattern_selection(pat)
 	return true
+
+
+# Vrai si un path/pattern ne doit pas etre pickable : invisible dans l'arbre
+# (calque cache par un mod tiers type Hide Layers) ou rejete par le filtre de
+# CALQUES du SelectTool (IsObjectLayerFiltered, methode C# publique). Le pick
+# natif de DD (HighlightThingAtPoint) refuse ces elements, nos picks ameliores
+# doivent faire pareil.
+func _layer_pick_blocked(thing) -> bool:
+	if thing == null or not is_instance_valid(thing):
+		return true
+	if thing is CanvasItem and not thing.is_visible_in_tree():
+		return true
+	if select_tool != null and select_tool.has_method("IsObjectLayerFiltered") and select_tool.IsObjectLayerFiltered(thing):
+		return true
+	return false
 
 
 # Vrai si un Thing (noeud) est dans la selection courante.
@@ -1375,6 +1394,10 @@ func _try_force_select() -> void:
 		return
 	var child = overlay_tool._hover_path
 	if child == null or not is_instance_valid(child):
+		return
+
+	# Respecter le filtre de calques et la visibilite
+	if _layer_pick_blocked(child):
 		return
 
 	# Si le path appartient à un groupe custom, laisser DD gérer la sélection groupée

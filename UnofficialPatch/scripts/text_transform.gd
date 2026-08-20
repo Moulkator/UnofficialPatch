@@ -640,6 +640,11 @@ func _on_input(event: InputEvent) -> void:
 # ══ Geometry ══════════════════════════════════════════════════════════════════
 
 func _mouse_world(vp: Node) -> Vector2:
+	# macOS fix: prefer DD's reference world mouse position; the manual
+	# conversion (viewport mouse + inverse canvas transform) drifts by a
+	# screen offset on some configs (Retina/DPI/UI scaling).
+	if _g != null and _g.get("WorldUI") != null:
+		return _g.WorldUI.MousePosition
 	return vp.canvas_transform.affine_inverse().xform(vp.get_mouse_position())
 
 # Axis-aligned bounding box of a text node (accounts for rotation)
@@ -649,6 +654,15 @@ func _text_visual_rect(t: Control) -> Dictionary:
 	var w = t.rect_size.x * t.rect_scale.x
 	var h = t.rect_size.y * t.rect_scale.y
 	var o = t.rect_position
+
+	# Curved text (text_style_extra): use the curved glyph extent so the
+	# selection box, handles, and hit-testing follow the bent text
+	var tse = _g.ModMapData.get("_tse_handler") if _g.ModMapData is Dictionary else null
+	if tse != null:
+		var cr = tse.get_curved_local_rect(t)
+		if cr.size != Vector2.ZERO:
+			var co = t.rect_position + cr.position * t.rect_scale
+			return {"o": co, "w": cr.size.x * t.rect_scale.x, "h": cr.size.y * t.rect_scale.y}
 
 	# Try to measure the actual text width
 	var text_str = t.get("text")
@@ -1551,12 +1565,16 @@ func _copy_selection() -> void:
 		if ttf:
 			var id = t.get_instance_id()
 			if ttf._anchors.has(id): align_mode = ttf._anchors[id]["mode"]
+		# Letter spacing / curvature (text_style_extra)
+		var tse = _g.ModMapData.get("_tse_handler")
+		var tse_style = tse.get_style_for_copy(t) if tse != null else [0, 0.0]
 		print("[TextTransform] Copy: font=", fi["font_name"], " size=", fi["font_size"], " scale=", t.rect_scale)
 		_clipboard.append({
 			"text":       t.text if t.get("text") != null else "",
 			"font_name":  fi["font_name"],
 			"font_size":  fi["font_size"],
 			"font_color": fc,
+			"tse_style":  tse_style,
 			"position":   t.rect_position,
 			"rotation":   t.rect_rotation,
 			"sx":         t.rect_scale.x,
@@ -1598,12 +1616,18 @@ func _paste_selection(vp: Node) -> void:
 		else:
 			print("[TextTransform] Paste: no template text found"); return
 	var ttf     = _g.ModMapData.get("_ttf_handler")
+	var tse     = _g.ModMapData.get("_tse_handler")
 	var tree    = _g.World.get_tree()
 	var offset  = Vector2(30, 30)
 	var new_sel = []
 	for item in _clipboard:
 		var nd = template.duplicate()
 		texts.add_child(nd)
+		# duplicate() copies the template's __meta__ (including node_id): the
+		# copy MUST get its own node_id, otherwise every node_id-keyed
+		# persistence (DD save, rot/scale in ModMapData, text_style_extra)
+		# collides between the original and the copy after reload.
+		_assign_fresh_node_id(nd, texts)
 		var new_pos = item["position"] + offset
 		var sx = item["sx"]; var sy = item["sy"]
 		# Pre-set dataOnFocus["position"] so SetFont/text= reset to the right place
@@ -1624,6 +1648,8 @@ func _paste_selection(vp: Node) -> void:
 		var tmp2 = tree.create_timer(0.0)
 		tmp2.connect("timeout", nd, "set", ["rect_position", new_pos])
 		if ttf: ttf.register_anchor_external(nd, new_pos, item["align_mode"])
+		if tse != null and item.has("tse_style"):
+			tse.register_style_external(nd, int(item["tse_style"][0]), float(item["tse_style"][1]))
 		new_sel.append(nd)
 	_selected_texts = new_sel
 	_primary_text   = new_sel[0] if new_sel.size() > 0 else null
@@ -1633,6 +1659,25 @@ func _paste_selection(vp: Node) -> void:
 		paste_snap.append(nd2)
 	_undo_stack.append({"type": "paste", "nodes": paste_snap})
 	print("[TextTransform] Pasted %d texts (undo saved)" % new_sel.size())
+
+
+func _assign_fresh_node_id(node: Node, texts: Node) -> void:
+	# Give a duplicated text its own node_id (max existing + 1, same scheme as
+	# text_tool_fix._assign_unique_node_id). Previously pasted nodes are
+	# already children of texts, so sequential pastes get sequential ids.
+	var max_id = 0
+	for t in texts.get_children():
+		if t == node: continue
+		var nid = _get_node_id_str(t)
+		if nid != null:
+			var nid_int = int(nid)
+			if nid_int > max_id:
+				max_id = nid_int
+	var meta = node.get("__meta__")
+	if meta is Dictionary:
+		meta["node_id"] = max_id + 1
+		node.set("__meta__", meta)
+		print("[TextTransform] Pasted text assigned node_id %d" % (max_id + 1))
 
 
 # ══ Anchor update callback ═════════════════════════════════════════════════════

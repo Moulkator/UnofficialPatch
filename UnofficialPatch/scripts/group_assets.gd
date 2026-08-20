@@ -365,6 +365,7 @@ func _on_process(_delta) -> void:
 		return
 
 	_update_visibility()
+	_sync_dd_separate_button()
 
 	if _load_pending:
 		if _load_delay > 0:
@@ -716,9 +717,11 @@ func _on_ungroup_pressed() -> void:
 		# Re-select the now-ungrouped things with the normal (non-mauve)
 		# transform box so the user keeps editing context. Without this
 		# the panel goes empty and you have to click again.
+		# Reselectionner TOUTE la selection d'origine (pas seulement les
+		# ex-groupes) : sur une selection mixte, les membres non groupes
+		# doivent rester selectionnes apres l'Ungroup.
 		var to_reselect: Array = []
-		for entry in pre_state:
-			var t = entry["ref"].get_ref()
+		for t in things:
 			if t != null and is_instance_valid(t):
 				to_reselect.append(t)
 		# IMPORTANT: restore the normal color BEFORE the re-selection.
@@ -910,6 +913,64 @@ func _on_paste_button_pressed() -> void:
 		_regroup_frames = 12
 
 
+# Bouton "Separate" NATIF du panneau SelectTool : DD l'affiche des que la
+# selection appartient a un groupe quelconque — donc aussi pour nos groupes
+# custom, qui ne sont pas des prefabs (et son Separate court-circuiterait la
+# comptabilite des groupes : sidecar json, undo). On le cache quand la
+# selection ne contient AUCUN vrai prefab, on le laisse quand il y en a un.
+var _dd_separate_btn = null
+
+func _sync_dd_separate_button() -> void:
+	var btn = _dd_separate_btn
+	if btn == null or not is_instance_valid(btn):
+		btn = _find_dd_separate_button()
+		_dd_separate_btn = btn
+	if btn == null:
+		return
+	if select_tool == null or not is_instance_valid(select_tool):
+		return
+	var raw = select_tool.RawSelectables
+	if raw == null or raw.size() == 0:
+		return   # selection vide : DD gere (bouton deja cache)
+	var has_real = false
+	var has_custom = false
+	for thing in _get_unique_things(raw):
+		if not is_instance_valid(thing):
+			continue
+		if _is_custom_group(thing):
+			has_custom = true
+		elif thing.has_meta("prefab_id"):
+			has_real = true
+	if has_real:
+		btn.visible = true
+	elif has_custom:
+		btn.visible = false
+
+
+func _find_dd_separate_button():
+	if _g == null or _g.Editor == null or _g.Editor.get("Toolset") == null:
+		return null
+	var panel = _g.Editor.Toolset.GetToolPanel("SelectTool")
+	if panel == null or not is_instance_valid(panel):
+		return null
+	return _find_button_by_needle(panel, "separate", 0)
+
+
+func _find_button_by_needle(node: Node, needle: String, depth: int):
+	if node == null or depth > 8:
+		return null
+	for i in range(node.get_child_count()):
+		var child = node.get_child(i)
+		if child is BaseButton:
+			var haystack = ("%s %s %s" % [child.name, child.get("text"), child.hint_tooltip]).to_lower()
+			if needle in haystack:
+				return child
+		var found = _find_button_by_needle(child, needle, depth + 1)
+		if found != null:
+			return found
+	return null
+
+
 func _all_share_custom_group(things: Array) -> bool:
 	# True if every thing has the same prefab_id and that id is in the
 	# custom-group range. Used to decide the transform-box color after
@@ -953,6 +1014,12 @@ func get_context_items(raw) -> Array:
 	else:
 		var icon = _load_icon("icons/group.png", 0.85) if _group_icon == null else _group_icon
 		items.append({label = "Group Selected Assets", icon = icon, action_id = "group"})
+		# Selection MIXTE (groupes + non-groupes) : proposer aussi Ungroup —
+		# _on_ungroup_pressed ne degroupe que les membres effectivement
+		# groupes, l'action est donc bien definie sur un mix.
+		if _selection_has_custom_group(raw):
+			var uicon = _load_icon("icons/ungroup.png", 0.85) if _ungroup_icon == null else _ungroup_icon
+			items.append({label = "Ungroup Assets", icon = uicon, action_id = "ungroup"})
 	return items
 
 

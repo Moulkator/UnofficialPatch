@@ -214,25 +214,28 @@ func _inject_ui():
 		target_idx = _size_container.get_index()
 	align.move_child(row, target_idx)
 
-	# Rangée "Stopped by" juste SOUS la rangée de modes (visible en mode Bucket).
-	_opts_hbox = HBoxContainer.new()
-	_opts_hbox.name = "TerrainBucketStoppedByRow"
+	# Bloc "Stopped by" juste SOUS la rangée de modes (visible en mode Bucket) :
+	# label sur sa propre ligne, cases à cocher sur la ligne suivante.
+	_opts_hbox = VBoxContainer.new()
+	_opts_hbox.name = "TerrainBucketStoppedByBlock"
 	_opts_hbox.visible = false
 	var lbl_sb = Label.new()
 	lbl_sb.text = "Stopped by:"
 	_opts_hbox.add_child(lbl_sb)
+	var cb_row = HBoxContainer.new()
 	_cb_walls = CheckBox.new()
 	_cb_walls.text = "Walls"
 	_cb_walls.pressed = true
-	_opts_hbox.add_child(_cb_walls)
+	cb_row.add_child(_cb_walls)
 	_cb_paths = CheckBox.new()
 	_cb_paths.text = "Paths"
 	_cb_paths.pressed = true
-	_opts_hbox.add_child(_cb_paths)
+	cb_row.add_child(_cb_paths)
 	_cb_patterns = CheckBox.new()
 	_cb_patterns.text = "Patterns"
 	_cb_patterns.pressed = false
-	_opts_hbox.add_child(_cb_patterns)
+	cb_row.add_child(_cb_patterns)
+	_opts_hbox.add_child(cb_row)
 	align.add_child(_opts_hbox)
 	align.move_child(_opts_hbox, row.get_index() + 1)
 
@@ -1155,6 +1158,13 @@ func _ensure_aso_grid_height() -> void:
 
 
 func _get_raw_mouse_world(world_ui, event):
+	# Source de verite : WorldUI.MousePosition (position monde des outils
+	# natifs DD). event.position converti a la main derive d'un offset ecran
+	# sur certaines configs (Retina/DPI/UI scaling) -> terrain place a droite.
+	var mp = world_ui.get("MousePosition")
+	if mp != null and mp is Vector2:
+		return mp
+	# Fallback : calcul manuel historique.
 	var vp = world_ui.get_viewport()
 	if vp == null: return null
 	var xform = vp.get_canvas_transform()

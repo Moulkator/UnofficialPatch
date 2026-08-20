@@ -858,8 +858,10 @@ func _on_input(event):
 			elif atn == "PrefabTool":
 				# Skip when mouse is over UI (lets context menus work on the panel)
 				if not (ui_util and ui_util.is_mouse_over_ui(input_listener)):
-					var preview = _get_prefab_preview()
-					if preview != null and preview.size() > 0:
+					# size 0 is legitimate: a walls-only prefab (prefab_walls)
+					# has no DD preview node but must still rotate.
+					var preview = _get_prefab_preview_state()
+					if preview != null:
 						_prefab_rotate(true, 90.0)
 						input_listener.get_tree().set_input_as_handled()
 						return
@@ -1867,6 +1869,11 @@ func _get_mouse_world_position() -> Vector2:
 # Prefab transform state
 var _prefab_rotation = 0.0
 var _prefab_scale_factor = 1.0
+var _prefab_capture_mouse = Vector2.ZERO
+var _prefab_capture_snapped = Vector2.ZERO
+var _prefab_capture_centroid = Vector2.ZERO
+var _prefab_capture_count = 0
+var _prefab_capture_token = 0
 var _prefab_last_list_idx = -1
 var _prefab_mouse_offsets = {}     # nid -> Vector2 (node.position - mouse_world, captured once)
 var _prefab_base_rotations = {}    # nid -> float
@@ -1921,7 +1928,24 @@ func _prefab_capture_offsets(preview):
 	_prefab_base_scales.clear()
 	
 	var mouse = _get_mouse_world_position()
+	# Reference frame published for other mods (prefab_walls draws its own ghost
+	# walls and must land on exactly the same transform as DD's preview).
+	_prefab_capture_mouse = mouse
+	_prefab_capture_snapped = _prefab_snapped_position()
+	_prefab_capture_centroid = Vector2.ZERO
+	_prefab_capture_count = 0
+	if preview != null:
+		for node in preview.keys():
+			if is_instance_valid(node) and node is Node2D:
+				_prefab_capture_centroid += node.position
+				_prefab_capture_count += 1
+		if _prefab_capture_count > 0:
+			_prefab_capture_centroid = _prefab_capture_centroid / float(_prefab_capture_count)
+	_prefab_capture_token += 1
+	_publish_prefab_transform()
 	
+	if preview == null:
+		return
 	for node in preview.keys():
 		if is_instance_valid(node) and node is Node2D:
 			var nid = node.get_instance_id()
@@ -1930,8 +1954,42 @@ func _prefab_capture_offsets(preview):
 			_prefab_base_scales[nid] = node.scale
 
 
+func _prefab_snapped_position() -> Vector2:
+	if _g and _g.get("WorldUI") != null and is_instance_valid(_g.WorldUI):
+		return _g.WorldUI.SnappedPosition
+	return _get_mouse_world_position()
+
+
+# Cross-mod state: prefab_walls renders its own ghost walls and needs the exact
+# same rotation/scale and the same reference frame to stay glued to DD's preview.
+func _publish_prefab_transform():
+	Engine.set_meta("_ac_prefab_transform", {
+		"rotation": _prefab_rotation,
+		"scale": _prefab_scale_factor,
+		"capture_mouse": _prefab_capture_mouse,
+		"capture_snapped": _prefab_capture_snapped,
+		"capture_centroid": _prefab_capture_centroid,
+		"capture_count": _prefab_capture_count,
+		"token": _prefab_capture_token,
+	})
+
+
+# A prefab made only of walls has an empty DD preview: rotation and scale must
+# still be tracked, otherwise prefab_walls has nothing to follow.
+func _get_prefab_preview_state():
+	if not _g.Editor or not _g.Editor.Tools:
+		return null
+	if not _g.Editor.Tools.has("PrefabTool"):
+		return null
+	var pt = _g.Editor.Tools["PrefabTool"]
+	var preview = pt.get("preview")
+	if preview == null or typeof(preview) != TYPE_DICTIONARY:
+		return null
+	return preview
+
+
 func _prefab_rotate(up: bool, step_deg: float = 15.0):
-	var preview = _get_prefab_preview()
+	var preview = _get_prefab_preview_state()
 	if preview == null:
 		return
 	
@@ -1943,10 +2001,11 @@ func _prefab_rotate(up: bool, step_deg: float = 15.0):
 	var step = deg2rad(step_deg)
 	_prefab_rotation += step if up else -step
 	_prefab_last_list_idx = _prefab_get_selected_idx()
+	_publish_prefab_transform()
 
 
 func _prefab_scale(up: bool):
-	var preview = _get_prefab_preview()
+	var preview = _get_prefab_preview_state()
 	if preview == null:
 		return
 	
@@ -1958,6 +2017,7 @@ func _prefab_scale(up: bool):
 	var factor = 1.1 if up else (1.0 / 1.1)
 	_prefab_scale_factor *= factor
 	_prefab_last_list_idx = _prefab_get_selected_idx()
+	_publish_prefab_transform()
 
 
 func _late_apply_prefab_transform():
@@ -2013,6 +2073,7 @@ func _apply_prefab_transform():
 func _prefab_reset_transform():
 	_prefab_rotation = 0.0
 	_prefab_scale_factor = 1.0
+	_publish_prefab_transform()
 	_prefab_last_list_idx = -1
 	_prefab_mouse_offsets.clear()
 	_prefab_base_rotations.clear()

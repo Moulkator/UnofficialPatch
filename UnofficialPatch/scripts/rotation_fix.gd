@@ -13,6 +13,7 @@ var input_listener: Node
 var drag_select_walls = null  # Optional, injected by Main.gd; rotates walls in sync
 
 const SELECTABLE_WALL = 1
+const SELECTABLE_PORTAL_WALL = 3
 
 
 # Lit le toggle "1° Rotation" (SHIFT + Z + MOUSEWHEEL) du Settings panel :
@@ -210,6 +211,15 @@ func _handle_select_tool(event, shift_held, z_held) -> void:
 	# pivot around the wrong point.
 	if ft_pivot_active:
 		_rotate_non_walls_around(ft_pivot, step)
+		# Walls must follow. While Free Transform is active,
+		# DragSelectWalls tears down its own overlay (FT draws the box
+		# instead), so _last_combined is empty and the has_target_pivot
+		# branch above never runs -- which used to leave walls behind
+		# while every other asset spun. FT's _selection_aabb already
+		# includes the selected walls, so ft_pivot is the correct shared
+		# pivot for the whole group.
+		if drag_select_walls != null and drag_select_walls.has_method("apply_rotation_around"):
+			drag_select_walls.apply_rotation_around(step, ft_pivot)
 		input_listener.get_tree().set_input_as_handled()
 		return
 	
@@ -484,6 +494,18 @@ func _rotate_non_walls_around(pivot: Vector2, step_deg: float) -> void:
 	var distort_store = _g.ModMapData.get("_ft_distort", {})
 	var shear_store = _g.ModMapData.get("_ft_transforms", {})
 	var rad = deg2rad(step_deg)
+	# Portals anchored to a wall that is ALSO selected are transformed by
+	# their wall (DragSelectWalls._apply_transform_to_wall moves and
+	# re-orients every child portal). Rotating them here as well applied
+	# the step twice, so they orbited and spun at double speed while the
+	# walls turned once. Collect the selected walls so we can skip them —
+	# same guard DragSelectWalls.rotate_selection_around already uses.
+	var selected_wall_ids := {}
+	for sw in raw:
+		if sw == null or sw.Thing == null or not is_instance_valid(sw.Thing):
+			continue
+		if sw.Type == SELECTABLE_WALL:
+			selected_wall_ids[sw.Thing.get_instance_id()] = true
 	# Wrap with DD's transform record so Ctrl+Z reverts the rotation.
 	if select_tool.has_method("SavePreTransforms"):
 		select_tool.SavePreTransforms()
@@ -495,6 +517,11 @@ func _rotate_non_walls_around(pivot: Vector2, step_deg: float) -> void:
 		var nd = s.Thing
 		if not (nd is Node2D):
 			continue
+		# Skip wall-anchored portals whose wall is in the selection.
+		if s.Type == SELECTABLE_PORTAL_WALL:
+			var pwall = nd.get_parent()
+			if pwall != null and selected_wall_ids.has(pwall.get_instance_id()):
+				continue
 		# Skip nodes with active FT distort or shear — see comment above.
 		var key = ""
 		if ft != null and ft.has_method("_ft_node_key"):
@@ -529,6 +556,10 @@ func _rotate_non_walls_around(pivot: Vector2, step_deg: float) -> void:
 			var nd2 = s2.Thing
 			if not (nd2 is Node2D):
 				continue
+			if s2.Type == SELECTABLE_PORTAL_WALL:
+				var pwall2 = nd2.get_parent()
+				if pwall2 != null and selected_wall_ids.has(pwall2.get_instance_id()):
+					continue
 			var k2 = ""
 			if ft.has_method("_ft_node_key"):
 				k2 = ft.call("_ft_node_key", nd2)

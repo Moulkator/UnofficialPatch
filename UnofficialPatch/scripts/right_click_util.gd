@@ -7,6 +7,15 @@
 #   get_context_items(raw) -> Array   — return [{label, icon, action_id}]
 #   on_context_action(action_id, raw) — handle a menu click
 #
+# An item may carry a `submenu` array of items (same shape, minus submenus):
+# the entry then opens a sub-popup instead of firing directly.
+#
+# Menu layout is decided at registration, not by the providers: register()
+# takes an `order` (position in the menu) and a `group` (providers sharing a
+# group are listed under the same divider). A `setting` id, when given, gates
+# the whole provider on a mod_settings toggle — that is what the "Right Click
+# Menu" settings section drives.
+#
 # Blocking windows: update() polls the RAW mouse state, so Godot's normal GUI
 # event consumption inside a mod dialog cannot stop us — a right-click on a
 # card of the Map Gallery would open the map context menu straight through the
@@ -20,26 +29,67 @@ var _g
 var ui_util
 
 var _right_was_pressed := false
-var _providers := []
+var _providers := []  # [{provider, order, group, setting, seq}]
 var _context_menu: PopupMenu = null
 var _popup_layer: CanvasLayer = null
-var _item_map := []   # [{provider_idx, action_id}] — maps menu index to provider
+var _item_map := {}   # menu id -> {provider, action_id}
 var _last_raw = null
+var _register_seq := 0
 
 
 func initialize() -> void:
 	print("[RightClickUtil] Initialized with ", _providers.size(), " provider(s)")
 
 
-func register(provider) -> void:
-	if provider in _providers:
+# order  : position in the menu (ascending). Convention in Main.gd:
+#          10 favorites, 20 free transform, 30 prefabs, 40 groups,
+#          50 rotate, 60 clipboard.
+# group  : divider group; providers sharing a value are listed together with
+#          no separator between them (prefabs and groups do). Defaults to the
+#          order, i.e. one group per provider.
+# setting: mod_settings toggle id gating the provider ("" = always on).
+func register(provider, order: int = 1000, group: int = -1, setting: String = "") -> void:
+	if _find_entry(provider) != null:
 		return
-	_providers.append(provider)
+	_register_seq += 1
+	_providers.append({
+		provider = provider,
+		order = order,
+		group = (order if group < 0 else group),
+		setting = setting,
+		seq = _register_seq,
+	})
 
 
 func unregister(provider) -> void:
-	if provider in _providers:
-		_providers.erase(provider)
+	var entry = _find_entry(provider)
+	if entry != null:
+		_providers.erase(entry)
+
+
+func _find_entry(provider):
+	for e in _providers:
+		if e.provider == provider:
+			return e
+	return null
+
+
+# sort_custom is unstable in Godot 3, hence the registration-order tiebreak.
+func _sort_entries(a: Dictionary, b: Dictionary) -> bool:
+	if a.order != b.order:
+		return a.order < b.order
+	return a.seq < b.seq
+
+
+func _setting_enabled(setting: String) -> bool:
+	if setting == "":
+		return true
+	if _g == null or _g.get("ModMapData") == null or not (_g.ModMapData is Dictionary):
+		return true
+	var ms = _g.ModMapData.get("_mod_settings")
+	if ms == null or not ms.has_method("is_enabled"):
+		return true
+	return ms.is_enabled(setting)
 
 
 func update(_delta: float) -> void:
@@ -113,7 +163,8 @@ func _on_right_click() -> void:
 	# Let providers intercept (e.g. favorites list click).
 	# Providers run regardless of active tool — their asset panels are
 	# visible everywhere (WallTool, PathTool, etc.).
-	for p in _providers:
+	for e in _providers:
+		var p = e.provider
 		if p.has_method("check_right_click") and p.check_right_click():
 			return
 
@@ -161,13 +212,20 @@ func _on_right_click() -> void:
 		# Near the selection box? (256px screen space)
 		near_selection = _is_mouse_near_selection(select_tool)
 
-	# Ask each provider for items
+	# Ask each provider for items, in menu order
 	var all_items := []
-	_item_map = []
 	_last_raw = raw
 
-	for pi in range(_providers.size()):
-		var p = _providers[pi]
+	var entries := []
+	for e in _providers:
+		entries.append(e)
+	entries.sort_custom(self, "_sort_entries")
+
+	var last_group = null
+	for e in entries:
+		if not _setting_enabled(e.setting):
+			continue
+		var p = e.provider
 		var items = null
 		if near_selection:
 			if p.has_method("get_context_items"):
@@ -177,13 +235,14 @@ func _on_right_click() -> void:
 				items = p.get_void_context_items()
 		if items == null or items.size() == 0:
 			continue
-		# Add separator between providers (except before the first group)
-		if all_items.size() > 0:
+		# Separator between divider groups only, and never leading.
+		if all_items.size() > 0 and e.group != last_group:
 			all_items.append({label = "", icon = null, action_id = "", _sep = true})
-			_item_map.append({provider_idx = -1, action_id = ""})
+		last_group = e.group
 		for item in items:
-			all_items.append(item)
-			_item_map.append({provider_idx = pi, action_id = item.action_id})
+			var copy = item.duplicate()
+			copy["_provider"] = p
+			all_items.append(copy)
 
 	if all_items.size() == 0:
 		return
@@ -197,16 +256,39 @@ func _show_popup(items: Array) -> void:
 		_context_menu = null
 
 	_context_menu = PopupMenu.new()
+	_item_map = {}
+	var next_id := 0
 
-	for i in range(items.size()):
-		var item = items[i]
+	for item in items:
 		if item.get("_sep", false):
 			_context_menu.add_separator()
-		else:
-			_context_menu.add_item(item.label, i)
+			continue
+		var submenu = item.get("submenu", null)
+		if submenu is Array and submenu.size() > 0:
+			var sub = PopupMenu.new()
+			sub.name = "rcu_sub_%d" % next_id
+			for sub_item in submenu:
+				if sub_item.get("_sep", false):
+					sub.add_separator()
+					continue
+				sub.add_item(sub_item.label, next_id)
+				if sub_item.get("icon", null) != null:
+					sub.set_item_icon(sub.get_item_index(next_id), sub_item.icon)
+				_item_map[next_id] = {provider = item["_provider"], action_id = sub_item.action_id}
+				next_id += 1
+			sub.connect("id_pressed", self, "_on_item_pressed")
+			_context_menu.add_child(sub)
+			# A submenu parent never emits id_pressed, so it needs no mapping.
+			_context_menu.add_submenu_item(item.label, sub.name, next_id)
 			if item.icon != null:
-				var idx = _context_menu.get_item_index(i)
-				_context_menu.set_item_icon(idx, item.icon)
+				_context_menu.set_item_icon(_context_menu.get_item_index(next_id), item.icon)
+			next_id += 1
+			continue
+		_context_menu.add_item(item.label, next_id)
+		if item.icon != null:
+			_context_menu.set_item_icon(_context_menu.get_item_index(next_id), item.icon)
+		_item_map[next_id] = {provider = item["_provider"], action_id = item.action_id}
+		next_id += 1
 
 	_context_menu.connect("id_pressed", self, "_on_item_pressed")
 	_context_menu.connect("popup_hide", self, "_on_popup_closed")
@@ -221,13 +303,11 @@ func _on_item_pressed(id: int) -> void:
 		_context_menu.queue_free()
 		_context_menu = null
 
-	if id < 0 or id >= _item_map.size():
+	if not _item_map.has(id):
 		return
 	var mapping = _item_map[id]
-	if mapping.provider_idx < 0:
-		return
-	var provider = _providers[mapping.provider_idx]
-	if provider.has_method("on_context_action"):
+	var provider = mapping.provider
+	if provider != null and is_instance_valid(provider) and provider.has_method("on_context_action"):
 		provider.on_context_action(mapping.action_id, _last_raw)
 
 

@@ -163,6 +163,21 @@ func _on_uu_node_removed(node: Node) -> void:
 # over the map. Callers that only need "is the cursor over a UI surface"
 # should pass true and hit-test the popup under the cursor separately with
 # is_mouse_over_popup().
+# macOS Retina : Viewport.get_mouse_position() renvoie des PIXELS physiques
+# alors que les rects GUI (get_global_rect des panneaux, edges) sont en POINTS
+# logiques -- facteur 2 sur Retina. Toute comparaison souris/rect GUI doit donc
+# normaliser par OS.get_screen_scale() (2.0 sur Retina, 1.0 partout ailleurs :
+# non implemente hors macOS en Godot 3). Diagnostique via [TTF-DIAG] :
+# event.pos=(813,676) vs vp.mouse=(1626,1352), edges=(284,1673,1104).
+func gui_mouse(vp) -> Vector2:
+	var m = vp.get_mouse_position()
+	if OS.has_method("get_screen_scale"):
+		var sc = OS.get_screen_scale()
+		if sc > 1.01:
+			return m / sc
+	return m
+
+
 func is_mouse_over_ui(listener_node: Node, ignore_popups: bool = false) -> bool:
 	# Profiler hook: when Main's F10 profiler is active, accumulate this
 	# (per-frame-cached) UI walk so we can see its true cost separately —
@@ -202,7 +217,7 @@ func _is_mouse_over_ui_impl(listener_node: Node, ignore_popups: bool = false) ->
 	if vp == null:
 		# Listener-specific degenerate case — don't poison the shared cache.
 		return true
-	var mouse = vp.get_mouse_position()
+	var mouse = gui_mouse(vp)
 	var vp_size = vp.size
 	var over := false
 
@@ -256,7 +271,7 @@ func is_mouse_over_hud(listener_node: Node) -> bool:
 	var tree = listener_node.get_tree()
 	if vp == null or tree == null:
 		return false
-	var mouse = vp.get_mouse_position()
+	var mouse = gui_mouse(vp)
 	cache["hud_val"] = _find_hud_control_at(tree.root, mouse, vp.size, 0) != null
 	return cache["hud_val"]
 
@@ -295,7 +310,7 @@ func get_popup_under_mouse(listener_node: Node):
 	var vp = listener_node.get_viewport()
 	if vp == null:
 		return null
-	var mouse = vp.get_mouse_position()
+	var mouse = gui_mouse(vp)
 	var tree = listener_node.get_tree()
 	if tree == null:
 		return null
@@ -307,7 +322,7 @@ func scroll_popup_under_mouse(listener_node: Node, up: bool) -> bool:
 	var vp = listener_node.get_viewport()
 	if vp == null:
 		return false
-	var mouse = vp.get_mouse_position()
+	var mouse = gui_mouse(vp)
 	
 	# First find the popup under the mouse
 	var tree = listener_node.get_tree()

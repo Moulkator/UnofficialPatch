@@ -326,6 +326,10 @@ func _rewrite_clipboard_prefab_ids() -> int:
 		pid_map[old_pid_str] = next_pid
 		next_pid += 1
 	print("[PrefabsFix] Fix2: paste pid mapping: %s" % str(pid_map))
+	# Publie pour clipboard_fix : les walls d'un prefab ne passent pas par le
+	# clipboard DD (Serialize les ignore), il lui faut cette table pour que les
+	# walls colles rejoignent le meme groupe que les assets colles.
+	Engine.set_meta("pfx_paste_pid_map", pid_map)
 
 	# 3. Reecrire les prefab_ids
 	for section in ["objects", "pathways", "walls", "lights", "portals", "pattern_shapes", "roofs"]:

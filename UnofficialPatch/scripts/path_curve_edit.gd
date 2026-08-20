@@ -408,8 +408,9 @@ func _on_input(event) -> bool:
 
 	var world_ui = _g.get("WorldUI")
 	if world_ui == null: return false
-	var canvas_xform = world_ui.get_viewport().get_canvas_transform()
-	var mouse_w: Vector2 = canvas_xform.affine_inverse().xform(event.position)
+	# macOS fix: use DD's reference world mouse position; converting
+	# event.position by hand drifts on Retina/DPI/UI scaling.
+	var mouse_w: Vector2 = world_ui.MousePosition
 
 	if event.alt:
 		return _try_flatten(mouse_w)

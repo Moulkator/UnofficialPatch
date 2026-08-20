@@ -965,7 +965,7 @@ func update(delta):
 		# Try to find search LineEdit if not yet stored
 		var _se = _panels[_sk].get("search_lineedit")
 		if _se == null or not is_instance_valid(_se):
-			var _lib = _panels[_sk].get("lib_panel")
+			var _lib = _search_root(_panels[_sk])
 			if _lib and is_instance_valid(_lib):
 				_se = _find_search_lineedit(_lib)
 				if _se != null: _panels[_sk]["search_lineedit"] = _se
@@ -3685,7 +3685,7 @@ func _show_favs_for_panel(key: String):
 	item_list.visible = false
 	overlay.visible = true
 	# Hook search bar AFTER overlay is visible (prevents premature text_changed)
-	var search_edit = _find_search_lineedit(panel["lib_panel"])
+	var search_edit = _find_search_lineedit(_search_root(panel))
 	if search_edit != null:
 		panel["search_lineedit"] = search_edit
 		if not search_edit.is_connected("focus_entered", self, "_on_search_focus_entered"):
@@ -3935,6 +3935,15 @@ func _snapshot_full_list(panel: Dictionary, item_list: ItemList) -> void:
 
 
 func _any_lineedit_has_focus() -> bool:
+	# Global check first: any focused text field anywhere in the app
+	# (covers other mods' search boxes, e.g. Theme Search), plus DD's own
+	# SearchHasFocus flag set by native search bars.
+	if _g.Editor and is_instance_valid(_g.Editor):
+		if _g.Editor.get("SearchHasFocus"):
+			return true
+		var focus_owner = _g.Editor.get_focus_owner()
+		if focus_owner is LineEdit or focus_owner is TextEdit:
+			return true
 	# Check all known search LineEdits from panels
 	for key in _panels:
 		var le = _panels[key].get("search_lineedit")
@@ -4275,6 +4284,27 @@ func _invalidate_all_draw_overlays() -> void:
 			ovl.invalidate()
 
 
+func _sync_overlay_modulates(panel: Dictionary, il, ovl) -> void:
+	# Some lists tint via per-item icon modulate applied by DD after our
+	# overlay snapshot. Cheap probe: compare the first mapped item; full
+	# re-copy only when it changed.
+	if not ovl.visible:
+		return
+	var fav_map = panel.get("fav_to_dd_index", [])
+	var n = min(ovl.get_item_count(), fav_map.size())
+	if n == 0:
+		return
+	var d0 = fav_map[0]
+	if not (d0 is int) or d0 < 0 or d0 >= il.get_item_count():
+		return
+	if ovl.get_item_icon_modulate(0) == il.get_item_icon_modulate(d0):
+		return
+	for i in range(n):
+		var d = fav_map[i]
+		if d is int and d >= 0 and d < il.get_item_count():
+			ovl.set_item_icon_modulate(i, il.get_item_icon_modulate(d))
+
+
 func _apply_badges_to_dd_lists():
 	for key in _panels:
 		var panel = _panels[key]
@@ -4288,6 +4318,14 @@ func _apply_badges_to_dd_lists():
 		if overlay_list != null and is_instance_valid(overlay_list):
 			if overlay_list.icon_scale != item_list.icon_scale:
 				overlay_list.icon_scale = item_list.icon_scale
+			# DD assigns (or replaces) its tint ShaderMaterial after boot: an
+			# overlay built earlier (Normal filter with hidden assets at map
+			# load) would keep a null/stale material and show untinted
+			# walls/patterns until the next mode cycle. Re-sync the reference;
+			# uniform changes then apply automatically (shared instance).
+			if overlay_list.material != item_list.material:
+				overlay_list.material = item_list.material
+			_sync_overlay_modulates(panel, item_list, overlay_list)
 		var overlay_visible = overlay_list != null and is_instance_valid(overlay_list) and overlay_list.visible and overlay_list.is_visible_in_tree()
 		var fav_type_b = panel["type"]
 		if not item_list.visible or not item_list.is_visible_in_tree():
@@ -4662,12 +4700,53 @@ func _find_search_lineedit(lib_panel: Node):
 
 func _find_lineedit_recursive(node: Node, depth: int):
 	if depth > 6: return null
-	if node is LineEdit: return node
+	# SpinBox owns an internal LineEdit (a numeric value box) — never a search field.
+	if node is SpinBox: return null
+	if node is LineEdit:
+		return node if _is_search_lineedit(node) else null
 	for child in node.get_children():
 		if not is_instance_valid(child): continue
 		var r = _find_lineedit_recursive(child, depth + 1)
 		if r != null: return r
 	return null
+
+
+func _is_search_lineedit(le) -> bool:
+	# Tool panels are full of numeric value boxes (slider editors: "0.6", "5"...).
+	# Filtering the overlay with those wiped every item (walls/caves/patterns/
+	# roofs/lights/portals bug). Only accept a LineEdit that demonstrably
+	# belongs to a search row.
+	if le == null or not is_instance_valid(le):
+		return false
+	if "search" in str(le.name).to_lower():
+		return true
+	if "search" in str(le.placeholder_text).to_lower():
+		return true
+	# DD / AdditionalSearchOptions rows keep a Label "Search..." next to the
+	# field; library_right_panel's split row is named UP_SearchFieldRow.
+	var p = le.get_parent()
+	var guard = 2
+	while p != null and is_instance_valid(p) and guard > 0:
+		if str(p.name) == "UP_SearchFieldRow":
+			return true
+		for c in p.get_children():
+			if c is Label and str(c.text).to_lower().begins_with("search"):
+				return true
+		p = p.get_parent()
+		guard -= 1
+	return false
+
+
+func _search_root(panel: Dictionary):
+	# The library may have been relocated by library_right_panel: the recorded
+	# lib_panel then only holds the leftover sliders. Search next to the
+	# list's CURRENT parent first, falling back to the recorded lib_panel.
+	var il = panel.get("item_list")
+	if il != null and is_instance_valid(il):
+		var p = il.get_parent()
+		if p != null and is_instance_valid(p):
+			return p
+	return panel.get("lib_panel")
 
 
 func _filter_overlay(key: String, text: String) -> void:
@@ -5630,7 +5709,7 @@ func _show_subset_overlay(key: String, want_hidden: bool):
 	il.visible = false
 	overlay.visible = true
 	overlay.select_mode = il.select_mode
-	var se = _find_search_lineedit(panel.get("lib_panel"))
+	var se = _find_search_lineedit(_search_root(panel))
 	if se != null:
 		panel["search_lineedit"] = se
 		_last_search_text[key] = se.text

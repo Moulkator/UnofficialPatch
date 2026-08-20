@@ -227,6 +227,17 @@ func update(_delta):
 	_prev_frame_sel_size = sel_size
 
 
+func _zorder_recently_applied() -> bool:
+	if not Engine.has_meta("_zorder_undo_applied_frame"):
+		return false
+	var f = Engine.get_meta("_zorder_undo_applied_frame")
+	if typeof(f) != TYPE_INT:
+		return false
+	# The record is applied on the Ctrl+Z input frame; our restore runs
+	# RESTORE_DELAY_FRAMES later. Small extra margin for frame skew.
+	return Engine.get_idle_frames() - f <= RESTORE_DELAY_FRAMES + 3
+
+
 func _is_undo_redo_key_held() -> bool:
 	return Input.is_key_pressed(KEY_CONTROL) or Input.is_key_pressed(KEY_META)
 
@@ -303,10 +314,18 @@ func _capture_selection(select_tool) -> void:
 			continue
 		current_nids.append(nid)
 		if node is Node2D:
+			# "z"/"lyr" catch layer changes (e.g. Minor Utils' layer up/down
+			# shortcuts write z_index on objects and SetLayer on patterns),
+			# which are invisible to the pos/rot/scale fingerprints.
+			var lyr = null
+			if node.has_method("GetLayer"):
+				lyr = node.GetLayer()
 			current_fingerprints[nid] = {
 				"pos": node.global_position,
 				"rot": node.global_rotation,
 				"scl": node.global_scale,
+				"z": node.z_index,
+				"lyr": lyr,
 			}
 		# Track real-prefab membership: a small positive prefab_id is
 		# a vanilla DD prefab (group_assets uses pid >= 10000).
@@ -406,6 +425,23 @@ func _restore_selection(select_tool) -> void:
 		if node.global_scale != fp["scl"]:
 			any_changed = true
 			break
+		# Layer fingerprints — .get() with the current value as default so a
+		# fingerprint captured before this field existed compares as equal.
+		if node.z_index != fp.get("z", node.z_index):
+			any_changed = true
+			break
+		var lyr = null
+		if node.has_method("GetLayer"):
+			lyr = node.GetLayer()
+		if lyr != fp.get("lyr", lyr):
+			any_changed = true
+			break
+	# Z-order undo/redo (zorder_undo submod) only moves child indices —
+	# invisible to the transform fingerprints above. The submod publishes
+	# the idle frame at which it applied a record; if that's within the
+	# restore window, the undone action DID touch the previous selection.
+	if not any_changed and _zorder_recently_applied():
+		any_changed = true
 	if not any_changed:
 		# Drop the snapshot so the next Ctrl+Z evaluates fresh.
 		_prev_selection_nids = []

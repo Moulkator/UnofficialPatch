@@ -30,7 +30,9 @@
 #     highlight. (On n'utilise pas IsInsideBounds : il a un padding de 512
 #     unités, trop large pour "strictement dans la map".)
 #   - Chaque frame, on vérifie aussi si le highlighted courant est d'un type
-#     (ou d'un calque) filtré ; si oui, on l'éteint.
+#     (ou d'un calque) filtré, ou s'il est invisible dans l'arbre (calque
+#     caché par un mod tiers type Hide Layers, ex. container Portals masqué —
+#     le pick de DD ignore la visibilité) ; si oui, on l'éteint.
 # Dans tous ces cas, si SelectTool est actif, on éteint le highlight de survol
 # via SelectTool.Highlight(highlighted, false) PUIS on remet highlighted à null
 # pour qu'il ne reste pas sélectionnable. DD le re-pose tout seul au prochain
@@ -51,6 +53,7 @@ const TYPE_TO_FILTER := {
 var _g
 var _content: Control = null
 var _watcher = null
+var _listener = null
 var _was_focused := true
 var _connected := false
 # Vrai tant que le SelectTool etait en train de tracer une dragbox (isDrawing)
@@ -88,7 +91,45 @@ func _notification(what):
 	_watcher.name = "SelectHighlightFixWatcher"
 	if _g != null and _g.Editor != null:
 		_g.Editor.add_child(_watcher)
+	# Listener d'input (phase _input, priorité haute, avant le
+	# _on_Content_gui_input de DD) : éteint le highlighted filtré/caché au
+	# moment exact du clic (voir _on_input). Complément du polling d'update(),
+	# qui perd la course quand un motion et le press arrivent dans la même
+	# frame : DD re-pose highlighted à CHAQUE motion pour les things cachés
+	# (son HighlightThingAtPoint ignore la visibilité), et son press lit
+	# highlighted avant que notre _process ait pu le nettoyer.
+	_listener = Node.new()
+	_listener.name = "SelectHighlightFixInput"
+	var lscript = GDScript.new()
+	lscript.source_code = "extends Node\nvar handler = null\nfunc _ready():\n\tset_process_input(true)\n\tprocess_priority = -250\nfunc _input(e):\n\tif handler != null:\n\t\thandler._on_input(e)\n"
+	lscript.reload()
+	_listener.set_script(lscript)
+	_listener.handler = self
+	if _g != null and _g.World != null:
+		_g.World.call_deferred("add_child", _listener)
 	print("[SelectHighlightFix] initialized")
+
+
+# Press/release gauche livrés en phase _input, AVANT le _ContentInput de DD :
+# si le highlighted courant est filtré ou caché, on l'éteint ICI pour que le
+# press de DD (Select(highlighted)) et l'ajout Shift à la release ne voient
+# plus rien. On ne consomme pas l'événement : le clic retombe sur le
+# comportement "espace vide" de DD (départ de dragbox), qui est le bon.
+func _on_input(event) -> void:
+	if not (event is InputEventMouseButton) or event.button_index != BUTTON_LEFT:
+		return
+	# Alt = alt_deselect : retirer un thing caché de la sélection reste
+	# légitime, ne pas lui voler son highlighted.
+	if event.alt:
+		return
+	if _g == null or _g.Editor == null:
+		return
+	# Lecture LIVE de l'outil actif : le cache _active_tool_name() n'est
+	# rafraîchi qu'en _process, or _input est délivré avant (cf. slpf).
+	if str(_g.Editor.ActiveToolName) != "SelectTool":
+		return
+	if _highlight_filtered():
+		_clear_highlight()
 
 
 func update(_delta) -> void:
@@ -269,10 +310,15 @@ func _highlight_filtered() -> bool:
 			var key = TYPE_TO_FILTER[t]
 			if filter.has(key) and filter[key] == false:
 				return true
-	# Filtre par calque (objets seulement).
 	var thing = h.get("Thing")
-	if thing != null and is_instance_valid(thing) and st.has_method("IsObjectLayerFiltered"):
-		if st.IsObjectLayerFiltered(thing):
+	if thing != null and is_instance_valid(thing):
+		# Visibilité : un thing caché (calque masqué par un mod tiers type
+		# Hide Layers) ne doit pas rester cliquable via le highlighted que
+		# DD pose quand même (son pick ignore la visibilité).
+		if thing is CanvasItem and not thing.is_visible_in_tree():
+			return true
+		# Filtre par calque.
+		if st.has_method("IsObjectLayerFiltered") and st.IsObjectLayerFiltered(thing):
 			return true
 	return false
 

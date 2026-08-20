@@ -53,6 +53,7 @@ var _was_shown      := false
 var _applying      := false
 var _styled        := false
 var _cur_scale     := 1.0
+var _last_vp       := Vector2.ZERO   # viewport size _pos was placed in
 var _destroyed     := false
 
 
@@ -293,8 +294,19 @@ func _tick() -> void:
 	_cur_scale = _compute_scale()
 	_panel.rect_pivot_offset = Vector2.ZERO
 	_panel.rect_scale = Vector2(_cur_scale, _cur_scale)
+	# NOTE: _last_vp must be updated BEFORE remap/clamp run, because both may
+	# call _save_settings(), which persists _last_vp. Saving the new position
+	# with the stale viewport size made the next mod instance (map reload)
+	# remap an already-remapped position.
+	var vp = _viewport_size()
+	var old_vp = _last_vp
+	_last_vp = vp
 	if _pos.x < 0:
 		_pos = _default_position()
+	else:
+		if old_vp != Vector2.ZERO and vp != old_vp and not _dragging:
+			_remap_to_viewport(old_vp, vp)
+		_clamp_to_viewport()
 	_panel.rect_position = _pos
 	_publish_ui_rect(_vis_rect(_panel))
 
@@ -343,6 +355,36 @@ func _set_check_silent(key: String, v: bool) -> void:
 		cb.set_block_signals(true)
 		cb.pressed = v
 		cb.set_block_signals(false)
+
+
+# The viewport size changed (fullscreen toggle, window resize, resolution
+# switch): move the bar so its *center* keeps the same relative position it had
+# in the old viewport. A plain edge-clamp isn't enough -- a bar parked near the
+# bottom in fullscreen would get pinned to the new bottom edge, hidden behind
+# the floatbar; proportional remapping puts it back where the user expects it.
+func _remap_to_viewport(old_vp: Vector2, new_vp: Vector2) -> void:
+	if old_vp.x < 1.0 or old_vp.y < 1.0:
+		return
+	var size = _panel.rect_size * _cur_scale
+	var center = _pos + size * 0.5
+	var frac = Vector2(center.x / old_vp.x, center.y / old_vp.y)
+	_pos = Vector2(frac.x * new_vp.x, frac.y * new_vp.y) - size * 0.5
+	print("[SelectFilterBar] Viewport %s -> %s, bar remapped to %s" % [str(old_vp), str(new_vp), str(_pos)])
+	_save_settings()
+
+
+# Keep the bar inside the current viewport. The saved position may lie outside
+# after a resolution / windowed-fullscreen change; without this the bar ends up
+# hidden under (or beyond) the rest of the UI.
+func _clamp_to_viewport() -> void:
+	var vp = _viewport_size()
+	var size = _panel.rect_size * _cur_scale
+	var p = _pos
+	p.x = clamp(p.x, 0.0, max(0.0, vp.x - size.x))
+	p.y = clamp(p.y, 0.0, max(0.0, vp.y - size.y))
+	if p != _pos:
+		_pos = p
+		_save_settings()
 
 
 func _default_position() -> Vector2:
@@ -729,7 +771,9 @@ func _sync_bar_button() -> void:
 # ── Settings persistence ─────────────────────────────────────────────────────
 
 func _save_settings() -> void:
-	var data = {"enabled": _enabled, "pos_x": _pos.x, "pos_y": _pos.y}
+	var vp = _last_vp if _last_vp != Vector2.ZERO else _viewport_size()
+	var data = {"enabled": _enabled, "pos_x": _pos.x, "pos_y": _pos.y,
+			"vp_x": vp.x, "vp_y": vp.y}
 	var dir = Directory.new()
 	if not dir.dir_exists("user://UnofficialPatch"):
 		dir.make_dir_recursive("user://UnofficialPatch")
@@ -753,3 +797,5 @@ func _load_settings() -> void:
 		_enabled = bool(d["enabled"])
 	if d.has("pos_x") and d.has("pos_y"):
 		_pos = Vector2(float(d["pos_x"]), float(d["pos_y"]))
+	if d.has("vp_x") and d.has("vp_y"):
+		_last_vp = Vector2(float(d["vp_x"]), float(d["vp_y"]))

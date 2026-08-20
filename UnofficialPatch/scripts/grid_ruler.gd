@@ -382,6 +382,14 @@ func _draw_ruler(ctrl: Control) -> void:
 	if camera == null or not is_instance_valid(camera):
 		return
 
+	# macOS Retina fix (credit: ARC): the ruler Control draws in physical
+	# pixels while canvas_xform yields logical points, so world->screen
+	# graduations must be multiplied by the screen scale. The mouse position
+	# is left raw for the same reason.
+	var _os_scale: float = 1.0
+	if OS.has_method("get_screen_scale"):
+		_os_scale = max(1.0, OS.get_screen_scale())
+
 	var vp = ctrl.get_viewport()
 	var vp_size : Vector2 = ctrl.rect_size
 	if vp_size.x <= 0 or vp_size.y <= 0:
@@ -506,7 +514,7 @@ func _draw_ruler(ctrl: Control) -> void:
 		x_end = cells_w
 	for x in range(x_start, x_end + 1):
 		var wx : float = world_rect.position.x + x * grid_size.x
-		var sx : float = canvas_xform.xform(Vector2(wx, world_rect.position.y)).x
+		var sx : float = canvas_xform.xform(Vector2(wx, world_rect.position.y)).x * _os_scale
 		if sx < strip_x0 - 2 or sx > right_edge + 2:
 			continue
 		var is_major : bool = (x % step == 0) or (x == cells_w)
@@ -539,7 +547,7 @@ func _draw_ruler(ctrl: Control) -> void:
 		y_end = cells_h
 	for y in range(y_start, y_end + 1):
 		var wy : float = world_rect.position.y + y * grid_size.y
-		var sy : float = canvas_xform.xform(Vector2(world_rect.position.x, wy)).y
+		var sy : float = canvas_xform.xform(Vector2(world_rect.position.x, wy)).y * _os_scale
 		if sy < strip_y0 - 2 or sy > vp_size.y + 2:
 			continue
 		var is_major : bool = (y % step == 0) or (y == cells_h)

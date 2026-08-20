@@ -76,8 +76,6 @@ const DEBUG := false
 var _destroyed := false
 var _attach_frame := -100
 var _root_child_count := -1
-
-
 func initialize() -> void:
 	_install_input_listener()
 	_dbg("initialized")
@@ -244,3 +242,66 @@ func _on_input(event) -> void:
 	_dbg("applied: rot=%.1f deg scale=%.2f" % [rad2deg(preview.global_rotation), preview.scale.x])
 	input_listener.get_tree().set_input_as_handled()
 
+
+# ==================== PREVIEW ACCESS ====================
+
+func _get_preview():
+	if not _uu_editor_reachable():
+		return null
+	var tools = _g.Editor.Tools
+	if tools == null or not tools.has("ScatterTool"):
+		return null
+	var st = tools["ScatterTool"]
+	if st == null:
+		return null
+	# ScatterTool.Preview is null between Disable() and the next Enable(),
+	# and its Texture is null while no asset is selected in the library.
+	var preview = st.get("Preview")
+	if preview == null or not is_instance_valid(preview):
+		return null
+	if preview.get("Texture") == null:
+		return null
+	return preview
+
+
+func _rotate_preview(preview, up: bool, step_deg: float) -> void:
+	var step = deg2rad(step_deg)
+	var target = preview.global_rotation + (step if up else -step)
+	preview.global_rotation = wrapf(target, -PI, PI)
+
+
+func _scale_preview(preview, up: bool) -> void:
+	# ScatterTool writes a uniform Scale (not GlobalScale), so we mirror that.
+	var current: float = preview.scale.x
+	var target: float = clamp(current + (SCALE_STEP if up else -SCALE_STEP), SCALE_MIN, SCALE_MAX)
+	preview.scale = Vector2(target, target)
+
+
+# ==================== SHARED EDITOR STATE ====================
+# Same contract as the other submods: read the per-frame snapshot published
+# by Main.gd instead of marshalling ActiveToolName across the interop
+# boundary, and memoize the _g.Editor reachability check once per tick.
+
+var _uu_ed_frame := -1
+var _uu_ed_ok := false
+
+
+func _active_tool_name() -> String:
+	if not _uu_editor_reachable():
+		return ""
+	if Engine.has_meta("_uu_editor_state"):
+		var s = Engine.get_meta("_uu_editor_state")
+		if s is Dictionary:
+			var v = s.get("active_tool_name")
+			if v is String:
+				return "%s" % v
+	return str(_g.Editor.ActiveToolName)
+
+
+func _uu_editor_reachable() -> bool:
+	var f = Engine.get_idle_frames()
+	if f == _uu_ed_frame:
+		return _uu_ed_ok
+	_uu_ed_frame = f
+	_uu_ed_ok = _g != null and _g.Editor != null
+	return _uu_ed_ok

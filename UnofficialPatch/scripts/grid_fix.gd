@@ -4,6 +4,10 @@ var _g
 
 var DEFAULT_Z = 649
 var current_z = DEFAULT_Z
+# Z offset published by compare_fix while level compare is active (0 otherwise).
+# Lets the grid ride above the stacked levels while keeping its configured
+# layer relative to the topmost visible level. Polled in update().
+var _compare_base = 0
 
 var layer_slider_ref = null
 var layer_spinbox_ref = null
@@ -55,42 +59,31 @@ func get_current_level():
   return _g.World.levels[_g.World.CurrentLevelId]
 
 
-# _get_best_parent_and_z : utilisé UNIQUEMENT pour la copie d'export.
-# Ne jamais appeler pour repositionner GridMesh lui-même :
-# placer GridMesh dans Walls/Roofs/etc. provoque un InvalidCastException
-# dans SelectTool.HighlightThingAtPoint (cast de type natif sur nos noeuds).
-# La copie d'export n'existe que pendant que la dialog export est ouverte
-# (l'utilisateur ne survole pas la map), donc pas de crash de ce cote.
-#
-# IMPORTANT : on EXCLUT Walls et Portals des parents candidats.
-# L'export Universal VTT (.dd2vtt) fait Exporter.ExportForVTT() qui itere
-# World.SourceLevel.Walls / Portals / Objects / Pathways / Lights avec des
-# casts C# stricts (foreach (Wall child in Walls.GetChildren()), etc.).
-# Une copie MeshInstance2D placee sous Walls/Portals y serait castee en
-# Wall/Portal -> InvalidCastException -> le bake JSON plante -> DD ne
-# supprime pas le PNG intermediaire et n'ecrit pas le .dd2vtt, laissant
-# un fichier "<nom>.dd2vtt.png". On ne garde donc que des nœuds rendus mais
-# NON serialises par le VTT. Le z visuel reste correct (z_parent + z_relatif).
-func _get_best_parent_and_z(level):
-  var LEVEL_NODES = [
-    ["Terrain",     -500],
-    ["CaveMesh",    -300],
-    ["FloorShapes", -200],
-    ["WaterMesh",      0],
-    ["Roofs",        800],
-  ]
-  var best_parent = level
-  var best_node_z = 0
-  var best_dist = 99999
-  for entry in LEVEL_NODES:
-    var node = level.find_node(entry[0], false, false)
-    if node != null:
-      var dist = abs(current_z - entry[1])
-      if dist < best_dist:
-        best_dist = dist
-        best_node_z = entry[1]
-        best_parent = node
-  return [best_parent, clamp(current_z - best_node_z, -4096, 4096)]
+# The export copy must NEVER live inside a DD level container. Older
+# versions of this mod parented it inside the nearest z container
+# (Terrain/CaveMesh/FloorShapes/WaterMesh/Roofs), and Roofs.Save() casts
+# every child to Roof ("foreach (Roof child in GetChildren())"): a
+# MeshInstance2D there throws InvalidCastException on the save thread,
+# which kills Save.Start() before its epilogue and leaves Master.IsSaving
+# stuck true forever (saving, autosave AND undo/redo all die, since
+# History.Undo()/Redo() are gated by Master.IsBusy). The same class of
+# crash exists in the VTT exporter for Walls/Portals/etc. The copy now
+# lives as a DIRECT child of the Level node (relative z, so it inherits
+# the per-floor z offset), which no native code casts.
+# This sweep frees any stale copy left behind by older versions or by an
+# aborted export within the current session.
+func _sweep_stale_export_copies():
+  if not (_g.World and _g.World is Node):
+    return
+  while true:
+    var stale = _g.World.find_node("GridExportCopy", true, false)
+    if stale == null or stale == export_grid_copy:
+      return
+    var sp = stale.get_parent()
+    if sp != null:
+      sp.remove_child(stale)
+    stale.queue_free()
+    print("[GridFix] Stale GridExportCopy swept.")
 
 
 func apply_to_current_level():
@@ -108,14 +101,23 @@ func apply_to_current_level():
     world.add_child(grid)
 
   # Z absolu : current_z est directement la valeur voulue
-  # (ex : 649 = entre Walls@600 et Roofs@800, le rendu est identique)
-  grid.call("set_z_index", current_z)
+  # (ex : 649 = entre Walls@600 et Roofs@800, le rendu est identique).
+  # Pendant un level compare (compare_fix), les levels visibles sont montes
+  # a z 1900..3000 : on ajoute le base publie (top du stack) pour garder la
+  # grid au meme layer relatif au level visible le plus haut (max 3901 < 4096).
+  grid.call("set_z_index", int(clamp(current_z + _get_compare_base(), -4096, 4096)))
   grid.call("set_z_as_relative", false)
   grid.call("_set_on_top", false)
 
   var c = grid.self_modulate
   c.a = current_opacity / 100.0
   grid.self_modulate = c
+
+
+func _get_compare_base() -> int:
+  if Engine.has_meta("uu_compare_grid_base"):
+    return int(Engine.get_meta("uu_compare_grid_base"))
+  return 0
 
 
 func park_grid_in_world():
@@ -394,6 +396,7 @@ func create_export_grid_copy():
   if _destroyed:
     return
   delete_export_grid_copy()
+  _sweep_stale_export_copies()
 
   var grid = get_grid_node()
   if grid == null:
@@ -416,14 +419,21 @@ func create_export_grid_copy():
   copy.position = grid.position
   copy.scale = grid.scale
 
-  var level = get_current_level()
-  var result = _get_best_parent_and_z(level)
-  var best_parent = result[0]
-  var z_relative = result[1]
-  copy.z_index = z_relative
+  # Parent: the Level node itself, with a RELATIVE z. The Level carries a
+  # per-floor z offset (e.g. -2000), so an absolute z under World would
+  # float above (or below) the whole level content no matter the slider
+  # value. Being a direct Level child inherits that offset, while staying
+  # out of the typed containers (see _sweep_stale_export_copies comment):
+  # nothing in Level.Save()/Load() or the VTT exporter iterates the
+  # Level's direct children with casts, only the containers' children.
+  copy.z_index = int(clamp(current_z, -4096, 4096))
   copy.z_as_relative = true
   copy.show_on_top = false
-  best_parent.add_child(copy)
+  var level = get_current_level()
+  if level != null and level is Node:
+    level.add_child(copy)
+  else:
+    _g.World.add_child(copy)
   export_grid_copy = copy
 
   var export_dialog = _g.Editor.Windows["Export"]
@@ -673,12 +683,19 @@ func update(_delta):
   if _g.World == null or _g.World.levels == null or _g.World.levels.size() == 0:
     return
 
+  # Compare mode (compare_fix) toggled on/off or restacked: re-layer the grid.
+  var cb = _get_compare_base()
+  if cb != _compare_base:
+    _compare_base = cb
+    apply_to_current_level()
+
   var current_world_id = _g.World.get_instance_id()
   if current_world_id != last_world_id:
     last_world_id = current_world_id
     last_level_id = -1
     last_level_count = -1
     map_key_loaded = false
+    _sweep_stale_export_copies()
 
   if not map_key_loaded and get_map_key() != null:
     map_key_loaded = true

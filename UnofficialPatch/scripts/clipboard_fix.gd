@@ -352,6 +352,11 @@ func _on_input(event) -> void:
 
 
 func _on_process(_delta) -> void:
+	# Fenetre paste en vol : voir _hide_pasted_items. Auto-expire si un chemin
+	# d'abandon oublie _show_hidden_nodes (le meta n'est plus rafraichi).
+	if _paste_hidden_nodes.size() > 0:
+		Engine.set_meta("up_selection_prune_hold_frame", Engine.get_idle_frames())
+
 	# Tentative de branchement du pont CMT (no-op une fois fait / mod absent).
 	if not _cmt_setup_done:
 		_cmt_try_setup()
@@ -765,15 +770,25 @@ func _save_copy_center() -> void:
 	# rien a restaurer.
 	var wall_copy_allowed = _is_wall_move_enabled()
 
+	# Les walls sont collectes puis TRIES par z-order avant snapshot : sans ca
+	# ils heritent de l'ordre de selection de RawSelectables et le paste
+	# remonte le dernier selectionne au-dessus (meme bug vanilla que
+	# _reorder_clipboard_by_zorder corrige pour les assets natifs -- sauf que
+	# ce reorder passe par Copy() de DD, qui ignore totalement les walls).
+	var wall_nodes := []
 	for s in raw:
 		if s == null or s.Thing == null:
 			continue
 		if s.Type == SELECTABLE_WALL:
-			if wall_copy_allowed:
-				_wall_clipboard.append(_snapshot_wall(s.Thing))
+			if wall_copy_allowed and is_instance_valid(s.Thing):
+				wall_nodes.append(s.Thing)
 		elif s.Thing is Node2D:
 			center += _get_visual_center(s)
 			count += 1
+	if wall_nodes.size() > 1:
+		wall_nodes.sort_custom(self, "_sort_by_child_index")
+	for w in wall_nodes:
+		_wall_clipboard.append(_snapshot_wall(w))
 
 	_has_wall_clipboard = _wall_clipboard.size() > 0
 
@@ -1197,6 +1212,16 @@ func _copy_subset_into_merged(merged_data: Dictionary, subset: Array, label: Str
 			merged_data[key] = data[key]
 
 
+# Empilement DD = ordre des enfants dans le conteneur (croissant = du bas vers
+# le haut). sort_custom est instable en Godot 3, d'ou le tie-break explicite.
+func _sort_by_child_index(a, b) -> bool:
+	var ia = a.get_index()
+	var ib = b.get_index()
+	if ia == ib:
+		return a.get_instance_id() < b.get_instance_id()
+	return ia < ib
+
+
 func _snapshot_wall(wall) -> Dictionary:
 	var pts = PoolVector2Array()
 	var raw_pts = wall.Points
@@ -1225,6 +1250,15 @@ func _snapshot_wall(wall) -> Dictionary:
 				"flip": p.Flip,
 			})
 
+	# prefab_id : DD ne le serialise pas dans Wall.Save(), mais il vit en meta
+	# sur le node. Sans lui, coller un prefab contenant des walls produisait
+	# des walls orphelins -- et pour un prefab 100% walls, la copie n'etait
+	# plus un prefab du tout (le clipboard DD ne contient alors aucun
+	# prefab_id, donc le remap de prefabs_fix ne trouve rien a remapper).
+	var prefab_id = ""
+	if wall.has_meta("prefab_id"):
+		prefab_id = str(wall.get_meta("prefab_id"))
+
 	return {
 		"points": pts,
 		"texture": wall.Texture,
@@ -1234,6 +1268,7 @@ func _snapshot_wall(wall) -> Dictionary:
 		"type": int(wall.Type),
 		"joint": int(wall.Joint),
 		"normalize_uv": wall.NormalizeUV,
+		"prefab_id": prefab_id,
 		"portals": portal_snaps,
 	}
 
@@ -1411,6 +1446,7 @@ func _on_paste_in_place() -> void:
 	_paste_move_counter = 1
 
 	select_tool.EnableTransformBox(false)
+	_clear_stale_highlight()
 	_hide_pasted_items()
 
 
@@ -1433,7 +1469,26 @@ func _on_paste() -> void:
 	_paste_move_counter = 1
 
 	select_tool.EnableTransformBox(false)
+	_clear_stale_highlight()
 	_hide_pasted_items()
+
+
+# Eteint le highlight de survol perime avant un paste. DD fige son highlight
+# tant que CTRL est enfonce (early-return de HighlightThingAtPoint, qui n'est
+# de toute facon rejoue qu'au mouvement de souris) : le highlighted pose au
+# survol AVANT la copie survit donc a un Ctrl+C / Ctrl+V enchaine sans
+# relacher Ctrl. Au paste, DeselectAll retire la teinte de selection de
+# l'original et sa teinte de survol latente (rose) redevient visible jusqu'au
+# prochain motion. On la coupe ici ; DD la re-posera naturellement au survol.
+func _clear_stale_highlight() -> void:
+	if select_tool == null or not is_instance_valid(select_tool):
+		return
+	var h = select_tool.get("highlighted")
+	if h == null or typeof(h) != TYPE_OBJECT or not is_instance_valid(h):
+		return
+	if select_tool.has_method("Highlight"):
+		select_tool.Highlight(h, false)
+	select_tool.set("highlighted", null)
 
 
 func _hide_pasted_items() -> void:
@@ -1446,6 +1501,13 @@ func _hide_pasted_items() -> void:
 				s.Thing.visible = false
 				if not _paste_hidden_nodes.has(s.Thing):
 					_paste_hidden_nodes.append(s.Thing)
+	# Fenetre "things selectionnes volontairement caches" : previent les mods
+	# qui purgent la selection des elements invisibles (select_fix) de ne pas
+	# toucher a la selection tant que le paste est en vol. Pose immediatement
+	# (le _process des autres mods peut passer avant le notre), puis rafraichi
+	# chaque frame dans _on_process tant que des nodes restent caches.
+	if _paste_hidden_nodes.size() > 0:
+		Engine.set_meta("up_selection_prune_hold_frame", Engine.get_idle_frames())
 
 
 func _compute_snap_delta(raw, pasted_walls := []) -> Vector2:
@@ -1726,6 +1788,43 @@ func _rebuild_transform_box() -> void:
 	_g.ModMapData["_clipboard_pasted_walls"] = []
 
 
+# Un wall colle doit rejoindre le MEME groupe que les assets colles a cote de
+# lui, pas celui du prefab source. prefabs_fix alloue les ids frais au moment
+# ou il reecrit le clipboard DD et publie sa table sous "pfx_paste_pid_map" :
+# on la consomme ici. Si elle est absente (prefab 100% walls : aucun asset DD
+# ne portait de prefab_id, donc rien n'a ete remappe), on alloue nous-memes un
+# id neuf via l'allocateur de DD, une seule fois par groupe source.
+func _resolve_pasted_prefab_id(old_pid: String, local_map: Dictionary) -> String:
+	if old_pid == "":
+		return ""
+	if local_map.has(old_pid):
+		return local_map[old_pid]
+	var new_pid = ""
+	if Engine.has_meta("pfx_paste_pid_map"):
+		var pid_map = Engine.get_meta("pfx_paste_pid_map")
+		if pid_map is Dictionary and pid_map.has(old_pid):
+			new_pid = str(pid_map[old_pid])
+	if new_pid == "" and _g != null and _g.World != null and _g.World.has_method("GetNextPrefabID"):
+		new_pid = str(_g.World.GetNextPrefabID())
+	if new_pid == "":
+		return ""
+	local_map[old_pid] = new_pid
+	return new_pid
+
+
+func _apply_prefab_group(wall, pid: String) -> void:
+	if pid == "" or wall == null or not is_instance_valid(wall):
+		return
+	wall.add_to_group(pid)
+	wall.set_meta("prefab_id", pid)
+	var portals = wall.get("Portals")
+	if portals != null:
+		for p in portals:
+			if p != null and is_instance_valid(p):
+				p.add_to_group(pid)
+				p.set_meta("prefab_id", pid)
+
+
 func _paste_walls_from_clipboard() -> Array:
 	var new_walls := []
 	if not _has_wall_clipboard or _wall_clipboard.size() == 0:
@@ -1739,6 +1838,7 @@ func _paste_walls_from_clipboard() -> Array:
 	if walls_container == null:
 		return new_walls
 
+	var pid_remap := {}
 	for snap in _wall_clipboard:
 		var wall = walls_container.AddWall(
 			snap["points"],
@@ -1754,6 +1854,7 @@ func _paste_walls_from_clipboard() -> Array:
 			continue
 		if snap.has("portals"):
 			_recreate_portals(wall, snap["portals"])
+		_apply_prefab_group(wall, _resolve_pasted_prefab_id(str(snap.get("prefab_id", "")), pid_remap))
 		new_walls.append(wall)
 
 	if new_walls.size() > 0:
@@ -1830,6 +1931,8 @@ func _recreate_walls(snaps: Array) -> Array:
 				_g.World.AssignNodeID(wall)
 		if snap.has("portals"):
 			_recreate_portals(wall, snap["portals"])
+		# Redo : le wall reprend le groupe qu'il avait, pas un id frais.
+		_apply_prefab_group(wall, str(snap.get("prefab_id", "")))
 		new_walls.append(wall)
 	return new_walls
 

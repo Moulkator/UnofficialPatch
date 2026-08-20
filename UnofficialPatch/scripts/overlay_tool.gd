@@ -121,12 +121,14 @@ func initialize():
 		path_fix._external_highlight_material = _path_material if _effective_paths() else null
 	_apply_tints()
 	call_deferred("_try_inject_bar_button", 0)
-	print("[OverlayTool] Initialized")
+	print("[OverlayTool] Initialized [BUILD: OT-FTMERGE-HOVER-1]")
 
 
 func cleanup():
 	_destroyed = true
 	_clear_object_highlight()
+	if _g != null and _g.ModMapData is Dictionary and _g.ModMapData.has("_ov_obj_hover_on"):
+		_g.ModMapData.erase("_ov_obj_hover_on")
 	# Restaurer le contour des assets qu'on avait masques pendant un drag instant.
 	var _st = _g.Editor.Tools["SelectTool"] if (_g != null and _g.Editor != null) else null
 	_restore_suppressed_boxes(_st)
@@ -409,6 +411,11 @@ func _effective_objects() -> bool:
 # Appele en tete de _on_process. Cout negligeable (lecture de highlighted, pas
 # de scan O(n)). Remplace la box jaune par une teinte sur l'asset survole.
 func _update_object_portal_hover():
+	# Publie l'etat du hover objets en mode overlay : select_layer_pick_fix ne
+	# pose sa box de highlight native QUE si la teinte overlay est inactive
+	# (sinon la box flashait une frame avant que la teinte prenne la main).
+	if _g != null and _g.ModMapData is Dictionary:
+		_g.ModMapData["_ov_obj_hover_on"] = _effective_objects()
 	if not _effective_objects():
 		_clear_object_highlight()
 		return
@@ -482,6 +489,14 @@ func _update_object_portal_hover():
 	if thing == null or typeof(thing) != TYPE_OBJECT or not is_instance_valid(thing):
 		_clear_object_highlight()
 		return
+	# Portail FANTOME (highlighte par DD mais couvert par un asset opaque sous le
+	# curseur, publie par select_layer_pick_fix) : ne pas le teinter. Sans ce
+	# garde, chaque frame de motion re-teintait le portail (DD re-highlighte en
+	# phase input) avant que select_layer_pick_fix ne neutralise en _process ->
+	# flicker d'une frame au mouvement au-dessus d'un asset selectionne.
+	if _g.ModMapData is Dictionary and _g.ModMapData.get("_slpf_phantom_portal") == thing:
+		_clear_object_highlight()
+		return
 	# select_layer_pick_fix : si DD a pioche un objet du dessous, il publie le bon
 	# objet a teinter ici (la box trompeuse de DD est deja eteinte de son cote).
 	if _g.ModMapData is Dictionary and _g.ModMapData.has("_slpf_true_top"):
@@ -525,8 +540,15 @@ func _tint_node(node):
 	# on teinte avec la variante warp en recopiant ses coins/UV, pour que le
 	# highlight épouse la forme distordue au lieu du quad d'origine.
 	if cur is ShaderMaterial and cur.has_meta("_ft_warp") and _obj_warp_material != null:
+		# Materiau FUSIONNE (compat CMT) : FT injecte son warp dans le shader
+		# CMT avec des uniformes prefixes ft_ (anti-collision). Lire les noms
+		# non prefixes renvoyait null -> coins du highlight remis a (0,0) ->
+		# quad effondre en un point : l'asset "disparaissait" au survol.
+		var pfx = "ft_" if cur.has_meta("_ft_merged") else ""
 		for p in ["corner_tl", "corner_tr", "corner_br", "corner_bl", "uv_min", "uv_max"]:
-			_obj_warp_material.set_shader_param(p, cur.get_shader_param(p))
+			var v = cur.get_shader_param(pfx + p)
+			if v != null:
+				_obj_warp_material.set_shader_param(p, v)
 		use_mat = _obj_warp_material
 	_hover_obj_saved_mats.append([node, cur])
 	node.material = use_mat
@@ -1356,6 +1378,32 @@ func _is_mouse_near_polyline(pts, mouse_world: Vector2, half_w: float, loop: boo
 	return false
 
 
+# SelectTool si actif, sinon null. Le filtre de CALQUES ne s'applique qu'en
+# SelectTool ; la visibilite, elle, est testee dans tous les cas.
+func _layer_filter_st():
+	if _g == null or _g.Editor == null:
+		return null
+	if _g.Editor.ActiveToolName != "SelectTool":
+		return null
+	return _g.Editor.Tools["SelectTool"]
+
+
+# Vrai si un element ne doit pas etre survolable : invisible dans l'arbre
+# (calque cache par un mod tiers type Hide Layers) ou rejete par le filtre de
+# calques du SelectTool (IsObjectLayerFiltered, methode C# publique). Aligne le
+# survol overlay sur le pick natif de DD ; wall_move et path_fix heritent du
+# blocage (selection ET curseurs) puisqu'ils consomment _hover_wall /
+# _hover_path / _hover_pattern.
+func _layer_hover_blocked(st, thing) -> bool:
+	if thing == null or not is_instance_valid(thing):
+		return true
+	if thing is CanvasItem and not thing.is_visible_in_tree():
+		return true
+	if st != null and st.has_method("IsObjectLayerFiltered") and st.IsObjectLayerFiltered(thing):
+		return true
+	return false
+
+
 func _update_wall_hover(level, mouse_world):
 	# Respecter le filter du SelectTool quand il est actif
 	if _g.Editor.ActiveToolName == "SelectTool":
@@ -1364,6 +1412,7 @@ func _update_wall_hover(level, mouse_world):
 		if filter is Dictionary and not bool(filter.get("Walls", true)):
 			_clear_wall_highlight()
 			return
+	var st_lf = _layer_filter_st()
 	# Ne pas interferer si path_fix est en train de dragger
 	if path_fix != null and is_instance_valid(path_fix):
 		if path_fix._is_dragging() or (path_fix._left_pressed and path_fix._drag_threshold_passed):
@@ -1385,6 +1434,9 @@ func _update_wall_hover(level, mouse_world):
 		if _is_mouse_on_wall(child, mouse_world):
 			# Don't highlight wall if mouse is on one of its portals
 			if _is_mouse_on_portal(child, mouse_world):
+				continue
+			# Filtre de calques / visibilite
+			if _layer_hover_blocked(st_lf, child):
 				continue
 			best = child
 			break
@@ -1680,6 +1732,7 @@ func _update_path_hover(level, mouse_world):
 		selected_path = path_fix._flat_line
 	var best = null
 	var best_z = -2147483648
+	var st_lf = _layer_filter_st()
 	var children = pathways.get_children()
 	# Choisir le path de plus HAUT calque (effective-z) parmi ceux sous le curseur,
 	# et non le premier rencontre : deux paths qui se croisent peuvent etre sur des
@@ -1700,6 +1753,9 @@ func _update_path_hover(level, mouse_world):
 		if _aabb_miss(child, mouse_world, cull_margin):
 			continue
 		if not _is_mouse_on_path(child, mouse_world):
+			continue
+		# Filtre de calques / visibilite
+		if _layer_hover_blocked(st_lf, child):
 			continue
 		var cz = _effective_z(child)
 		if best == null or cz >= best_z:
@@ -1973,6 +2029,7 @@ func _update_pattern_hover(level, mouse_world):
 	# selectionne (rendu au-dessus) et ne doit pas se teinter. null = aucune
 	# selection ne couvre le point -> pas de filtrage.
 	var sel_ceiling = _selection_cover_layer(mouse_world)
+	var st_lf = _layer_filter_st()
 	var best = null
 	for i in range(list.size() - 1, -1, -1):
 		var sh = list[i]
@@ -1992,6 +2049,9 @@ func _update_pattern_hover(level, mouse_world):
 		elif sh.has_method("IsMouseWithin"):
 			inside = sh.IsMouseWithin(mouse_world)
 		if not inside:
+			continue
+		# Filtre de calques / visibilite
+		if _layer_hover_blocked(st_lf, sh):
 			continue
 		# Filtre calque : pattern au meme calque ou sous la selection -> ignore
 		# (rang pattern < rang objet, donc a calque egal l'objet est au-dessus).

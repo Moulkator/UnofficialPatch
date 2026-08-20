@@ -500,6 +500,30 @@ func _restore_entry(m: Dictionary) -> void:
 	var lbl = m["label"]
 	if lbl != null and is_instance_valid(lbl):
 		lbl.visible = m["label_visible"]
+	# Adopted companions (FavsOverlay, *FavsButton, AssetFilterBox_*, ASO
+	# rows) live in the box but are NOT in m["nodes"]: freeing the box would
+	# free them too, leaving the library blank until the next reload
+	# (favorites keeps references to the freed overlay/button). Hand them
+	# back to the original parent, right after the library.
+	if is_instance_valid(m["box"]) and parent != null and is_instance_valid(parent):
+		var grid = m["node"]
+		var after = parent.get_child_count() - 1
+		if grid != null and is_instance_valid(grid) and grid.get_parent() == parent:
+			after = grid.get_index()
+		var strays := []
+		for c in m["box"].get_children():
+			if not (c is Control):
+				continue
+			if c in m["nodes"]:
+				continue
+			if c is Label:
+				continue  # the box's own heading
+			strays.append(c)
+		for c in strays:
+			m["box"].remove_child(c)
+			parent.add_child(c)
+			after = min(after + 1, parent.get_child_count() - 1)
+			parent.move_child(c, after)
 	if is_instance_valid(m["box"]):
 		m["box"].queue_free()
 
@@ -559,7 +583,11 @@ func _adopt_orphans() -> void:
 				continue
 			parent.remove_child(child)
 			box.add_child(child)
-			box.move_child(child, max(grid.get_index(), 0))
+			if str(child.name) == "FavsOverlay":
+				# The overlay replaces the grid visually: keep it right after it.
+				box.move_child(child, min(grid.get_index() + 1, box.get_child_count() - 1))
+			else:
+				box.move_child(child, max(grid.get_index(), 0))
 			print("[LibraryRightPanel] adopted '", child.name, "' into ", m["id"])
 
 
@@ -673,6 +701,13 @@ func _find_line_edit(node, depth: int):
 func _is_library_companion(node) -> bool:
 	# favorites.gd toggle.
 	if node is CheckButton and str(node.name).ends_with("FavsButton"):
+		return true
+	# favorites.gd Favorites/Hidden overlay list — created before the library
+	# moved (boot with >=1 hidden asset) it would otherwise stay on the left.
+	if node is ItemList and str(node.name) == "FavsOverlay":
+		return true
+	# favorites.gd mode-cycle control (button + count label).
+	if node is VBoxContainer and str(node.name).begins_with("AssetFilterBox_"):
 		return true
 	if node is HBoxContainer:
 		# AdditionalSearchOptions search row: the LineEdit is a direct child.

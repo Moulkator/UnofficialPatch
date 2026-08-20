@@ -26,6 +26,17 @@
 #    DD (lue dans user://config.ini), et on purge au-dela de max_backups.
 #    Le timer est amorce avec Master.AutoBackupTimer pour rester synchrone.
 #
+# 4) DEBLOCAGE UNDO/REDO : History.Undo()/Redo() sont gates par Master.IsBusy,
+#    donc un IsSaving coince les neutralise aussi. La seule ecriture de
+#    "IsSaving = false" est l'epilogue de Save.Start() (C#). A la detection du
+#    blocage, on relance donc une Save C# native complete via Master.Save()
+#    vers un fichier de backup : si elle aboutit, son epilogue efface IsSaving
+#    et undo/redo, autosave et save natifs redeviennent fonctionnels. Avant la
+#    relance, les nodes Roofs sont audites et repares (quarantaine des enfants
+#    etrangers, qui font planter le cast de Roofs.Save). Verdict
+#    apres quelques secondes ; en cas d'echec on retombe sur les mecanismes
+#    1-3 (rien de pire qu'avant).
+#
 # Aucun flag statique n'est modifie.
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -43,6 +54,8 @@ const PREFS_REFRESH = 30.0
 # Duree d'affichage de l'indicateur "BACKING_UP" avant l'ecriture (secondes),
 # pour qu'il soit visible comme en natif.
 const BACKUP_SHOW_SECONDS = 0.8
+# Delai avant le verdict d'une tentative de deblocage C# (secondes).
+const UNSTICK_VERDICT_SECONDS = 6.0
 
 var _master = null
 var _listener = null
@@ -50,6 +63,10 @@ var _listener = null
 var _busy_since := -1.0
 var _hooked := false
 var _stuck_handled := false
+
+# Deblocage C# (relance d'une Save native pour effacer IsSaving).
+var _unstick_pending := false
+var _unstick_at := -1.0
 
 # Caches d'accrochage (pour restauration propre).
 var _save_btn = null
@@ -205,17 +222,31 @@ func _on_tick(delta):
 	elif _hooked and busy == false:
 		_restore_hooks()
 
-	# (1b) Autosave immediat a la detection du blocage : la save en cours ne se
-	# terminera jamais, on en fait donc une tout de suite (one-shot).
+	# (1b) A la detection du blocage (one-shot) : diagnostic des flags, puis,
+	# si IsSaving est en cause, tentative de deblocage via une Save C# native
+	# (voir section 1c). Sinon (ou si la tentative ne peut pas demarrer),
+	# autosave de secours immediat comme avant.
 	if stuck and not _stuck_handled:
 		_stuck_handled = true
-		var p0 = _get_prefs()
-		print("[SaveBypass] Blocage detecte -> autosave immediat.")
-		_begin_auto_backup(p0["limit"], now)
-		_backup_accum = 0.0
-		_backup_prev_now = now
+		print("[SaveBypass] Blocage detecte. Flags: saving=%s dialog=%s exporting=%s closing=%s computing=%s backing=%s" % [
+			str(saving), str(dialog), str(exporting),
+			str(_flag("IsClosing")), str(_flag("IsComputing")), str(backing)])
+		if saving:
+			_audit_roofs()
+		var unstick_started = false
+		if saving:
+			unstick_started = _try_unstick(now)
+		if not unstick_started:
+			var p0 = _get_prefs()
+			print("[SaveBypass] Autosave de secours immediat.")
+			_begin_auto_backup(p0["limit"], now)
+			_backup_accum = 0.0
+			_backup_prev_now = now
 	elif not stuck:
 		_stuck_handled = false
+
+	# (1c) Verdict differe de la tentative de deblocage.
+	_tick_unstick(now)
 
 	# (2) Spinner bloque.
 	_tick_spinner(saving or backing, now)
@@ -223,6 +254,120 @@ func _on_tick(delta):
 	# (3) Backups de secours (uniquement quand DD est bloque).
 	_tick_backup(stuck, editing, unbacked, now)
 	_tick_pending_backup(now)
+
+
+# ── (1b-bis) Audit Roofs ──────────────────────────────────────────────────────
+# Roofs.Save() (C#) plante avec InvalidCastException sur les maps corrompues.
+# Le try/catch natif ne couvre que child.Save() ; restent exposes dans la
+# boucle : le cast "foreach (Roof child in ...)" (enfant non-Roof sous le node
+# Roofs) et l'unbox de GetNodeID() (meta "node_id" stocke avec le mauvais
+# type). Cet audit liste chaque enfant de chaque node Roofs pour identifier
+# l'objet fautif avant toute reparation.
+
+func _find_roofs_nodes() -> Array:
+	# Un node Roofs est identifiable par sa methode C# unique CreateRoof().
+	var out = []
+	if not (_g.World and _g.World is Node):
+		return out
+	var stack = [_g.World]
+	while not stack.empty():
+		var n = stack.pop_back()
+		if n.has_method("CreateRoof"):
+			out.append(n)
+			continue  # Les enfants d'un Roofs ne contiennent pas d'autre Roofs.
+		for c in n.get_children():
+			stack.push_back(c)
+	return out
+
+
+func _audit_roofs():
+	var roofs_nodes = _find_roofs_nodes()
+	print("[SaveBypass] Roofs audit: %d node(s) Roofs trouve(s)." % roofs_nodes.size())
+	for rn in roofs_nodes:
+		var parent = rn.get_parent()
+		var pname = parent.name if parent != null else "?"
+		var kids = rn.get_children()
+		print("[SaveBypass]  Roofs '%s' (parent=%s) : %d enfant(s)" % [rn.name, pname, kids.size()])
+		for i in range(kids.size()):
+			var k = kids[i]
+			var is_roof = k.has_method("AddHip")  # Methode C# unique de Roof.
+			var meta_desc = "ABSENT"
+			var suspect = ""
+			if k.has_meta("node_id"):
+				var mv = k.get_meta("node_id")
+				meta_desc = "typeof=%d val=%s" % [typeof(mv), str(mv)]
+				if typeof(mv) != TYPE_INT:
+					suspect += " <== SUSPECT meta type"
+			if not is_roof:
+				suspect += " <== SUSPECT non-Roof"
+			print("[SaveBypass]   [%d] name=%s class=%s roof=%s queued_del=%s meta(node_id)=%s%s" % [
+				i, k.name, k.get_class(), str(is_roof),
+				str(k.is_queued_for_deletion()), meta_desc, suspect])
+
+
+# ── (1c) Deblocage : relance d'une Save C# native ─────────────────────────────
+# La cible d'ecriture est un fichier de backup horodate (jamais la map
+# courante). Deux points a valider au runtime via les logs :
+#   - le dispatch de la methode STATIQUE Master.Save() via call() sur
+#     l'instance Master (les lectures de champs statiques passent deja) ;
+#   - le fait que la nouvelle Save n'echoue pas au meme endroit que la
+#     premiere (Serialize/Write tournent dans des Task.Run).
+# En cas d'echec, le verdict retombe sur l'autosave GDScript de secours.
+
+func _repair_roofs() -> int:
+	# Quarantaine de tout enfant non-Roof trouve sous un node Roofs :
+	# Roofs.Save() caste chaque enfant en Roof, un node etranger fait donc
+	# planter toute save native (cas avere : "GridExportCopy" des anciennes
+	# versions de grid_fix). Le reparentage sous World garde le node vivant
+	# (le mod proprietaire conserve sa reference et fera son cleanup) tout
+	# en rendant la save serialisable a nouveau.
+	var moved = 0
+	for rn in _find_roofs_nodes():
+		for k in rn.get_children():
+			if k.has_method("AddHip"):
+				continue
+			rn.remove_child(k)
+			if _g.World and _g.World is Node:
+				_g.World.add_child(k)
+			else:
+				k.queue_free()
+			moved += 1
+			print("[SaveBypass] Roofs repare: enfant etranger '%s' (%s) mis en quarantaine sous World." % [k.name, k.get_class()])
+	return moved
+
+
+func _try_unstick(now: float) -> bool:
+	var m = _find_master()
+	if m == null:
+		return false
+	_repair_roofs()
+	var path = "user://backups/backup_" + str(OS.get_unix_time()) + ".dungeondraft_map"
+	print("[SaveBypass] Tentative de deblocage: Master.Save() vers " + path)
+	# NB: l'ERROR console "unmarshallable managed type: Action" est
+	# cosmetique (marshalling du callback null) ; l'appel part bien.
+	m.call("Save", path, null)
+	_unstick_pending = true
+	_unstick_at = now
+	return true
+
+
+func _tick_unstick(now: float):
+	if not _unstick_pending:
+		return
+	if (now - _unstick_at) < UNSTICK_VERDICT_SECONDS:
+		return
+	_unstick_pending = false
+	if _flag("IsSaving") == true:
+		# Toujours coince : la Save relancee n'a pas abouti (ou le dispatch
+		# statique a echoue -> erreur visible en console). Mode secours.
+		print("[SaveBypass] Deblocage rate (IsSaving toujours true) -> mode secours.")
+		var p = _get_prefs()
+		_begin_auto_backup(p["limit"], now)
+		_backup_accum = 0.0
+		_backup_prev_now = now
+	else:
+		print("[SaveBypass] Deblocage reussi : IsSaving efface, undo/redo re-operationnels.")
+		_clean_backups(_get_prefs()["limit"])
 
 
 # ── (2) Spinner ───────────────────────────────────────────────────────────────

@@ -86,6 +86,21 @@ const SNAP_DELAY_MS      := 250
 # considérée immobile (pas de snap subi à l'arrêt après le délai).
 const MOVE_EPS           := 0.01
 
+# Snap-target hysteresis, as a fraction of the distance between the current
+# target and a candidate target. When the raw (unsnapped) leader position sits
+# near the midpoint between two snap points, hand tremor makes the nearest
+# point flip every few frames, so the asset jitters between the two. We only
+# switch to the candidate once the raw position is decisively closer to it
+# (past the midpoint by SNAP_HYSTERESIS/2 of the separation). 0.2 = the raw
+# position must cross the midpoint by 10% of a cell before the target changes.
+const SNAP_HYSTERESIS    := 0.2
+
+# Number of frames the captured final positions are re-applied after mouseup.
+# One frame is not always enough: DD can rewrite the asset position after our
+# single restore (mouseup handling split across input/_Process, deferred
+# calls), which made the asset visibly roll back on release.
+const FINAL_RESTORE_FRAMES := 3
+
 # Mettre à false pour désactiver le recentrage par compensation des frames
 # bloquées (l'asset reste à sa position d'origine quand le drag démarre).
 const RECENTER_ON_DRAG   := true
@@ -125,6 +140,15 @@ var _center_active            := false
 # souris entre le mouseup et la frame suivante ne snappe l'asset sur un
 # point adjacent. Voir update() pour le détail.
 var _final_positions          := {}       # { Node2D: Vector2 }
+# Last delta applied by update() during the drag. Re-applied verbatim on
+# frames where the mouse is considered still, so OUR positions keep overriding
+# whatever DD wrote that frame (previously we returned early and DD's own
+# snap target became visible — the mid-drag "rollback"/flicker).
+var _last_delta               = null      # Vector2 or null
+# Current snap target of the leader — hysteresis anchor (see SNAP_HYSTERESIS).
+var _last_leader_target       = null      # Vector2 or null
+# Countdown of post-mouseup restore frames (see FINAL_RESTORE_FRAMES).
+var _final_restore_frames     := 0
 var _destroyed                := false
 
 
@@ -309,6 +333,9 @@ func _reset() -> void:
 	_drag_start_time_ms       = 0
 	_prev_mouse_world         = null
 	_center_active            = false
+	_last_delta               = null
+	_last_leader_target       = null
+	_final_restore_frames     = 0
 	_assets_pos_at_first_move.clear()
 	_final_positions.clear()
 
@@ -360,10 +387,31 @@ func _on_input(event: InputEvent) -> void:
 			# effectué par update() après la restauration.
 			if _drag_started and _center_active:
 				_mouse_down = false
+				_final_restore_frames = FINAL_RESTORE_FRAMES
 				_final_positions.clear()
-				for thing in _assets_pos_at_first_move:
-					if is_instance_valid(thing):
-						_final_positions[thing] = thing.global_position
+				# Release while the mouse is MOVING: the visible positions
+				# still date from last frame's update() and lag behind the
+				# cursor (the motion events of the current frame have not
+				# been folded in by update() yet). Capturing them verbatim
+				# discarded that last bit of movement — the asset visibly
+				# jumped back on release. Instead, recompute the final
+				# delta from the CURRENT mouse position via the same
+				# formula as update(). WorldUI.MousePosition is fresh
+				# here: the motion events preceding this mouseup in the
+				# same frame have already been fully dispatched to DD.
+				var mouse_world = _get_mouse_world_pos()
+				var leader_orig = _pick_leader_orig()
+				if mouse_world != null and leader_orig != null and _click_world_pos != null:
+					var delta = _compute_drag_delta(mouse_world, leader_orig, true)
+					for thing in _assets_pos_at_first_move:
+						if is_instance_valid(thing):
+							thing.global_position = _assets_pos_at_first_move[thing] + delta
+							_final_positions[thing] = thing.global_position
+				else:
+					# Fallback: capture whatever is currently visible.
+					for thing in _assets_pos_at_first_move:
+						if is_instance_valid(thing):
+							_final_positions[thing] = thing.global_position
 			else:
 				_reset()
 
@@ -454,6 +502,58 @@ func _pick_leader_orig():
 	return best
 
 
+# Computes the drag delta for the given mouse world position, applying the
+# same snap gating (SNAP_DELAY_MS), still-mouse handling and hysteresis as
+# always. Updates _last_delta / _last_leader_target as a side effect.
+# Shared by update() (per-frame override) and the mouseup handler (final
+# position capture), so both always agree on where the drag ends up.
+func _compute_drag_delta(mouse_world: Vector2, leader_orig: Vector2, is_moving: bool) -> Vector2:
+	var delta := Vector2.ZERO
+	var snap_ready = OS.get_ticks_msec() - _drag_start_time_ms >= SNAP_DELAY_MS
+	if _snap_is_enabled() and snap_ready:
+		# Mouse still after the delay: RE-APPLY the last computed
+		# delta instead of returning. DD keeps writing its own
+		# (differently snapped) position on motion events; skipping
+		# our override for even one frame let DD's target become
+		# visible — the asset appeared to jump back / flicker
+		# between two snap points. We must win every frame.
+		if not is_moving and _last_delta != null:
+			return _last_delta
+		# Le leader doit atterrir sur un snap point du mode courant :
+		#   pos_leader = snap(mouse + leader_orig - click)
+		# Le snap est ré-évalué chaque frame, donc basculer vanilla ↔
+		# Custom Snap pendant le drag repositionne immédiatement
+		# l'asset sur un point de snap du nouveau mode.
+		#
+		# Tous les autres assets suivent du même delta — la structure
+		# relative est préservée (prefabs/groupes). Un snap per-asset
+		# enverrait chaque membre vers son propre point de grille le
+		# plus proche et casserait la mise en page du prefab.
+		var raw = mouse_world + leader_orig - _click_world_pos
+		var leader_target = _get_snapped_position(raw)
+		# Hysteresis: when the raw position hovers around the
+		# midpoint between two snap points, the nearest point
+		# flips every few frames (hand tremor) and the asset
+		# jitters. Only switch targets once the raw position is
+		# decisively closer to the candidate than to the current
+		# target (see SNAP_HYSTERESIS).
+		if _last_leader_target != null and leader_target.distance_to(_last_leader_target) > 0.001:
+			var separation = leader_target.distance_to(_last_leader_target)
+			var gain = raw.distance_to(_last_leader_target) - raw.distance_to(leader_target)
+			if gain < separation * SNAP_HYSTERESIS:
+				leader_target = _last_leader_target
+		_last_leader_target = leader_target
+		delta = leader_target - leader_orig
+		_last_delta = delta
+	else:
+		# Snap off : suivi direct de la souris. À la frame de drag
+		# start mouse ≈ click → delta ≈ 0, aucun saut visuel.
+		delta = mouse_world - _click_world_pos
+		_last_delta = delta
+		_last_leader_target = null
+	return delta
+
+
 func update(_delta: float) -> void:
 	if _destroyed:
 		return
@@ -470,11 +570,15 @@ func update(_delta: float) -> void:
 	# On ne recalcule PAS via la formule ici, sinon une micro-dérive de la
 	# souris entre le mouseup et cette frame pourrait franchir une frontière
 	# de snap et repositionner l'asset sur un point adjacent.
+	# Restored over several frames (not just one): DD can rewrite the
+	# position after our first restore, which caused a visible rollback.
 	if not _mouse_down:
 		for thing in _final_positions:
 			if is_instance_valid(thing):
 				thing.global_position = _final_positions[thing]
-		_reset()
+		_final_restore_frames -= 1
+		if _final_restore_frames <= 0:
+			_reset()
 		return
 
 	# Drag actif : formule normale.
@@ -485,36 +589,10 @@ func update(_delta: float) -> void:
 	if mouse_world != null:
 		var leader_orig = _pick_leader_orig()
 		if leader_orig != null:
-			var delta = Vector2.ZERO
-			# Snap actif seulement passé SNAP_DELAY_MS depuis le départ du drag :
-			# avant ce délai, suivi libre (comme la branche snap-off), ce qui
-			# évite les rollbacks de position au tout début du déplacement.
-			var snap_ready = OS.get_ticks_msec() - _drag_start_time_ms >= SNAP_DELAY_MS
 			# Mouvement de la souris depuis la frame d'update() précédente.
 			var is_moving = _prev_mouse_world == null or mouse_world.distance_to(_prev_mouse_world) > MOVE_EPS
 			_prev_mouse_world = mouse_world
-			if _snap_is_enabled() and snap_ready:
-				# Souris immobile après le délai : on ne snappe pas, on garde la
-				# position courante (libre si jamais snappée, sinon le dernier
-				# point de grille déjà posé). Évite un snap subi à l'arrêt du curseur.
-				if not is_moving:
-					return
-				# Le leader doit atterrir sur un snap point du mode courant :
-				#   pos_leader = snap(mouse + leader_orig - click)
-				# Le snap est ré-évalué chaque frame, donc basculer vanilla ↔
-				# Custom Snap pendant le drag repositionne immédiatement
-				# l'asset sur un point de snap du nouveau mode.
-				#
-				# Tous les autres assets suivent du même delta — la structure
-				# relative est préservée (prefabs/groupes). Un snap per-asset
-				# enverrait chaque membre vers son propre point de grille le
-				# plus proche et casserait la mise en page du prefab.
-				var leader_target = _get_snapped_position(mouse_world + leader_orig - _click_world_pos)
-				delta = leader_target - leader_orig
-			else:
-				# Snap off : suivi direct de la souris. À la frame de drag
-				# start mouse ≈ click → delta ≈ 0, aucun saut visuel.
-				delta = mouse_world - _click_world_pos
+			var delta = _compute_drag_delta(mouse_world, leader_orig, is_moving)
 			for thing in _assets_pos_at_first_move:
 				if is_instance_valid(thing):
 					thing.global_position = _assets_pos_at_first_move[thing] + delta

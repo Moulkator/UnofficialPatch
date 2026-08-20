@@ -62,6 +62,17 @@ var _tpl_tip : Label = null
 const SETTLE_FRAMES := 120
 const TOOLTIPS_PATH := "Master/Editor/VPartition/Infobar/Align/Tooltips"
 
+# Corner display mode — cycled by left-clicking the bottom-right corner.
+#   ASSET    → asset name + pack only (CornerLabel hidden)
+#   POSITION → cursor position only (AssetInfo hidden)
+#   BOTH     → position and asset info side by side
+const CORNER_MODE_ASSET := 0
+const CORNER_MODE_POSITION := 1
+const CORNER_MODE_BOTH := 2
+const CORNER_SETTINGS_FILE := "user://UnofficialPatch/tool_hint.json"
+const CORNER_CYCLE_TOOLTIP := "Click to cycle: Asset Info / Position / Both"
+var _corner_mode := CORNER_MODE_ASSET
+
 var _destroyed := false
 
 
@@ -70,11 +81,13 @@ var _destroyed := false
 # ============================================================================
 
 func initialize() -> void:
+	_load_corner_settings()
 	print("[ToolHint] initialized")
 
 
 func cleanup() -> void:
 	_destroyed = true
+	_restore_corner()
 	# Free all nodes we cloned/added (hints + separators + bound categories)
 	for n in _owned_nodes:
 		if n != null and is_instance_valid(n):
@@ -897,8 +910,9 @@ func _shrink_control(c: Control, target_w: float) -> void:
 
 
 # Customize the right-side Corner of the Infobar:
-#   - CornerLabel (cursor position display) → hidden
+#   - CornerLabel (cursor position display) → shown/hidden per _corner_mode
 #   - AssetInfo (pack name) → right-aligned, clipped, tooltip-synced
+#   - Left-click on the corner cycles Asset Info / Position / Both
 #
 # Layout context (from runtime inspection):
 #   Corner is a fixed-width HBoxContainer (200px at x=1720 in a 1920 window).
@@ -913,9 +927,20 @@ func _customize_corner() -> void:
 	if corner == null:
 		return
 
+	# Click-to-cycle: gui_input never reaches Corner or its labels in DD's
+	# Infobar (events are consumed upstream), so we use a global input
+	# listener Node that hit-tests clicks against the Corner's global rect.
+	_ensure_corner_click_listener()
+
 	for c in corner.get_children():
 		# CornerLabel visibility is managed per-frame by _sync_asset_info_tooltip
 		# (it shows save status messages, hides during normal position display).
+		if c is Label and c.name == "CornerLabel":
+			if not c.has_meta("up_corner_prepped"):
+				c.mouse_filter = Control.MOUSE_FILTER_PASS
+				c.hint_tooltip = CORNER_CYCLE_TOOLTIP
+				c.set_meta("up_orig_min_x", c.rect_min_size.x)
+				c.set_meta("up_corner_prepped", true)
 		if c is Label and c.name == "AssetInfo":
 			if not c.has_meta("up_clipped"):
 				c.clip_text = true
@@ -949,25 +974,40 @@ func _sync_asset_info_tooltip() -> void:
 		if _asset_info_node == null:
 			return
 
-	# --- CornerLabel: show temporarily when it holds a non-position status ---
+	# --- Visibility per corner mode ---
 	# DD reuses CornerLabel to display "Saving...", "Saved", etc. We detect
 	# that by checking if the text starts with "Position" (the normal case).
-	# When it holds a status message, we swap: show CornerLabel, hide AssetInfo.
+	# Status messages always take over CornerLabel; whether AssetInfo stays
+	# visible alongside depends on the current mode.
 	if _corner_label_node != null and is_instance_valid(_corner_label_node):
 		var cl_text = _corner_label_node.text
 		var is_position = cl_text.begins_with("Position")
-		if is_position:
-			# Normal: asset info visible, position hidden
-			if _corner_label_node.visible:
-				_corner_label_node.visible = false
-			if not _asset_info_node.visible:
-				_asset_info_node.visible = true
-		else:
-			# Status message present: swap
-			if not _corner_label_node.visible:
-				_corner_label_node.visible = true
-			if _asset_info_node.visible:
-				_asset_info_node.visible = false
+		var want_label : bool
+		var want_asset : bool
+		match _corner_mode:
+			CORNER_MODE_POSITION:
+				want_label = true
+				want_asset = false
+			CORNER_MODE_BOTH:
+				want_label = true
+				want_asset = true
+			_:
+				# ASSET (default): position hidden; status messages swap in.
+				want_label = not is_position
+				want_asset = is_position
+		if _corner_label_node.visible != want_label:
+			_corner_label_node.visible = want_label
+		if _asset_info_node.visible != want_asset:
+			_asset_info_node.visible = want_asset
+		# CornerLabel keeps its native fixed width in every mode: the numbers
+		# vary inside a static, left-aligned box, so "Position" never moves.
+		if _corner_label_node.has_meta("up_orig_min_x"):
+			var orig_min_x = float(_corner_label_node.get_meta("up_orig_min_x"))
+			if _corner_label_node.rect_min_size.x != orig_min_x:
+				_corner_label_node.rect_min_size.x = orig_min_x
+		if _corner_mode == CORNER_MODE_BOTH:
+			_apply_both_layout()
+		if not want_asset:
 			# Nothing more to do for AssetInfo while it's hidden
 			return
 
@@ -981,7 +1021,7 @@ func _sync_asset_info_tooltip() -> void:
 	# DD wrote new text. Capture it as the original.
 	var orig = c.text
 	c.set_meta("up_orig_text", orig)
-	c.hint_tooltip = orig
+	c.hint_tooltip = orig + "\n" + CORNER_CYCLE_TOOLTIP
 
 	# Compute display: truncate with [...] if too wide
 	var display = _fit_with_ellipsis(c, orig, ASSET_INFO_WIDTH)
@@ -1018,9 +1058,149 @@ func _fit_with_ellipsis(label: Label, s: String, max_w: float) -> String:
 
 
 func _get_corner() -> Node:
-	if _g.World == null:
+	if _g == null or _g.World == null or not is_instance_valid(_g.World):
 		return null
-	return _g.World.get_tree().root.get_node_or_null(CORNER_PATH)
+	var tree = _g.World.get_tree()
+	if tree == null or tree.root == null:
+		return null
+	return tree.root.get_node_or_null(CORNER_PATH)
+
+
+# Standalone listener Node: _input() only fires for nodes in the scene tree,
+# and this mod script itself isn't in the tree. Follows the project's input
+# listener pattern (attached to tree.root via call_deferred). We never mark
+# the event handled — we only observe, so DD's own handling is untouched.
+class CornerClickListener extends Node:
+	var owner_mod = null
+	func _ready() -> void:
+		set_process_input(true)
+	func _input(ev) -> void:
+		if owner_mod != null:
+			owner_mod._on_global_click(ev, self)
+
+var _click_listener = null
+
+# Spawn the global click listener once (idempotent, owned for cleanup).
+func _ensure_corner_click_listener() -> void:
+	if _click_listener != null and is_instance_valid(_click_listener):
+		return
+	if _g == null or _g.World == null or not is_instance_valid(_g.World):
+		return
+	var tree = _g.World.get_tree()
+	if tree == null or tree.root == null:
+		return
+	_click_listener = CornerClickListener.new()
+	_click_listener.name = "UP_ToolHint_CornerClickListener"
+	_click_listener.owner_mod = self
+	tree.root.call_deferred("add_child", _click_listener)
+	_owned_nodes.append(_click_listener)
+
+
+# Left-click inside the Corner's rect cycles Asset Info → Position → Both.
+# Hit-test uses corner.get_global_mouse_position() against get_global_rect()
+# so both sides are in the same (logical) coordinate space — avoids the
+# macOS Retina physical/logical mismatch of viewport mouse coords.
+func _on_global_click(ev, listener: Node) -> void:
+	if _destroyed:
+		return
+	if not (ev is InputEventMouseButton and ev.pressed and ev.button_index == BUTTON_LEFT):
+		return
+	# The listener receives input during map transitions (New Map dialog),
+	# while the old World is being torn down. _g.World is then a DANGLING
+	# reference to a disposed C# object (not null!) — calling anything on it
+	# is a use-after-free in a release build. Freeze the whole click path
+	# whenever the world is not fully valid, and resolve the Corner through
+	# the listener's own tree instead of _g.
+	if _g == null or _g.World == null or not is_instance_valid(_g.World):
+		return
+	var tree = listener.get_tree()
+	if tree == null or tree.root == null:
+		return
+	var corner = tree.root.get_node_or_null(CORNER_PATH)
+	if corner == null or not corner.is_visible_in_tree():
+		return
+	if not corner.get_global_rect().has_point(corner.get_global_mouse_position()):
+		return
+	_corner_mode = (_corner_mode + 1) % 3
+	_save_corner_settings()
+	print("[ToolHint] corner mode -> ", _corner_mode)
+
+
+# Undo our corner overrides so vanilla DD behavior resumes after unload:
+# DD toggles the two labels exclusively on its own once we stop forcing
+# visibility each frame.
+func _restore_corner() -> void:
+	var corner = _get_corner()
+	if corner == null:
+		return
+	if corner.has_meta("up_click_connected"):
+		corner.remove_meta("up_click_connected")
+	if corner.has_meta("up_both_layout"):
+		var cl2 = corner.get_node_or_null("CornerLabel")
+		if cl2 != null and corner.has_meta("up_orig_cl_idx"):
+			corner.move_child(cl2, int(corner.get_meta("up_orig_cl_idx")))
+		if corner.has_meta("up_orig_separation"):
+			corner.add_constant_override("separation", int(corner.get_meta("up_orig_separation")))
+		for m in ["up_both_layout", "up_orig_cl_idx", "up_orig_separation"]:
+			if corner.has_meta(m):
+				corner.remove_meta(m)
+	_click_listener = null
+	var cl = corner.get_node_or_null("CornerLabel")
+	if cl != null:
+		if cl.has_meta("up_orig_min_x"):
+			cl.rect_min_size.x = float(cl.get_meta("up_orig_min_x"))
+		cl.hint_tooltip = ""
+		cl.visible = true
+	var ai = corner.get_node_or_null("AssetInfo")
+	if ai != null:
+		ai.visible = true
+
+
+# BOTH-mode layout, applied once (meta-guarded):
+#   - Display order: AssetInfo first, then Position → CornerLabel moved to
+#     be the LAST child of the Corner HBox.
+#   - CornerLabel keeps its native fixed width and left alignment, and the
+#     corner's right edge is pinned to the bar's right end → every edge is
+#     static, so "Position" never moves when the numbers change width.
+#   - HBox separation bumped so the two texts don't touch.
+# Left in place when switching to other modes (invisible there, since only
+# one label is shown); fully reverted in _restore_corner().
+func _apply_both_layout() -> void:
+	var corner = _corner_label_node.get_parent()
+	if corner == null or not (corner is Container):
+		return
+	if corner.has_meta("up_both_layout"):
+		return
+	corner.set_meta("up_both_layout", true)
+	corner.set_meta("up_orig_cl_idx", _corner_label_node.get_index())
+	corner.set_meta("up_orig_separation", corner.get_constant("separation"))
+	corner.move_child(_corner_label_node, corner.get_child_count() - 1)
+	corner.add_constant_override("separation", 16)
+
+
+func _load_corner_settings() -> void:
+	var f = File.new()
+	if not f.file_exists(CORNER_SETTINGS_FILE):
+		return
+	if f.open(CORNER_SETTINGS_FILE, File.READ) != OK:
+		return
+	var txt = f.get_as_text()
+	f.close()
+	var parsed = JSON.parse(txt)
+	if parsed.error == OK and parsed.result is Dictionary:
+		var m = int(parsed.result.get("corner_mode", CORNER_MODE_ASSET))
+		if m >= CORNER_MODE_ASSET and m <= CORNER_MODE_BOTH:
+			_corner_mode = m
+
+
+func _save_corner_settings() -> void:
+	var dir = Directory.new()
+	if not dir.dir_exists("user://UnofficialPatch"):
+		dir.make_dir_recursive("user://UnofficialPatch")
+	var f = File.new()
+	if f.open(CORNER_SETTINGS_FILE, File.WRITE) == OK:
+		f.store_string(JSON.print({"corner_mode": _corner_mode}))
+		f.close()
 
 
 # Target widths (tweak here to taste)

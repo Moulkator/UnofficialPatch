@@ -14,6 +14,26 @@
 # v9: Reorder ref levels to end of World children via move_child, so that
 #     same-layer assets (which use absolute z_index) render with ref above
 #     current. Original tree order is restored on disable.
+# v17: Fix z/tree-order restore clobber. _apply_compare() runs on every
+#      slider/row/dropdown change and used to clear+resave _saved_z_indices /
+#      _saved_child_indices each time — from the 2nd apply on it saved the
+#      ALREADY-BUMPED values, so _disable_compare() "restored" levels to
+#      1900/3000, leaving their content above the drag box and the grid on
+#      those levels. Originals are now saved once per level (first apply that
+#      touches it) and only cleared after restore in _disable_compare().
+# v16: Keep WorldUI overlays visible during compare. WorldUI draws cursors,
+#      the drag-box outline etc. in its own canvas item, and SelectTool
+#      lazily parents widgets (SelectionBoxWidget, TransformBoxWidget) under
+#      World.UI with ABSOLUTE z (ZAsRelative=false, z=999) — both end up
+#      buried under the levels stacked at z 1900..3000. While comparing we
+#      raise WorldUI to z=4096 (absolute) and, per frame, bump any absolute-z
+#      child of WorldUI (z <= 1100) to 4095, saving originals; everything is
+#      restored on disable. Per-frame scan is required because the widgets
+#      are created on first use, possibly after _apply_compare().
+# v15: Publish grid z base via Engine.set_meta("uu_compare_grid_base") so
+#      grid_fix can lift GridMesh above the stacked levels (grid kept at its
+#      configured layer relative to the topmost visible level). Reset to 0 on
+#      disable/map change.
 # v14: Each ref Level gets its own z range (base 1100, step adaptive ≤1100),
 #      assigned in reverse iteration order so higher levels in the list get
 #      higher z. DD's sub-containers are z_as_relative=true so they inherit
@@ -37,6 +57,8 @@ var _ready = false
 var _comparing = false
 var _saved_child_indices = {}   # {Level: original_index_in_parent}
 var _saved_z_indices = {}        # {Level: original_z_index}
+var _wui_saved = null            # {z, rel} : WorldUI original z state
+var _saved_widget_z = {}         # {Node: original_z} absolute-z WorldUI children
 
 # Original DD controls (hidden, kept for structure)
 var _orig_ref_options = null
@@ -84,6 +106,9 @@ func _on_map_changed() -> void:
 	# refs (_ct, _compare_win, notre UI custom, _input_listener) sont freed.
 	# Reset pour relancer le build complet.
 	print("[CompareFix] World changed → reset")
+	Engine.set_meta("uu_compare_grid_base", 0)
+	_wui_saved = null
+	_saved_widget_z.clear()
 	_ready = false
 	_frame = 0
 	_comparing = false
@@ -127,6 +152,8 @@ func update(delta):
 		_on_map_changed()
 
 	if _ready:
+		if _comparing:
+			_bump_ui_widgets()
 		return
 	_frame += 1
 	if _frame < 10 or _frame % 10 != 0:
@@ -819,8 +846,13 @@ func _apply_compare():
 		if max_step < step:
 			step = max_step
 
-	_saved_child_indices.clear()
-	_saved_z_indices.clear()
+	# Tell grid_fix (if present) where the top of the level stack sits, so
+	# the grid can be re-layered relative to the topmost visible level.
+	Engine.set_meta("uu_compare_grid_base", z_top)
+	_raise_world_ui()
+
+	# NOTE: no clear() here — originals are saved once per level below and
+	# cleared only after restore in _disable_compare() (see v17 note).
 
 	# Iterate all_levels (top-to-bottom in the list). idx counts visible
 	# levels as we encounter them; the first visible gets the highest z.
@@ -836,7 +868,8 @@ func _apply_compare():
 				lvl.modulate = Color(1, 1, 1, ref_map[lvl])
 			# DD's sub-containers are z_as_relative=true so they inherit via
 			# the chain. z descends from z_top by step per visible level.
-			_saved_z_indices[lvl] = lvl.z_index
+			if not _saved_z_indices.has(lvl):
+				_saved_z_indices[lvl] = lvl.z_index
 			var z = z_top - idx * step
 			# Safety clamp — shouldn't trigger given step calculation above.
 			if z > 4096:
@@ -848,16 +881,67 @@ func _apply_compare():
 			# Tree-order fallback for the few absolute UI overlays.
 			var parent = lvl.get_parent()
 			if parent != null:
-				_saved_child_indices[lvl] = lvl.get_index()
+				if not _saved_child_indices.has(lvl):
+					_saved_child_indices[lvl] = lvl.get_index()
 				parent.move_child(lvl, parent.get_child_count() - 1)
 		else:
 			lvl.visible = false
+
+
+# ══ WorldUI overlay handling ══════════════════════════════════════════════════
+
+# Raise WorldUI itself above the stacked levels (its _Draw renders the
+# drag-box outline, cursors, polylines, ruler...).
+func _raise_world_ui():
+	var wui = _g.WorldUI
+	if wui == null or not is_instance_valid(wui):
+		return
+	if _wui_saved == null:
+		_wui_saved = {"z": wui.z_index, "rel": wui.z_as_relative}
+	wui.z_index = 4096
+	wui.z_as_relative = false
+	_bump_ui_widgets()
+
+
+# SelectTool widgets are direct WorldUI children with ZAsRelative=false, so
+# they ignore the parent bump. Called every frame while comparing: widgets
+# created mid-compare get caught on the next frame.
+func _bump_ui_widgets():
+	var wui = _g.WorldUI
+	if wui == null or not is_instance_valid(wui):
+		return
+	for i in range(wui.get_child_count()):
+		var c = wui.get_child(i)
+		if _saved_widget_z.has(c):
+			continue
+		var rel = c.get("z_as_relative")
+		if rel == null or rel == true:
+			continue
+		var z = c.get("z_index")
+		if z == null or int(z) > 1100:
+			continue
+		_saved_widget_z[c] = int(z)
+		c.set("z_index", 4095)
+
+
+func _restore_world_ui():
+	var wui = _g.WorldUI
+	if _wui_saved != null and wui != null and is_instance_valid(wui):
+		wui.z_index = int(_wui_saved["z"])
+		wui.z_as_relative = bool(_wui_saved["rel"])
+	_wui_saved = null
+	for c in _saved_widget_z.keys():
+		if is_instance_valid(c):
+			c.set("z_index", _saved_widget_z[c])
+	_saved_widget_z.clear()
 
 
 # ══ Disable compare ═══════════════════════════════════════════════════════════
 
 func _disable_compare():
 	_comparing = false
+	Engine.set_meta("uu_compare_grid_base", 0)
+	_restore_world_ui()
 	var world = _g.World
 	if world == null:
 		return

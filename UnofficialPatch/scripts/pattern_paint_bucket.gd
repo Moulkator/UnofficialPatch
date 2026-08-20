@@ -175,27 +175,31 @@ func _inject_ui():
 # Rangée "Stopped by: [x] Walls [x] Paths [ ] Patterns", visible uniquement quand
 # l'outil bucket est actif.
 func _build_options_row(align):
-	_opts_hbox = HBoxContainer.new()
+	# Label sur sa propre ligne, cases à cocher sur la ligne suivante.
+	_opts_hbox = VBoxContainer.new()
 	_opts_hbox.visible = false
 
 	var lbl = Label.new()
 	lbl.text = "Stopped by:"
 	_opts_hbox.add_child(lbl)
 
+	var cb_row = HBoxContainer.new()
+	_opts_hbox.add_child(cb_row)
+
 	_cb_walls = CheckBox.new()
 	_cb_walls.text = "Walls"
 	_cb_walls.pressed = true
-	_opts_hbox.add_child(_cb_walls)
+	cb_row.add_child(_cb_walls)
 
 	_cb_paths = CheckBox.new()
 	_cb_paths.text = "Paths"
 	_cb_paths.pressed = true
-	_opts_hbox.add_child(_cb_paths)
+	cb_row.add_child(_cb_paths)
 
 	_cb_patterns = CheckBox.new()
 	_cb_patterns.text = "Patterns"
 	_cb_patterns.pressed = false
-	_opts_hbox.add_child(_cb_patterns)
+	cb_row.add_child(_cb_patterns)
 
 	# Insérer la rangée juste SOUS la rangée des boutons de forme/bucket.
 	var parent = _shape_hbox.get_parent()
@@ -740,8 +744,9 @@ func _on_input(event) -> bool:
 
 	var world_ui = _g.get("WorldUI")
 	if world_ui == null: return false
-	var canvas_xform = world_ui.get_viewport().get_canvas_transform()
-	var mouse_world: Vector2 = canvas_xform.affine_inverse().xform(event.position)
+	# macOS fix: use DD's reference world mouse position; converting
+	# event.position by hand drifts on Retina/DPI/UI scaling.
+	var mouse_world: Vector2 = world_ui.MousePosition
 
 	var stop_walls = _cb_walls.pressed if _cb_walls != null else true
 	var stop_paths = _cb_paths.pressed if _cb_paths != null else true

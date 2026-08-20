@@ -60,6 +60,9 @@ var _move_snapshots := {}         # {wall: {pts, portals, portal_rots, children}
 var _overlay = null
 var _last_combined: Rect2 = Rect2()  # axis-aligned world AABB of the (possibly rotated) box; .center == _box_pos
 var _dd_box_hidden_by_us: bool = false
+# True once we've re-issued EnableTransformBox(false) for the current DD
+# transform (transformMode > 0). Reset as soon as the transform ends.
+var _dd_box_hidden_during_tm: bool = false
 var _mouse_world: Vector2 = Vector2.ZERO
 
 # Locked box state — the box rotates with the content during transforms,
@@ -73,6 +76,39 @@ var _box_pos: Vector2 = Vector2.ZERO        # world position of the box center
 var _box_rotation: float = 0.0              # box rotation, radians (0 = axis-aligned)
 var _box_half_size: Vector2 = Vector2.ZERO  # half-width / half-height in box-local frame
 var _box_initialized: bool = false          # false when the box needs to re-fit to a fresh AABB
+# Geometry watchdog. The locked box only re-fits on a SELECTION change, so
+# anything that edits the selected walls WITHOUT going through our transform
+# API (wall_move's click-drag, curve edit, undo/redo, ...) used to leave the
+# box stranded at the old location. We hash the walls' geometry each frame
+# and re-fit when it moves under us. Our OWN edits all funnel through
+# _apply_transform_to_wall, which stamps _geo_owned_frame — those are ignored
+# so a move / rotate / scale of ours keeps the locked box (and its rotation).
+var _wall_geo_sig: int = 0
+var _geo_owned_frame: int = -1000
+# Instant drag de DD (clic-glisser direct sur un asset, sans passer par la
+# transform box) : CheckForInstantDrag remplit movableThings avec TOUS les
+# membres du groupe via GetGrouped(), walls compris, puis les deplace en
+# ecrivant Thing.Position. Or un Wall ne porte pas sa geometrie dans sa
+# position : ses Points sont en coordonnees monde et le node reste a
+# l'origine. Le rendu suit (les Line2D enfants sont en local) mais les Points
+# ne bougent pas — donc la box reste en arriere, et surtout Wall.Save()
+# n'ecrit pas la position du node : le deplacement serait perdu au rechargement.
+# On convertit donc la translation du node en vraie geometrie a chaque frame.
+var _dd_pos_drag_snaps: Dictionary = {}   # wall -> snapshot pre-drag
+var _dd_pos_drag_active: bool = false
+var _dd_drag_delta: Dictionary = {}      # wall -> derniere translation totale lue
+# Diagnostic temporaire (a retirer une fois le drag valide).
+var _dd_diag_done: bool = false
+var _dd_diag_frames: int = 0
+var _dd_diag_last_pos: Vector2 = Vector2.ZERO
+var _dd_diag_last_pt: Vector2 = Vector2.ZERO
+# Le bake de l'instant drag ne tourne plus dans _process mais dans
+# frame_pre_draw (cf. on_frame_pre_draw). _dd_bake_ok est la porte ouverte
+# par _on_process_impl pour la frame courante ; _dd_dbg_proc_pos memorise la
+# position du node telle que _process la voyait, pour comparer avec celle lue
+# juste avant le rendu et prouver l'ordre d'execution.
+var _dd_bake_ok: bool = false
+var _dd_dbg_proc_pos: Vector2 = Vector2.ZERO
 var _last_selection_set: Dictionary = {}    # set of selected Thing.get_instance_id() — used to detect selection change
 
 # Custom-interaction drag state. _ci_mode: 0=none 1=move 2=rotate 3=scale.
@@ -215,6 +251,21 @@ func is_locked_layer_filter_active() -> bool:
 			return filters_menu.is_item_checked(_i)
 	return false
 
+
+# True when a wall or wall portal must not be box-pickable: invisible in the
+# scene tree (layer hidden by a third-party mod like Hide Layers) or rejected
+# by SelectTool's LAYER filter (public C# IsObjectLayerFiltered). DD's own
+# SelectThingsInsideBox applies this filter to everything it box-selects;
+# the walls and wall portals we add here must obey it too.
+func _layer_pick_blocked(thing) -> bool:
+	if thing == null or not is_instance_valid(thing):
+		return true
+	if thing is CanvasItem and not thing.is_visible_in_tree():
+		return true
+	if select_tool != null and select_tool.has_method("IsObjectLayerFiltered") and select_tool.IsObjectLayerFiltered(thing):
+		return true
+	return false
+
 #########################################################################################################
 ##
 ## WALL-IN-BOX TEST
@@ -267,6 +318,10 @@ func _update_highlights() -> void:
 		if not is_wall_in_box(wall, box[0], box[1]):
 			continue
 		if deselect and not selected_walls.has(wall):
+			continue
+		# Layer filter / visibility: never paint a "will select" highlight on
+		# a wall the commit below would skip. Deselect mode stays allowed.
+		if not deselect and _layer_pick_blocked(wall):
 			continue
 		walls_in_box.append(wall)
 
@@ -351,6 +406,9 @@ func _update_portal_highlights() -> void:
 				continue
 			if already != null and already.has(portal):
 				continue
+			# Layer filter / visibility (parity with the deferred commit)
+			if _layer_pick_blocked(portal):
+				continue
 			want.append(portal)
 	for portal in _highlighted_portals:
 		if is_instance_valid(portal) and not (portal in want):
@@ -392,6 +450,9 @@ func _add_walls_to_selection() -> void:
 	var added = 0
 	for wall in level.Walls.get_children():
 		if is_wall_in_box(wall, _deferred_box_start, _deferred_box_end):
+			# Layer filter / visibility (parity with DD's own box-select)
+			if _layer_pick_blocked(wall):
+				continue
 			select_tool.SelectThing(wall, true)
 			added += 1
 	if added > 0:
@@ -477,6 +538,10 @@ func _add_portals_to_selection() -> void:
 				continue
 			if already != null and already.has(portal):
 				continue
+			# Layer filter / visibility (parity with DD's own box-select,
+			# which applies IsObjectLayerFiltered to freestanding portals)
+			if _layer_pick_blocked(portal):
+				continue
 			select_tool.SelectThing(portal, true)
 			added += 1
 	if added == 0:
@@ -509,6 +574,38 @@ func _add_portals_to_selection() -> void:
 ##  over unselected walls) is a no-op.
 ##
 #########################################################################################################
+
+# DD's own SelectThingsInsideBox applies the layer filter but never tests
+# VISIBILITY: with a container hidden by a third-party mod like Hide Layers
+# (e.g. level.Portals invisible), hidden freestanding portals — and any other
+# hidden things — still get box-selected by DD. Runs once after DD's box has
+# committed: drop every selected thing that is not visible in the scene tree,
+# then refit or close the transform box.
+func _remove_hidden_from_selection(adjust_box := true) -> void:
+	if select_tool == null:
+		return
+	var raw = select_tool.RawSelectables
+	if raw == null or raw.size() == 0:
+		return
+	var to_remove = []
+	for s in raw:
+		if s == null or not is_instance_valid(s):
+			continue
+		var thing = s.get("Thing")
+		if thing == null or not is_instance_valid(thing):
+			continue
+		if thing is CanvasItem and not thing.is_visible_in_tree():
+			to_remove.append(thing)
+	if to_remove.empty():
+		return
+	for thing in to_remove:
+		select_tool.SelectThing(thing, false)
+	outputlog("Removed %d hidden thing(s) from box selection" % to_remove.size())
+	# Pendant le tracé de la box (adjust_box=false), ne pas toucher la
+	# transform box : elle est cachée tant que isDrawing est vrai.
+	if adjust_box and select_tool.has_method("EnableTransformBox"):
+		select_tool.call("EnableTransformBox", to_remove.size() < raw.size())
+
 
 func _deselect_walls_in_box(level) -> void:
 	var selected_walls := {}
@@ -757,7 +854,7 @@ func _apply_transform_to_wall(wall, snap: Dictionary, W: Transform2D, remake_lin
 	var new_pts = []
 	for p in snap["pts"]:
 		new_pts.append(W.xform(p))
-	wall.set("Points", new_pts)
+	_set_wall_points(wall, new_pts)
 
 	# 2. Visual children
 	for node in snap["children"]:
@@ -815,6 +912,10 @@ func _apply_transform_to_wall(wall, snap: Dictionary, W: Transform2D, remake_lin
 			wall.RemakeLines()
 		elif wall.has_method("RemakeLinesWhenAllPortalsReady"):
 			wall.RemakeLinesWhenAllPortalsReady()
+
+	# 5. Claim this geometry change so the watchdog in _update_overlay
+	#    doesn't mistake it for an external edit and re-fit the box.
+	_geo_owned_frame = Engine.get_frames_drawn()
 
 
 # Snapshot the `points` arrays of every Line2D in `node`'s subtree
@@ -1076,7 +1177,7 @@ func _restore_wall_state(wall, snap: Dictionary) -> void:
 	var pts = []
 	for p in snap.get("pts", []):
 		pts.append(p)
-	wall.set("Points", pts)
+	_set_wall_points(wall, pts)
 	# Children (Line2D / Node2D)
 	for node in snap.get("children", {}):
 		if not is_instance_valid(node):
@@ -1350,6 +1451,199 @@ func _update_group_transform() -> void:
 			_apply_transform_to_wall(wall, _move_snapshots[wall], W)
 
 
+# Instant drag de DD (clic-glisser direct sur un asset). DD remplit
+# movableThings avec tout le groupe — walls compris — et ecrit chaque frame :
+#     movableThings[i].Position = preMovePositions[i] + firstItemDelta
+# Pour un wall c'est un non-sens : sa geometrie vit dans Points (coordonnees
+# monde) et son node reste a l'origine. Le rendu suit (Line2D enfants en
+# local) mais les Points ne bougent pas — box en arriere, et Wall.Save()
+# n'ecrivant pas la position du node, le deplacement serait perdu au reload.
+#
+# La cle : preMovePositions vaut ZERO pour un wall, donc `wall.position` est
+# exactement la translation TOTALE depuis le debut du drag. On repart donc du
+# snapshot pris au debut et on lui applique cette translation absolue — rien
+# ne s'accumule, et l'ordre d'execution entre DD et nous n'a plus d'importance.
+# Sur une frame sans mouvement DD ne reecrit rien : la derniere valeur lue est
+# reutilisee, sinon le wall reviendrait au snapshot le temps d'une frame.
+#
+# (Mesurer la translation sur un item non-wall du groupe ne marchait pas : sa
+# position de reference ne peut etre capturee qu'a la premiere frame ou l'on
+# voit manualAction, apres que DD a deja applique un premier increment — d'ou
+# un decalage constant, le wall « sur un autre plan ».)
+#
+# L'undo de DD ne couvre pas ces walls : son MoveRecord compare
+# preMovePositions[i] a Position, toutes deux nulles ici. D'ou notre record.
+func _bake_dd_position_drag() -> void:
+	if _transforming or _ci_mode > 0:
+		_dd_drag_stop(false)
+		return
+	if select_tool == null:
+		return
+	var ma = select_tool.get("manualAction")
+	if not _dd_diag_done:
+		_dd_diag_done = true
+		print("[DSW-DIAG] manualAction lisible=%s valeur=%s" % [str(ma != null), str(ma)])
+	if ma == null or int(ma) != 1:   # ManualAction.MoveThing
+		_dd_drag_stop(true)
+		return
+	if _dd_diag_frames < 40:
+		var wl: Array = _get_selection_split()[0]
+		if wl.size() > 0 and is_instance_valid(wl[0]):
+			var w0 = wl[0]
+			var wpos = w0.position
+			var p0 = Vector2.ZERO
+			var raw0 = w0.get("Points")
+			if raw0 != null and raw0.size() > 0:
+				p0 = raw0[0]
+			# Une ligne seulement quand quelque chose bouge : sinon les frames
+			# immobiles du debut consommaient tout le budget de trace.
+			if wpos != _dd_diag_last_pos or p0 != _dd_diag_last_pt:
+				_dd_diag_frames += 1
+				_dd_diag_last_pos = wpos
+				_dd_diag_last_pt = p0
+				var ref_node = _dd_diag_ref_asset()
+				var rpos = ref_node.global_position if ref_node != null else Vector2.ZERO
+				print("[DSW-DIAG] pos_proc=%s pos_draw=%s pts[0]=%s asset=%s" % [str(_dd_dbg_proc_pos), str(wpos), str(p0), str(rpos)])
+
+	var walls: Array = _get_selection_split()[0]
+	if walls.size() == 0:
+		_dd_drag_stop(true)
+		return
+
+	if not _dd_pos_drag_active:
+		_dd_diag_frames = 0
+		_dd_diag_last_pos = Vector2.ZERO
+		_dd_diag_last_pt = Vector2.ZERO
+		_dd_pos_drag_snaps = {}
+		_dd_drag_delta = {}
+		for wall in walls:
+			if is_instance_valid(wall):
+				_dd_pos_drag_snaps[wall] = _snapshot_wall(wall)
+		_dd_pos_drag_active = true
+
+	for wall in _dd_pos_drag_snaps.keys():
+		if not is_instance_valid(wall):
+			continue
+		# Espace de coordonnees : `position` est LOCAL au parent. Les Points,
+		# eux, sont traites comme du monde partout dans ce mod. Si le conteneur
+		# Walls (ou Objects, d'ou vient firstItemDelta) porte une echelle, le
+		# meme delta numerique ne represente pas la meme distance monde — le
+		# wall se deplace alors d'un facteur different des assets, exactement
+		# le symptome « sur un autre plan ». On convertit donc explicitement.
+		var d = wall.position
+		var wparent = wall.get_parent()
+		if d != Vector2.ZERO and wparent != null and is_instance_valid(wparent):
+			d = wparent.global_transform.basis_xform(d)
+		if d != Vector2.ZERO:
+			_dd_drag_delta[wall] = d
+			# Remise a zero : la position du node ferait double emploi avec la
+			# geometrie qu'on vient de deplacer.
+			wall.position = Vector2.ZERO
+		else:
+			d = _dd_drag_delta.get(wall, Vector2.ZERO)
+		if d == Vector2.ZERO:
+			continue
+		# remake_lines = false : RemakeLines() libere les Line2D enfants et en
+		# recree d'autres. Fait depuis frame_pre_draw, la liste d'affichage de
+		# la frame est deja constituee : les anciens noeuds ont disparu et les
+		# nouveaux ne seront rendus qu'a la frame suivante — le wall clignote
+		# hors ecran pendant tout le drag. On se contente donc de translater
+		# les points des Line2D existants (le snapshot les garde valides tant
+		# qu'on ne remake pas) et on remake une seule fois au relachement.
+		_apply_transform_to_wall(wall, _dd_pos_drag_snaps[wall], Transform2D(0.0, d), false)
+
+
+# Entree appelee par l'emitter sur le signal frame_pre_draw de VisualServer.
+# Ce signal est emis juste avant VisualServer.draw(), donc APRES la phase
+# input de la frame (que DD passe par process_events ou par le flush des
+# evenements accumules) et APRES tous les _process. C'est le seul endroit ou
+# l'on est certain de lire la derniere valeur ecrite par DD dans
+# Thing.Position, de la remettre a zero, et que le rendu de la frame utilise
+# bien la geometrie qu'on vient de calculer.
+func on_frame_pre_draw() -> void:
+	if not _dd_bake_ok:
+		return
+	if _g == null or select_tool == null or not is_instance_valid(select_tool):
+		return
+	_bake_dd_position_drag()
+
+
+# Position du node du premier wall suivi par le bake, ou ZERO hors drag.
+# Sert uniquement au diagnostic d'ordre d'execution.
+func _dd_first_wall_position() -> Vector2:
+	if not _dd_pos_drag_active:
+		return Vector2.ZERO
+	for wall in _dd_pos_drag_snaps.keys():
+		if is_instance_valid(wall):
+			return wall.position
+	return Vector2.ZERO
+
+
+func _dd_diag_ref_asset():
+	if select_tool == null:
+		return null
+	var raw = select_tool.RawSelectables
+	if raw == null:
+		return null
+	for sel in raw:
+		if sel == null:
+			continue
+		var thing = sel.get("Thing")
+		if thing == null or not is_instance_valid(thing) or not (thing is Node2D):
+			continue
+		if int(sel.get("Type")) == SELECTABLE_WALL:
+			continue
+		return thing
+	return null
+
+
+func _dd_drag_stop(record: bool) -> void:
+	if not _dd_pos_drag_active:
+		return
+	_dd_pos_drag_active = false
+	# Passe finale. DD reecrit la position du node APRES notre bake dans la
+	# frame (son _ContentInput tourne apres notre update) : au relachement,
+	# cette derniere ecriture n'est plus jamais consommee. Le node gardait donc
+	# la translation complete EN PLUS de la geometrie deja deplacee — le wall
+	# restait a snapshot + 2 x delta, ce fameux « autre plan ».
+	for wall in _dd_pos_drag_snaps.keys():
+		if not is_instance_valid(wall):
+			continue
+		var d = wall.position
+		if d != Vector2.ZERO:
+			var wparent = wall.get_parent()
+			if wparent != null and is_instance_valid(wparent):
+				d = wparent.global_transform.basis_xform(d)
+			_dd_drag_delta[wall] = d
+			wall.position = Vector2.ZERO
+		else:
+			d = _dd_drag_delta.get(wall, Vector2.ZERO)
+		if d != Vector2.ZERO:
+			_apply_transform_to_wall(wall, _dd_pos_drag_snaps[wall], Transform2D(0.0, d), false)
+		# Passe unique de reconstruction, differee : _dd_drag_stop peut etre
+		# appele depuis frame_pre_draw, et un RemakeLines() a ce moment ferait
+		# disparaitre le wall pour une frame. call_deferred le repousse a la
+		# frame suivante, avant son rendu.
+		if wall.has_method("RemakeLines"):
+			wall.call_deferred("RemakeLines")
+		elif wall.has_method("RemakeLinesWhenAllPortalsReady"):
+			wall.call_deferred("RemakeLinesWhenAllPortalsReady")
+	var entries := []
+	if record:
+		for wall in _dd_pos_drag_snaps.keys():
+			if not is_instance_valid(wall):
+				continue
+			entries.append({
+				"wall": wall,
+				"pre_snap": _dd_pos_drag_snaps[wall],
+				"post_snap": _snapshot_wall(wall),
+			})
+	_dd_pos_drag_snaps = {}
+	_dd_drag_delta = {}
+	if entries.size() > 0:
+		_register_walls_undo("Move Walls", entries)
+
+
 func _end_group_transform() -> void:
 	_transforming = false
 	_drag_mode = 0
@@ -1491,6 +1785,73 @@ func translate_wall(wall, delta: Vector2) -> void:
 ##
 #########################################################################################################
 
+# Cheap hash of the selected walls' geometry. Samples the first, middle and
+# last point of each wall (plus its point count and identity) — enough to
+# catch any translation, rotation or scale, and most local edits, without
+# walking long polylines every frame. Coordinates are quantised to 1/8 unit
+# so float jitter doesn't produce spurious re-fits.
+func _walls_geo_signature(walls: Array) -> int:
+	var h := 0
+	for wall in walls:
+		if not is_instance_valid(wall):
+			continue
+		h = (h * 31 + wall.get_instance_id()) & 0x3FFFFFFF
+		# Filet de securite : si un chemin externe translate le node au lieu
+		# des Points, la box doit quand meme bouger (cf. _bake_dd_position_drag).
+		h = _hash_point(h, wall.position)
+		var pts = wall.get("Points")
+		if pts == null:
+			continue
+		var n: int = pts.size()
+		h = (h * 31 + n) & 0x3FFFFFFF
+		if n == 0:
+			continue
+		h = _hash_point(h, pts[0])
+		if n > 2:
+			h = _hash_point(h, pts[n / 2])
+		if n > 1:
+			h = _hash_point(h, pts[n - 1])
+	return h
+
+
+func _hash_point(h: int, p: Vector2) -> int:
+	h = (h * 31 + int(round(p.x * 8.0))) & 0x3FFFFFFF
+	h = (h * 31 + int(round(p.y * 8.0))) & 0x3FFFFFFF
+	return h
+
+
+# ── Wall.Points ↔ Wall.pointsClosed ────────────────────────────────────────
+# DD keeps a second copy of a LOOPED wall's outline in the private
+# `pointsClosed` array (Points + Points[0] appended). It is built only by
+# Wall.Set() and shifted by Wall.Offset() — RemakeLines() does NOT rebuild
+# it. PortalTool.FindBestLocation() → Wall.FindPortalSpot() reads
+# `Loop ? pointsClosed : Points`, so once we write Points directly the
+# PortalTool keeps snapping new portals onto the wall's OLD outline.
+# Every direct Points write must go through this helper. Godot's Mono
+# property bridge reaches private auto-properties, so we can write the
+# cache back ourselves; non-looped walls need nothing.
+func _set_wall_points(wall, pts) -> void:
+	wall.set("Points", pts)
+	if wall.get("Loop") != true:
+		return
+	if pts == null or pts.size() < 2:
+		return
+	var closed := PoolVector2Array()
+	for p in pts:
+		closed.append(p)
+	closed.append(pts[0])
+	wall.set("pointsClosed", closed)
+	# One-shot sanity check: if the private property turns out to be
+	# unreachable, say so once instead of silently leaving portals
+	# snapping to stale geometry.
+	if not Engine.has_meta("_up_pointsclosed_checked"):
+		Engine.set_meta("_up_pointsclosed_checked", true)
+		var back = wall.get("pointsClosed")
+		if back == null or back.size() != closed.size():
+			printerr("[UnofficialPatch] Wall.pointsClosed is not writable from GDScript; ")
+			printerr("[UnofficialPatch] portals may snap to stale geometry on looped walls.")
+
+
 # AABB of all given walls' Points. Returns Rect2() if no point found.
 func _compute_walls_aabb(walls: Array) -> Rect2:
 	var has := false
@@ -1502,39 +1863,69 @@ func _compute_walls_aabb(walls: Array) -> Rect2:
 		var pts = wall.Points
 		if pts == null or pts.size() == 0:
 			continue
-		for p in pts:
-			if p.x < minp.x: minp.x = p.x
-			if p.y < minp.y: minp.y = p.y
-			if p.x > maxp.x: maxp.x = p.x
-			if p.y > maxp.y: maxp.y = p.y
+		# Offset du node : nul en temps normal (les Points sont en monde),
+		# non nul le temps d'un instant drag de DD.
+		var wpos = wall.position
+		# Les Points ne decrivent que l'AXE du mur ; le ruban dessine deborde
+		# de la moitie de la largeur du Line2D de chaque cote. Sans cette
+		# marge la box passe a l'interieur du mur : cliquer sur une partie qui
+		# depasse tombe HORS de la box.
+		var ht: float = _wall_half_thickness(wall)
+		var n: int = pts.size()
+		var loop: bool = wall.get("Loop") == true
+		for i in range(n):
+			var p = pts[i] + wpos
+			var e: float = _wall_point_extent(pts, i, n, loop, ht)
+			if p.x - e < minp.x: minp.x = p.x - e
+			if p.y - e < minp.y: minp.y = p.y - e
+			if p.x + e > maxp.x: maxp.x = p.x + e
+			if p.y + e > maxp.y: maxp.y = p.y + e
 			has = true
 	if not has:
 		return Rect2()
 	return Rect2(minp, maxp - minp)
 
 
-# True if a wall is "flat" — all its points share the same X or the same
-# Y coordinate. DD's native transform box already works fine for those
-# (the AABB is a thin axis-aligned rectangle), so we leave them alone.
-# Non-flat single walls (diagonal lines, curves, or multi-segment walls
-# that bend) get our overlay so the user has a real 2D box to manipulate.
-func _is_wall_flat(wall) -> bool:
+# Debordement du ruban dessine autour du point d'index `i`, en pixels monde.
+# Sur un segment droit c'est la demi-largeur. A une jonction c'est la longueur
+# d'onglet ht / sin(angle / 2) : plus l'angle est aigu, plus la pointe part
+# loin — un mur triangulaire depasse largement de l'AABB de ses Points. On
+# plafonne a 4 x ht, DD biseautant les jonctions (LineJointMode.Bevel), et
+# parce qu'un angle quasi nul ferait exploser la box.
+func _wall_point_extent(pts, i: int, n: int, loop: bool, ht: float) -> float:
+	if n < 3:
+		return ht
+	var has_prev: bool = i > 0 or loop
+	var has_next: bool = i < n - 1 or loop
+	if not has_prev or not has_next:
+		return ht
+	var prev: Vector2 = pts[(i - 1 + n) % n]
+	var nxt: Vector2 = pts[(i + 1) % n]
+	var d0: Vector2 = pts[i] - prev
+	var d1: Vector2 = nxt - pts[i]
+	if d0.length() < 0.001 or d1.length() < 0.001:
+		return ht
+	var cosv: float = clamp(-d0.normalized().dot(d1.normalized()), -1.0, 1.0)
+	var half_angle: float = acos(cosv) * 0.5
+	var sn: float = sin(half_angle)
+	if sn < 0.001:
+		return ht * 4.0
+	return min(ht / sn, ht * 4.0)
+
+
+# Demi-epaisseur rendue d'un wall, en pixels monde. Wall.AddLine() cree les
+# Line2D du mur en ENFANTS DIRECTS et leur donne Width = Texture.GetHeight() ;
+# les Line2D d'ombre, deux fois plus larges, vivent sous le noeud `shadows`.
+# On ne regarde donc que les enfants directs, sinon la box doublerait.
+func _wall_half_thickness(wall) -> float:
 	if wall == null or not is_instance_valid(wall):
-		return true
-	var pts = wall.Points
-	if pts == null or pts.size() < 2:
-		return true
-	var first: Vector2 = pts[0]
-	var all_same_x := true
-	var all_same_y := true
-	for p in pts:
-		if abs(p.x - first.x) > 0.001:
-			all_same_x = false
-		if abs(p.y - first.y) > 0.001:
-			all_same_y = false
-		if not all_same_x and not all_same_y:
-			return false
-	return all_same_x or all_same_y
+		return 0.0
+	var w := 0.0
+	for i in range(wall.get_child_count()):
+		var child = wall.get_child(i)
+		if child is Line2D and child.width > w:
+			w = child.width
+	return w * 0.5
 
 
 # Splits the current selection into [walls_array, has_non_wall_bool].
@@ -2027,9 +2418,7 @@ func _update_overlay() -> void:
 	var wall_count: int = walls.size()
 	# Same gating as _is_custom_active() — overlay only when DD's native
 	# transform box would be wrong or unsuitable.
-	var should_show: bool = wall_count >= 2 \
-		or (wall_count > 0 and has_non_wall) \
-		or (wall_count == 1 and not _is_wall_flat(walls[0]))
+	var should_show: bool = wall_count >= 1
 	if not should_show:
 		_clear_overlay()
 		_last_combined = Rect2()
@@ -2045,7 +2434,16 @@ func _update_overlay() -> void:
 	var tt_fit = _tt_mixed()
 	var tt_sig = tt_fit.dsw_get_texts_signature() if (tt_fit != null and tt_fit.has_method("dsw_get_texts_signature")) else 0
 	var sel_changed = _selection_changed() or tt_sig != _last_tt_sig
-	if sel_changed or not _box_initialized:
+	# Geometry watchdog — see _wall_geo_sig. Only external edits count:
+	# ours are stamped by _apply_transform_to_wall (same frame, or the
+	# previous one when the edit happened during _input), and interactive
+	# drags are excluded outright.
+	var geo_sig := _walls_geo_signature(walls)
+	var geo_moved: bool = _box_initialized and geo_sig != _wall_geo_sig \
+			and _ci_mode == 0 and not _transforming \
+			and (Engine.get_frames_drawn() - _geo_owned_frame) > 1
+	_wall_geo_sig = geo_sig
+	if sel_changed or geo_moved or not _box_initialized:
 		var walls_rect: Rect2 = _compute_walls_aabb(walls)
 		if walls_rect.size == Vector2.ZERO:
 			_clear_overlay()
@@ -2090,6 +2488,14 @@ func _update_overlay() -> void:
 		var divisor = pow(max(zoom, 0.01), HANDLE_ZOOM_BLEND)
 		var hs = base_px / divisor
 		var hlw = HANDLE_LINE_WIDTH / divisor
+		# Cap a fort zoom : taille ECRAN <= base_px. Le blend partiel laissait
+		# les poignees grossir en zoom^(1-blend) -> enormes tres zoome. Les
+		# zones de hit sont deja en px ecran, rien d'autre a ajuster.
+		if zoom > 1.0:
+			hs = min(hs, base_px / zoom)
+			hlw = min(hlw, HANDLE_LINE_WIDTH / zoom)
+		# Contour : constant en monde (2.0) => epais tres zoome. Cap ecran.
+		_overlay.line_width = OVERLAY_WIDTH / max(zoom, 1.0)
 		# Hit zone debug values (in world units) — only > 0 when DEBUG enabled
 		var dcr = 0.0
 		var drr = 0.0
@@ -2751,6 +3157,23 @@ func _custom_end_drag() -> void:
 		_we_have_active_custom = false
 
 
+# True as soon as the selection holds at least one wall — that is, as soon as
+# our overlay is the one responsible for the transform box.
+#
+# Unlike _is_custom_active(), this deliberately ignores isDrawing. DD turns a
+# click into a drag-select whenever its own hit test misses the wall (it
+# tolerates 32 px from the AXIS, so the outer edge of a thick wall or the tip
+# of a sharp corner does not register), and during that state the overlay is
+# hidden — but DD's box must NOT come back, or the user sees two boxes of
+# different sizes. Public: wall_move.gd reads it through _dsw_owns_box().
+func _selection_owns_box() -> bool:
+	if select_tool == null:
+		return false
+	if _g.Editor == null or _g.Editor.ActiveToolName != "SelectTool":
+		return false
+	return _get_selection_split()[0].size() >= 1
+
+
 # True when our custom box should be active (mixed wall+prop selection,
 # SelectTool current, not in a drag-select).
 func _is_custom_active() -> bool:
@@ -2763,24 +3186,17 @@ func _is_custom_active() -> bool:
 	var split = _get_selection_split()
 	var walls: Array = split[0]
 	var wall_count: int = walls.size()
-	var has_non_wall: bool = split[1]
-	# Activate our overlay when DD's native transform box is broken
-	# or unsuitable:
-	#   - 2+ walls only: DD's box only wraps the first wall
-	#   - 1+ walls AND 1+ non-walls: DD silently excludes non-walls from
-	#     the rect for mixed selections
-	#   - 1 NON-FLAT wall (diagonal / curved / multi-segment that bends):
-	#     DD's native box is the wall's AABB — workable for translate but
-	#     not great for rotate/scale on a wall that's already at an angle
-	# A single FLAT wall (horizontal or vertical) or non-walls only → DD's
-	# native is fine, we let it handle.
-	if wall_count >= 2:
-		return true
-	if wall_count > 0 and has_non_wall:
-		return true
-	if wall_count == 1 and not _is_wall_flat(walls[0]):
-		return true
-	return false
+	# Our overlay owns every selection that contains at least one wall.
+	# DD's native box is unusable in all of those cases:
+	#   - 2+ walls only: its box only wraps the first wall
+	#   - 1+ walls AND 1+ non-walls: it silently drops the non-walls
+	#   - 1 wall on its own: the box is the wall's AABB, so a FLAT wall
+	#     gets a degenerate rectangle with no usable rotate handle, and a
+	#     diagonal one gets a box far too loose to rotate or scale with.
+	# Owning the box also keeps DD from latching transformMode when
+	# wall_move force-selects a wall (see _enable_dd_box_if_owned there).
+	# Selections without any wall → DD's native box, untouched.
+	return wall_count >= 1
 
 
 # If the click is on a different (non-selected) asset highlighted by DD,
@@ -3016,6 +3432,9 @@ func on_process(_delta):
 
 
 func _on_process_impl(_delta):
+	# Referme la porte du bake : seule la branche nominale ci-dessous la
+	# rouvre pour la frame courante.
+	_dd_bake_ok = false
 	if _g.Editor.ActiveToolName != "SelectTool":
 		if _was_drawing:
 			_clear_highlights()
@@ -3030,6 +3449,7 @@ func _on_process_impl(_delta):
 		if _dd_box_hidden_by_us:
 			select_tool.EnableTransformBox(true)
 			_dd_box_hidden_by_us = false
+			_dd_box_hidden_during_tm = false
 		if _we_have_active_custom:
 			Input.set_custom_mouse_cursor(null, Input.CURSOR_ARROW)
 			_we_have_active_custom = false
@@ -3047,10 +3467,18 @@ func _on_process_impl(_delta):
 		_drag_deselect_sampled = Input.is_key_pressed(KEY_ALT) and Input.is_key_pressed(KEY_SHIFT)
 		_update_highlights()
 		_update_portal_highlights()
+		# DD re-sélectionne les things cachés à CHAQUE motion de box
+		# (SelectThingsInsideBox ne teste pas la visibilité) : purge en
+		# continu pour garder la sélection propre pendant le tracé.
+		_remove_hidden_from_selection(false)
 	elif _was_drawing:
 		_was_drawing = false
 		_clear_highlights()
 		_clear_portal_highlights()
+		# Purge sur la frame de release, AVANT le rendu : la passe différée
+		# (2 frames plus tard) laissait la transform box flasher une fraction
+		# de seconde autour d'un thing caché.
+		_remove_hidden_from_selection()
 		if _last_box_begin.distance_to(_last_box_end) > MIN_DISTANCE:
 			var box = _normalize_box(_last_box_begin, _last_box_end)
 			_deferred_box_start = box[0]
@@ -3069,6 +3497,7 @@ func _on_process_impl(_delta):
 		_deferred_frames = -1
 		_add_walls_to_selection()
 		_add_portals_to_selection()
+		_remove_hidden_from_selection()
 		_deferred_deselect = false
 
 	# Tout ce qui suit (transform de groupe, custom box, cursor) ne doit
@@ -3085,6 +3514,7 @@ func _on_process_impl(_delta):
 		if _dd_box_hidden_by_us:
 			select_tool.EnableTransformBox(true)
 			_dd_box_hidden_by_us = false
+			_dd_box_hidden_during_tm = false
 		if _we_have_active_custom:
 			Input.set_custom_mouse_cursor(null, Input.CURSOR_ARROW)
 			_we_have_active_custom = false
@@ -3103,19 +3533,44 @@ func _on_process_impl(_delta):
 		# Transform in progress: re-derive W from ref item and reapply to walls
 		_update_group_transform()
 
+	# --- Instant drag de DD : Position du node -> Points ---------------------
+	# On ne bake PAS ici : DD ecrit Thing.Position depuis _on_Content_gui_input,
+	# dont l'ordre par rapport a notre _process n'est pas garanti. Quand son
+	# ecriture tombe apres la notre, le wall est dessine a
+	# Points(base + d_precedent) + position(d_courant) : il file devant le
+	# reste du prefab — l'effet de "parallaxe". On se contente d'ouvrir la
+	# porte, et le bake tourne dans frame_pre_draw, toujours apres la phase
+	# input et juste avant le rendu.
+	_dd_bake_ok = true
+	_dd_dbg_proc_pos = _dd_first_wall_position()
+
 	# --- Box expansion: include walls' AABB in the transform box ---
 	# --- Visual overlay update ---
 	# We always recompute (even during transforms) so the outline tracks
 	# the live combined AABB; we only hide it during a drag-select since
 	# DD's drag rect is shown there instead.
-	if is_drawing:
+	if is_drawing or _dd_pos_drag_active:
 		_clear_overlay()
-		# When the user starts a drag-select, restore DD's box visibility
-		# so future selection state goes back to normal. Also clear our
-		# ARROW custom (if any) so DD's drag-select cursor isn't masked.
-		if _dd_box_hidden_by_us:
+		if _dd_pos_drag_active or _selection_owns_box():
+			# Instant drag: DD's own box is stale (it is fitted once, at
+			# selection time, and never follows the move) and a plain drag
+			# does not need it. Keep it hidden for the whole drag; the
+			# selection is dropped on release anyway.
+			# Drag-select: same treatment as soon as the selection holds a
+			# wall. Restoring DD's box here was showing a SECOND box, fitted
+			# on the bare Points (so visibly thinner than ours), for as long
+			# as isDrawing stayed true — i.e. the whole time the button was
+			# held down after a click DD had turned into a drag-select.
+			select_tool.EnableTransformBox(false)
+			_dd_box_hidden_by_us = true
+			_dd_box_hidden_during_tm = false
+		elif _dd_box_hidden_by_us:
+			# When the user starts a drag-select, restore DD's box visibility
+			# so future selection state goes back to normal. Also clear our
+			# ARROW custom (if any) so DD's drag-select cursor isn't masked.
 			select_tool.EnableTransformBox(true)
 			_dd_box_hidden_by_us = false
+			_dd_box_hidden_during_tm = false
 		if _we_have_active_custom:
 			Input.set_custom_mouse_cursor(null, Input.CURSOR_ARROW)
 			_we_have_active_custom = false
@@ -3125,14 +3580,37 @@ func _on_process_impl(_delta):
 		# this each frame because DD re-enables internally on selection
 		# events. Skipping while a transform is in progress avoids
 		# fighting DD during its own drags.
-		var custom_active = _is_custom_active() and tm == 0
+		var overlay_owns_box = _is_custom_active()
+		var custom_active = overlay_owns_box and tm == 0
 		if custom_active:
 			select_tool.EnableTransformBox(false)
 			_dd_box_hidden_by_us = true
+			_dd_box_hidden_during_tm = false
 			_custom_update_cursor()
+		elif overlay_owns_box and tm > 0:
+			# DD latched one of its own transforms even though our overlay
+			# owns this selection. It happens on the very first press of a
+			# wall_move click-drag: wall_move selects the wall and calls
+			# EnableTransformBox(true) (needed so DD keeps a valid box for
+			# single FLAT walls), then DD's _ContentInput sees
+			# transformBox.Visible and sets transformMode = GetTransformMode().
+			# We never got a tm == 0 frame in between, so the box was still
+			# visible and stayed stranded at the pre-drag position for the
+			# whole drag — the "second box" the user sees.
+			# Hiding it now is safe: SelectTool only reads transformBox.Visible
+			# when LATCHING a transform (and for wheel-rotate); once
+			# transformMode is set, the motion and release paths only test
+			# transformMode, so Disable() can't abort the drag.
+			# Issued once per transform — re-toggling every frame during a
+			# live DD drag is what the original tm == 0 guard avoided.
+			if not _dd_box_hidden_during_tm:
+				select_tool.EnableTransformBox(false)
+				_dd_box_hidden_during_tm = true
+				_dd_box_hidden_by_us = true
 		elif _dd_box_hidden_by_us:
 			select_tool.EnableTransformBox(true)
 			_dd_box_hidden_by_us = false
+			_dd_box_hidden_during_tm = false
 			# Clear our ARROW custom so DD's other transform boxes regain
 			# their normal cursor behavior. We DON'T touch
 			# set_default_cursor_shape because that interferes with DD's
@@ -3163,7 +3641,7 @@ func _on_process_impl(_delta):
 
 func set_up_input_capture():
 	var s = GDScript.new()
-	s.source_code = "extends Node\nvar handler = null\nfunc _ready():\n\tset_process_input(true)\nfunc _process(d):\n\tif handler != null:\n\t\thandler.on_process(d)\nfunc _input(e):\n\tif handler != null:\n\t\thandler.on_input(e)\n"
+	s.source_code = "extends Node\nvar handler = null\nfunc _ready():\n\tset_process_input(true)\n\tif VisualServer.has_signal(\"frame_pre_draw\"):\n\t\tVisualServer.connect(\"frame_pre_draw\", self, \"_on_frame_pre_draw\")\nfunc _on_frame_pre_draw():\n\tif handler != null:\n\t\thandler.on_frame_pre_draw()\nfunc _process(d):\n\tif handler != null:\n\t\thandler.on_process(d)\nfunc _input(e):\n\tif handler != null:\n\t\thandler.on_input(e)\n"
 	s.reload()
 	var emitter = Node.new()
 	emitter.name = "DragSelectWallsEmitter"

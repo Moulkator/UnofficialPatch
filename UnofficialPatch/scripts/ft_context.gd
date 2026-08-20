@@ -17,6 +17,12 @@ var _icon_ft = null
 var _ft_toggle_btn_ref = null
 var _initial_sync_frames := 120  # ~2s de retry pour sync initial
 
+# Mode a appliquer juste apres l'activation de FT depuis le sous-menu.
+# FT construit ses handles et son etat sur la frame suivant le toggle, d'ou
+# le report de quelques frames avant de lui pousser le mode.
+var _pending_mode := -1
+var _pending_frames := 0
+
 
 func initialize() -> void:
 	var img_ft = Image.new()
@@ -32,6 +38,10 @@ func initialize() -> void:
 # il n'existe pas tout de suite au boot d'ou la fenetre de retry de ~2s
 # qui s'arrete des qu'on a reussi a sync une fois.
 func update(_delta: float) -> void:
+	if _pending_frames > 0:
+		_pending_frames -= 1
+		if _pending_frames == 0:
+			_apply_pending_mode()
 	if _initial_sync_frames > 0:
 		_initial_sync_frames -= 1
 		# Considere "pret" des que free_transform expose set_widget_visible
@@ -133,15 +143,69 @@ func get_context_items(raw) -> Array:
 		# automatiquement entre providers. Si ft_context est seul (favorites
 		# et group_assets desactives), pas de leading separator = pas
 		# d'espace vide en haut du popup.
-		items.append({label = "Free Transform", icon = _icon_ft, action_id = "ft_enable"})
+		# Sans sous-menu exploitable on retombe sur un item simple, sinon
+		# l'entree deviendrait un parent de sous-menu vide, donc non
+		# cliquable, et FT ne serait plus activable depuis le menu.
+		var submenu = _build_mode_submenu()
+		if submenu.size() > 0:
+			items.append({
+				label = "Free Transform",
+				icon = _icon_ft,
+				action_id = "ft_enable",
+				submenu = submenu,
+			})
+		else:
+			items.append({label = "Free Transform", icon = _icon_ft, action_id = "ft_enable"})
 	return items
 
 
+# Sous-menu propose quand FT est OFF : cliquer une option active FT puis la
+# joue, il n'y a donc pas d'entree "Enable" separee.
+#
+# La liste vient de free_transform lui-meme (get_context_menu_options) : les
+# regles de disponibilite -- portals vs walls vs props, Crop reserve a un prop
+# simple isole, Reset seulement si un asset porte deja une donnee FT -- vivent
+# la-bas et dependent d'un etat que ce provider ne voit pas.
+func _build_mode_submenu() -> Array:
+	var sub := []
+	if free_transform == null or not is_instance_valid(free_transform):
+		return sub
+	if not free_transform.has_method("get_context_menu_options"):
+		return sub
+	var options = free_transform.get_context_menu_options()
+	if not (options is Array):
+		return sub
+	for opt in options:
+		if opt.get("_sep", false):
+			sub.append({label = "", icon = null, action_id = "", _sep = true})
+			continue
+		sub.append({
+			label = opt.get("label", ""),
+			icon = null,
+			action_id = "ft_mode_%d" % int(opt.get("id", 0)),
+		})
+	return sub
+
+
 func on_context_action(action_id: String, raw) -> void:
-	if action_id != "ft_enable":
+	if action_id != "ft_enable" and not action_id.begins_with("ft_mode_"):
 		return
 	var btn = _find_ft_toggle_button()
 	if btn != null and is_instance_valid(btn):
 		btn.pressed = true
 		btn.emit_signal("toggled", true)
 		print("[FTContext] Free Transform enabled via context menu")
+	if action_id.begins_with("ft_mode_"):
+		_pending_mode = int(action_id.substr(8))
+		_pending_frames = 3
+
+
+func _apply_pending_mode() -> void:
+	var mode = _pending_mode
+	_pending_mode = -1
+	if mode < 0:
+		return
+	if free_transform == null or not is_instance_valid(free_transform):
+		return
+	if free_transform.has_method("_on_transform_menu_id"):
+		free_transform._on_transform_menu_id(mode)

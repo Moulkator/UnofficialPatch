@@ -1226,6 +1226,7 @@ func _render_prefab_data(data: Dictionary, thumb_size: int = THUMB_SIZE):
 	_collect_bb_shapes(data.get("pattern_shapes", []), all_bb)
 	_collect_bb_paths(data.get("pathways", []), all_bb)
 	_collect_bb_roofs(data.get("roofs", []), all_bb)
+	_collect_bb_walls(data.get("walls", []), all_bb)
 
 	if all_bb.size() == 0:
 		yield(_panel.get_tree(), "idle_frame")
@@ -1274,6 +1275,7 @@ func _render_prefab_data(data: Dictionary, thumb_size: int = THUMB_SIZE):
 	var nodes_with_layer = []
 	_build_shape_nodes(data.get("pattern_shapes", []), sf, offset, nodes_with_layer)
 	_build_path_nodes(data.get("pathways", []), sf, offset, nodes_with_layer)
+	_build_wall_nodes(data.get("walls", []), data, sf, offset, nodes_with_layer)
 	_build_object_nodes(data.get("objects", []), sf, offset, nodes_with_layer)
 	_build_roof_nodes(data.get("roofs", []), sf, offset, nodes_with_layer)
 	nodes_with_layer.sort_custom(self, "_sort_by_layer")
@@ -1347,6 +1349,116 @@ func _collect_bb_paths(paths: Array, out: Array) -> void:
 			var world = origin + Vector2(s.x * cs - s.y * sn, s.x * sn + s.y * cs)
 			out.append(world + Vector2(-w, -w))
 			out.append(world + Vector2(w, w))
+
+
+# Les walls viennent de la section "walls" ajoutee par le sous-mod prefab_walls
+# (DD ne serialise pas les walls dans ses prefabs). Format : points en
+# PoolVector2Array serialise, couleur en tableau [r,g,b,a], portails imbriques.
+func _collect_bb_walls(walls: Array, out: Array) -> void:
+	for wall in walls:
+		if not (wall is Dictionary):
+			continue
+		var points = _parse_pool_vector2(str(wall.get("points", "")))
+		if points.size() < 2:
+			continue
+		var half = _wall_half_width(wall)
+		for p in points:
+			out.append(p + Vector2(-half, -half))
+			out.append(p + Vector2(half, half))
+
+
+func _wall_half_width(wall: Dictionary) -> float:
+	var tex = _safe_load_texture(str(wall.get("texture", "")))
+	if tex == null:
+		return 16.0
+	return float(tex.get_height()) * 0.5
+
+
+func _build_wall_nodes(walls: Array, data: Dictionary, sf: float, offset: Vector2, out: Array) -> void:
+	if walls.size() == 0:
+		return
+	var layer = _wall_render_layer(data)
+	for i in range(walls.size()):
+		var wall = walls[i]
+		if not (wall is Dictionary):
+			continue
+		var points = _parse_pool_vector2(str(wall.get("points", "")))
+		if points.size() < 2:
+			continue
+		var tex = _safe_load_texture(str(wall.get("texture", "")))
+		if tex == null:
+			continue
+		var pts = PoolVector2Array()
+		for p in points:
+			pts.append(p * sf + offset)
+		if wall.get("loop", false) == true and pts.size() > 2:
+			pts.append(pts[0])
+		var line = Line2D.new()
+		line.points = pts
+		line.width = float(tex.get_height()) * sf
+		line.texture = tex
+		line.texture_mode = Line2D.LINE_TEXTURE_TILE
+		line.joint_mode = int(wall.get("joint", 1))
+		line.antialiased = false
+		var wall_color = _parse_wall_color(wall.get("color", null))
+		line.default_color = wall_color
+		# categorie 1 (comme les paths) mais src_idx decale : a layer egal un
+		# wall passe au-dessus d'un path et reste sous les objects.
+		out.append({"node": line, "layer": layer, "category": 1, "src_idx": 20000 + i})
+		_build_wall_portal_nodes(wall, layer, sf, offset, out, i)
+
+
+func _build_wall_portal_nodes(wall: Dictionary, layer: int, sf: float, offset: Vector2, out: Array, wall_idx: int) -> void:
+	var portals = wall.get("portals", [])
+	if not (portals is Array):
+		return
+	for j in range(portals.size()):
+		var portal = portals[j]
+		if not (portal is Dictionary):
+			continue
+		var tex = _safe_load_texture(str(portal.get("texture", "")))
+		if tex == null:
+			continue
+		var pos = Vector2.ZERO
+		var raw_pos = portal.get("position", null)
+		if raw_pos is Array and raw_pos.size() >= 2:
+			pos = Vector2(float(raw_pos[0]), float(raw_pos[1]))
+		var sprite = Sprite.new()
+		sprite.texture = tex
+		sprite.position = pos * sf + offset
+		sprite.rotation = float(portal.get("rotation", 0.0))
+		sprite.scale = Vector2(sf, sf)
+		out.append({"node": sprite, "layer": layer, "category": 1, "src_idx": 30000 + wall_idx * 100 + j})
+
+
+# Les walls DD se dessinent au-dessus des sols et sous les objets. Comme le tri
+# est fait d'abord sur le layer, on cale les walls sur le plus haut layer de
+# sol/path present, sans depasser le plus bas layer d'objet.
+func _wall_render_layer(data: Dictionary) -> int:
+	var ground = -2147483648
+	for section in ["pattern_shapes", "pathways"]:
+		for item in data.get(section, []):
+			if item is Dictionary:
+				ground = max(ground, int(item.get("layer", 100)))
+	var objects = 2147483647
+	for item in data.get("objects", []):
+		if item is Dictionary:
+			objects = min(objects, int(item.get("layer", 100)))
+	if ground == -2147483648 and objects == 2147483647:
+		return 100
+	if ground == -2147483648:
+		return objects
+	if objects == 2147483647:
+		return ground
+	return max(ground, objects)
+
+
+func _parse_wall_color(raw) -> Color:
+	if raw is Array and raw.size() >= 4:
+		return Color(float(raw[0]), float(raw[1]), float(raw[2]), float(raw[3]))
+	if raw is String:
+		return _parse_color(raw)
+	return Color.white
 
 
 func _build_object_nodes(objects: Array, sf: float, offset: Vector2, out: Array) -> void:
