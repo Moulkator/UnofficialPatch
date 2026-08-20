@@ -1,5 +1,58 @@
 UNOFFICIAL PATCH
 
+v1.6.0
+
+NEW FEATURES:
+- Added Walls and Portals to prefabs
+- Added "Make Prefab" and "Separate Prefab" to a right click selection
+- Added options in the Settings to enable/disable what's in the right click menu
+- Added a right click submenu for the Free Transform options
+- Added a Snap To Grid button in the export window (+ S shortcut support)
+- Added a way to switch between asset info, cursor position and both by clicking at the bottom right of the screen
+- Added curvature and spacing to the text tool
+- Added the Bucket Tool to the Water Tool and the Material Tool
+- Added the Square Brush to the Water Tool and the Material Tool
+- Added an option to hide a Material's border texture
+- Added  undo/redo support for Send to Back/Bring to Front (also compatible with Minor Utils shortcuts)
+- Added a "Natural Spacing" option in the Scatter Tool (ON by default) so the spacing follows your cursor path instead of map distances between two assets (allows zigzags) - Compatible with Colour and Modify Things
+- Improved asset selection when transform boxes are displayed near the asset you want to select
+- Improved Transform Box size at high zoom level
+
+FIXES:
+- Slightly improved the UI of the Bucket Tool
+- Fixed Free Transform compatibility issues with the Colour and Modify Things mod from uchideshi34
+- Fixed Favorites shortcut (F) triggering unwantedly in Themed Search mod
+- Fixed Favorites and Hide Assets not working correctly with the Right Side Panel and without Additional Search Options
+- Fixed Scatter Tool's rotation and scale not working 
+- Fixed odd light scalings. Steps are now 0.1 (size 0.1-1.0), 0.2 (1.0 - 2.0), 0.5 (above 2.0)
+- Fixed autosave in the Export Window causing Undo/Redo not working
+- Fixed some rollback happening sometimes after dragging an asset
+- Fixed Filter Floatbar being hidden between maps if the resolution changed
+- Fixed a vanilla bug that didn't hide the dot cursor in Eyedropper mod in the Water Brush, preventing from choosing a color
+- Fixed Trace Image and Text not being move correctly during a map resize
+- Fixed grid odd behavior after using the Compare Levels tool
+- Fixed layer filters not being applied for walls, paths, portals and patterns
+- Fixed walls, paths, portals and patterns baing selectable even if layer was hidden with Hide Layer Mod
+- Fixed freestanding portals not being transformed correctly in a multiple selection symmetry
+- Fixed walls not rotating with portals in Free Transform mode
+- Fixed walls not always having the rotation handle in Free Transform
+- Fixed Transform Box not moving with walls sometimes
+- Fixed shifting issues after applying several transformations in Free Transform mode
+- Fixed Soft Shadows being applied to the wrong side of a wall after a symmetry
+- Fixed Soft Shadows creating scale issues in Free Transform mode
+- Fixed a vanilla bug preventing assets to be selected above freestanding portals
+
+MAC ISSUES THAT SHOULD HOPEFULLY BE FIXED:
+- Edit Curve not working properly
+- Paint Bucket not aiming correctly
+- Text Tool (some users still report crashes though)
+- Text Selection not working properly
+- Grid Ruler not displayed correctly
+- Free Transform Handles being unclickable
+
+DISCLAIMER: I'm still working on fixing some more issues for Mac users, some people don't experience exactly the same so I need to get feedback from you guys. If you're interested in helping, feel free to send me a message.
+
+
 v1.5.0
 - Added an option to place all the libraries on the right side of the screen
 - Added the ability to copy portals when you copy walls (before, portals were lost on copy)
@@ -160,7 +213,7 @@ v1.1.3
 v1.1.2
 - "Create Custom Pack From Favorites" is now turned off by default, you need to manually enable it if you need that option
 - Enabling that option will display a popup reminding the user the pack is strictly for personal use
-- Fixed the non working ON/OFF toggle for that option 
+- Fixed the non working ON/OFF toggle for that option
 
 
 v1.1.1

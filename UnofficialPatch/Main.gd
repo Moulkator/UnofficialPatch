@@ -55,6 +55,9 @@ var prefs_label_fix
 var PrefabsFixScript
 var prefabs_fix
 
+var PrefabWallsScript
+var prefab_walls
+
 var PortalToolFixScript
 var portal_tool_fix
 
@@ -84,6 +87,9 @@ var scatter_multiselect_fix
 
 var ScatterTransformScript
 var scatter_transform
+
+var ScatterPathSpacingScript
+var scatter_path_spacing
 
 var SelectCursorFixScript
 var select_cursor_fix
@@ -186,6 +192,9 @@ var edit_points_undo
 var PreserveSelectionUndoScript
 var preserve_selection_undo
 
+var ZOrderUndoScript
+var zorder_undo
+
 var PrefabsCloneFixScript
 var prefabs_clone_fix
 
@@ -237,6 +246,9 @@ var wall_move
 var TextSelectStyleScript
 var text_select_style
 
+var TextStyleExtraScript
+var text_style_extra
+
 var LevelSettingsFixScript
 var level_settings_fix
 
@@ -257,6 +269,12 @@ var pattern_paint_bucket
 
 var TerrainPaintBucketScript
 var terrain_paint_bucket
+
+var WaterSquareBucketScript
+var water_square_bucket
+
+var MaterialSquareBucketScript
+var material_square_bucket
 var TerrainSlotsExtendedScript
 var terrain_slots_extended
 
@@ -276,6 +294,9 @@ var select_collapse
 
 var SliderScrollFixScript
 var slider_scroll_fix
+
+var ExportSnapCropScript
+var export_snap_crop
 
 var SelectRotationScript
 var select_rotation
@@ -302,6 +323,9 @@ var RightClickUtilScript
 var right_click_util
 var ft_context
 var rotate_context
+
+var PrefabContextScript
+var prefab_context
 var clipboard_context
 
 var MapExplorerScript
@@ -455,6 +479,7 @@ func start() -> void:
 		mod_settings.register_section("controls", "CONTROLS")
 		mod_settings.register_section("selection_tool", "SELECTION TOOL")
 		mod_settings.register_section("other_tools", "OTHER TOOLS")
+		mod_settings.register_section("right_click_menu", "RIGHT CLICK MENU")
 		mod_settings.register_section("debug", "DEBUG")
 		mod_settings.register_toggle(
 			"favorite_assets", "general", "Asset Favorites",
@@ -646,6 +671,10 @@ func start() -> void:
 			"After Ctrl+Z / Ctrl+Y, restores the SelectTool selection to\nwhat it was just before the action — so you don't have to\nre-click the items you were working on.",
 			true, self, "_on_undo_preserves_selection_toggled")
 		mod_settings.register_toggle(
+			"zorder_undo", "selection_tool", "Undo for Bring to Front / Send to Back",
+			"Makes the panel's Bring to Front / Send to Back buttons\nundoable with Ctrl+Z / Ctrl+Y (vanilla never records\nthem in the history).",
+			true, self, "_on_zorder_undo_toggled")
+		mod_settings.register_toggle(
 			"light_tool_object_like", "other_tools", "Light Tool - Controls from Objects Tool",
 			"In LightTool, when ON: ObjectTool-style shortcuts\n(Right Click = +90° rotation, Mousewheel = rotate\n15°/Z=5°/Shift+Z=1°, Shift+wheel = cycle styles,\nAlt+wheel = range).\nWhen OFF: vanilla LightTool feel (Alt+wheel = rotate\n15°/Z=5°, Shift+wheel = scale by 0.1, no plain wheel\nrotation, no right-click rotation).",
 			true)
@@ -659,6 +688,32 @@ func start() -> void:
 			true,
 			null, "",
 			true)
+		# Right click menu — one toggle per group of entries. Favorites has no
+		# toggle here: its entries follow the Favorite Assets mod itself.
+		mod_settings.register_toggle(
+			"rcm_free_transform", "right_click_menu", "Free Transform",
+			"Shows the Free Transform entry, with a submenu to\nstart directly in a given transform mode.",
+			true)
+		mod_settings.register_toggle(
+			"rcm_prefabs", "right_click_menu", "Prefabs",
+			"Shows Make Prefab / Separate Prefab.",
+			true)
+		mod_settings.register_toggle(
+			"rcm_groups", "right_click_menu", "Group / Ungroup",
+			"Shows Group Selected Assets / Ungroup Assets.",
+			true)
+		mod_settings.register_toggle(
+			"rcm_rotate", "right_click_menu", "Rotate 90°",
+			"Shows the Rotate 90° entry for object selections.",
+			true)
+		mod_settings.register_toggle(
+			"rcm_clipboard", "right_click_menu", "Copy / Paste / Delete",
+			"Shows Copy, Cut, Paste, Paste in Place and Delete.",
+			true)
+		mod_settings.register_toggle(
+			"prefab_walls", "other_tools", "Prefab Tool - Walls & Portals",
+			"Lets prefabs carry walls (and the portals anchored to\nthem), which vanilla DD silently drops.\nSelected walls are written into the prefab file, a ghost\npreview follows the cursor next to DD's own preview, and\nthe real walls are created on click.\nMixed prefabs undo in two steps: walls first, then the\nassets handled by DD.",
+			true)
 		mod_settings.register_toggle(
 			"reposition_portals", "other_tools", "Wall Tool - Reposition Portals",
 			"In WallTool's Edit Points mode, adds a 'Reposition Portals\n(Beta)' toggle that keeps portals on edited segments and\nrepositions them along the new geometry.\nWith this off, portals on edited walls are removed\n(vanilla DD behavior).",
@@ -670,6 +725,10 @@ func start() -> void:
 			true,
 			null, "",
 			false, "", "PORTAL TOOL")
+		mod_settings.register_toggle(
+			"export_snap_crop", "other_tools", "Export Window - Snap Toggle",
+			"Adds a 'Snap to Grid' ON/OFF toggle next to Crop /\nReset Crop in the Export window, plus the 'S' shortcut\nwhile the window is open, to control grid snapping for\nthe crop selection.",
+			true, self, "_on_export_snap_crop_toggled")
 		mod_settings.register_toggle(
 			"display_debug_tool", "debug", "Display Debug Panel",
 			"Shows the 'Mod Debug' panel alongside this one,\nwhere each loadable mod script can be toggled\nindividually (next-launch effect).\nDisable to hide the panel and reset all per-script\ntoggles to ON.",
@@ -879,6 +938,13 @@ func start() -> void:
 		scatter_transform.ui_util = ui_util
 		scatter_transform.initialize()
 
+	if _debug_enabled("scatter_path_spacing"):
+		ScatterPathSpacingScript = ResourceLoader.load(Global.Root + "scripts/scatter_path_spacing.gd", "GDScript", true)
+		scatter_path_spacing = ScatterPathSpacingScript.new()
+		scatter_path_spacing._g = Global
+		scatter_path_spacing.ui_util = ui_util
+		scatter_path_spacing.initialize()
+
 	if _debug_enabled("transform_box_fix"):
 		TransformBoxFixScript = ResourceLoader.load(Global.Root + "scripts/transform_box_fix.gd", "GDScript", true)
 		transform_box_fix = TransformBoxFixScript.new()
@@ -984,6 +1050,20 @@ func start() -> void:
 		terrain_paint_bucket.ui_util = ui_util
 		terrain_paint_bucket.initialize()
 
+	if _debug_enabled("water_square_bucket"):
+		WaterSquareBucketScript = ResourceLoader.load(Global.Root + "scripts/water_square_bucket.gd", "GDScript", true)
+		water_square_bucket = WaterSquareBucketScript.new()
+		water_square_bucket._g = Global
+		water_square_bucket.ui_util = ui_util
+		water_square_bucket.initialize()
+
+	if _debug_enabled("material_square_bucket"):
+		MaterialSquareBucketScript = ResourceLoader.load(Global.Root + "scripts/material_square_bucket.gd", "GDScript", true)
+		material_square_bucket = MaterialSquareBucketScript.new()
+		material_square_bucket._g = Global
+		material_square_bucket.ui_util = ui_util
+		material_square_bucket.initialize()
+
 	if _debug_enabled("terrain_slots_extended"):
 		TerrainSlotsExtendedScript = ResourceLoader.load(Global.Root + "scripts/terrain_slots_extended.gd", "GDScript", true)
 		terrain_slots_extended = TerrainSlotsExtendedScript.new()
@@ -1004,6 +1084,19 @@ func start() -> void:
 		prefabs_thumbnails = PrefabsThumbnailsScript.new()
 		prefabs_thumbnails._g = Global
 		prefabs_thumbnails.initialize()
+
+	# PrefabWalls is loaded regardless of its toggle: it reads the setting at
+	# runtime, so it can be switched on/off without a restart.
+	if _debug_enabled("prefab_walls"):
+		PrefabWallsScript = ResourceLoader.load(Global.Root + "scripts/prefab_walls.gd", "GDScript", true)
+		if PrefabWallsScript != null:
+			prefab_walls = PrefabWallsScript.new()
+		if prefab_walls != null:
+			prefab_walls._g = Global
+			prefab_walls.ui_util = ui_util
+			prefab_walls.initialize()
+		else:
+			print("[UnofficialPatch] PrefabWalls could not be loaded.")
 
 	if mod_settings == null or mod_settings.is_enabled("save_reminder"):
 		_load_save_reminder()
@@ -1027,6 +1120,14 @@ func start() -> void:
 		text_select_style._g = Global
 		text_select_style.text_transform = text_transform
 		text_select_style.initialize()
+
+	if _debug_enabled("text_style_extra"):
+		TextStyleExtraScript = ResourceLoader.load(Global.Root + "scripts/text_style_extra.gd", "GDScript", true)
+		text_style_extra = TextStyleExtraScript.new()
+		text_style_extra._g = Global
+		text_style_extra.text_transform = text_transform
+		text_style_extra.text_select_style = text_select_style
+		text_style_extra.initialize()
 
 	if _debug_enabled("scale_unlock"):
 		ScaleUnlockScript = ResourceLoader.load(Global.Root + "scripts/scale_unlock.gd", "GDScript", true)
@@ -1116,6 +1217,9 @@ func start() -> void:
 	if mod_settings == null or mod_settings.is_enabled("slider_scroll_fix"):
 		_load_slider_scroll_fix()
 
+	if mod_settings == null or mod_settings.is_enabled("export_snap_crop"):
+		_load_export_snap_crop()
+
 	if mod_settings == null or mod_settings.is_enabled("rotation_slider"):
 		_load_select_rotation()
 
@@ -1164,10 +1268,12 @@ func start() -> void:
 		right_click_util = RightClickUtilScript.new()
 		right_click_util._g = Global
 		right_click_util.ui_util = ui_util
+		# Menu order and divider groups (see right_click_util.register):
+		# favorites | free transform | prefabs + groups | rotate | clipboard
 		if favorites != null:
-			right_click_util.register(favorites)
+			right_click_util.register(favorites, 10, 0, "")
 		if group_assets != null:
-			right_click_util.register(group_assets)
+			right_click_util.register(group_assets, 40, 2, "rcm_groups")
 		# FTContext: always loaded, provides the "Free Transform" item of
 		# the context menu even when Favorite Assets is disabled.
 		var FTContextScript = ResourceLoader.load(Global.Root + "scripts/ft_context.gd", "GDScript", true)
@@ -1176,7 +1282,7 @@ func start() -> void:
 			ft_context._g = Global
 			ft_context.free_transform = free_transform
 			ft_context.initialize()
-			right_click_util.register(ft_context)
+			right_click_util.register(ft_context, 20, 1, "rcm_free_transform")
 		# RotateContext: adds "Rotate 90°" to the context menu and neutralizes
 		# the auto-rotation on right-click from the third-party mod
 		# RotateAndJiggle (Jiggle.gd), which fired at the same time as our menu.
@@ -1185,7 +1291,18 @@ func start() -> void:
 			rotate_context = RotateContextScript.new()
 			rotate_context._g = Global
 			rotate_context.initialize()
-			right_click_util.register(rotate_context)
+			right_click_util.register(rotate_context, 50, 3, "rcm_rotate")
+		# PrefabContext: adds "Make Prefab" / "Separate Prefab" to the context
+		# menu. DD only exposes them as panel buttons, and its Make Prefab one
+		# is greyed out for selections without a transform box (walls only).
+		if _debug_enabled("prefab_context"):
+			PrefabContextScript = ResourceLoader.load(Global.Root + "scripts/prefab_context.gd", "GDScript", true)
+			if PrefabContextScript != null:
+				prefab_context = PrefabContextScript.new()
+			if prefab_context != null:
+				prefab_context._g = Global
+				prefab_context.initialize()
+				right_click_util.register(prefab_context, 30, 2, "rcm_prefabs")
 		# ClipboardContext: adds Copy / Cut / Paste / Paste in Place / Delete
 		# to the context menu (selection items when there is a selection,
 		# paste items when the clipboard holds something, incl. right-click in
@@ -1197,7 +1314,7 @@ func start() -> void:
 				clipboard_context._g = Global
 				clipboard_context.clipboard_fix = clipboard_fix
 				clipboard_context.initialize()
-				right_click_util.register(clipboard_context)
+				right_click_util.register(clipboard_context, 60, 4, "rcm_clipboard")
 		right_click_util.initialize()
 		print("[UnofficialPatch] RightClickUtil loaded.")
 
@@ -1231,6 +1348,10 @@ func start() -> void:
 	# so the user doesn't have to re-click the items they were working on.
 	if mod_settings == null or mod_settings.is_enabled("undo_preserves_selection"):
 		_load_preserve_selection_undo()
+
+	# ZOrderUndo — make Bring to Front / Send to Back undoable (needs undo_lib).
+	if mod_settings == null or mod_settings.is_enabled("zorder_undo"):
+		_load_zorder_undo()
 
 	# Load SplitPath only if not already loaded as a standalone mod
 	var _sp_already_loaded = false  # our improved version takes priority
@@ -1654,6 +1775,36 @@ func _on_slider_scroll_fix_toggled(enabled) -> void:
 		_unload_slider_scroll_fix()
 
 
+# --- ExportSnapCrop / Export Window - Snap Toggle ---
+func _load_export_snap_crop() -> void:
+	if export_snap_crop != null:
+		return
+	if _debug_enabled("export_snap_crop"):
+		ExportSnapCropScript = ResourceLoader.load(Global.Root + "scripts/export_snap_crop.gd", "GDScript", true)
+	if ExportSnapCropScript == null:
+		return
+	export_snap_crop = ExportSnapCropScript.new()
+	export_snap_crop._g = Global
+	export_snap_crop.initialize()
+	print("[UnofficialPatch] ExportSnapCrop loaded.")
+
+
+func _unload_export_snap_crop() -> void:
+	if export_snap_crop == null:
+		return
+	if export_snap_crop.has_method("cleanup"):
+		export_snap_crop.cleanup()
+	export_snap_crop = null
+	print("[UnofficialPatch] ExportSnapCrop unloaded.")
+
+
+func _on_export_snap_crop_toggled(enabled) -> void:
+	if enabled:
+		_load_export_snap_crop()
+	else:
+		_unload_export_snap_crop()
+
+
 # --- SelectRotation / Rotation Slider ---
 func _load_select_rotation() -> void:
 	if select_rotation != null:
@@ -1716,6 +1867,36 @@ func _on_undo_preserves_selection_toggled(enabled) -> void:
 		_unload_preserve_selection_undo()
 
 
+# --- ZOrderUndo / Undo for Bring to Front / Send to Back ---
+func _load_zorder_undo() -> void:
+	if zorder_undo != null:
+		return
+	if _debug_enabled("zorder_undo"):
+		ZOrderUndoScript = ResourceLoader.load(Global.Root + "scripts/zorder_undo.gd", "GDScript", true)
+	if ZOrderUndoScript == null:
+		return
+	zorder_undo = ZOrderUndoScript.new()
+	zorder_undo._g = Global
+	zorder_undo.initialize()
+	print("[UnofficialPatch] ZOrderUndo loaded.")
+
+
+func _unload_zorder_undo() -> void:
+	if zorder_undo == null:
+		return
+	if zorder_undo.has_method("cleanup"):
+		zorder_undo.cleanup()
+	zorder_undo = null
+	print("[UnofficialPatch] ZOrderUndo unloaded.")
+
+
+func _on_zorder_undo_toggled(enabled) -> void:
+	if enabled:
+		_load_zorder_undo()
+	else:
+		_unload_zorder_undo()
+
+
 # --- GroupAssets ---
 func _load_group_assets() -> void:
 	if group_assets != null:
@@ -1732,7 +1913,7 @@ func _load_group_assets() -> void:
 	# at boot before right_click_util.initialize, but on a hot-toggle we
 	# are post-boot so we register at runtime).
 	if right_click_util != null and right_click_util.has_method("register"):
-		right_click_util.register(group_assets)
+		right_click_util.register(group_assets, 40, 2, "rcm_groups")
 	print("[UnofficialPatch] GroupAssets loaded.")
 
 
@@ -2280,6 +2461,7 @@ func update(delta) -> void:
 	_pu("select_fix", select_fix, delta)
 	_pu("scatter_multiselect_fix", scatter_multiselect_fix, delta)
 	_pu("scatter_transform", scatter_transform, delta)
+	_pu("scatter_path_spacing", scatter_path_spacing, delta)
 	_pu("select_cursor_fix", select_cursor_fix, delta)
 	_pu("select_highlight_fix", select_highlight_fix, delta)
 	_pu("drag_select_focus_fix", drag_select_focus_fix, delta)
@@ -2306,9 +2488,13 @@ func update(delta) -> void:
 	_pu("pattern_curve_edit", pattern_curve_edit, delta)
 	_pu("edit_points_undo", edit_points_undo, delta)
 	_pu("preserve_selection_undo", preserve_selection_undo, delta)
+	_pu("zorder_undo", zorder_undo, delta)
 	_pu("pattern_paint_bucket", pattern_paint_bucket, delta)
 	_pu("terrain_paint_bucket", terrain_paint_bucket, delta)
+	_pu("water_square_bucket", water_square_bucket, delta)
+	_pu("material_square_bucket", material_square_bucket, delta)
 	_pu("prefabs_thumbnails", prefabs_thumbnails, delta)
+	_pu("prefab_walls", prefab_walls, delta)
 	_pu("save_reminder", save_reminder, delta)
 	_pu("text_tool_fix", text_tool_fix, delta)
 	_pu("text_transform", text_transform, delta)
@@ -2318,6 +2504,7 @@ func update(delta) -> void:
 	_pu("free_transform_data_manager", free_transform_data_manager, delta)
 	_pu("no_micro_drag", no_micro_drag, delta)
 	_pu("text_select_style", text_select_style, delta)
+	_pu("text_style_extra", text_style_extra, delta)
 	_pu("split_path", split_path, delta)
 	_pu("merge_path", merge_path, delta)
 	if drag_select_walls != null:
@@ -2383,6 +2570,8 @@ func _register_debug_mods() -> void:
 		"Fixes the multi-second freeze when Shift-selecting a large\nrange of assets in the Scatter Tool's object library.")
 	debug_settings.register_mod("scatter_transform", "Scatter Manual Transform", [], "",
 		"Scatter Tool: wheel rotates the asset in hand (Z = 5\u00b0,\nShift+Z = 1\u00b0) and Alt+wheel resizes it, overriding the\nrandom rotation/scale for that object only.")
+	debug_settings.register_mod("scatter_path_spacing", "Scatter Natural Spacing", [], "",
+		"Scatter Tool: adds a 'Natural Spacing' toggle under the\nSpread slider. When on, assets drop by distance traveled\nalong the cursor path (zigzags and back-and-forth count,\noverlaps allowed) instead of the vanilla no-overlap spacing.")
 	debug_settings.register_mod("select_cursor_fix", "", [], "",
 		"Fixes the cursor staying stuck on a resize/move/rotate\nshape when leaving SelectTool via a keyboard shortcut\nwhile hovering or manipulating a transform handle.")
 	debug_settings.register_mod("select_highlight_fix", "", [], "",
@@ -2423,6 +2612,8 @@ func _register_debug_mods() -> void:
 		"Adds alignment buttons, font selector, and various\nfixes to the Text Tool.")
 	debug_settings.register_mod("text_select_style", "", [], "",
 		"Adds font, size, and color editing for selected texts\nfrom the SelectTool panel.")
+	debug_settings.register_mod("text_style_extra", "", [], "",
+		"Adds Letter Spacing and Curvature sliders to the\nText Tool and SelectTool text style panels.")
 	debug_settings.register_mod("text_transform", "", [], "",
 		"Lets you move, scale, and rotate text objects with\nthe SelectTool transform box.")
 	debug_settings.register_mod("trace_extended", "", [], "",
@@ -2449,6 +2640,10 @@ func _register_debug_mods() -> void:
 		"Expands the Terrain Brush from 8 to up to 24 terrain slots,\nwith a custom texture picker (search, favorites, All tab).")
 	debug_settings.register_mod("pattern_paint_bucket", "", [], "",
 		"Adds a flood-fill paint bucket to the Pattern Tool.")
+	debug_settings.register_mod("water_square_bucket", "Water Square & Bucket", [], "",
+		"Adds a grid-aligned square brush and a flood-fill\npaint bucket to the Water Tool.")
+	debug_settings.register_mod("material_square_bucket", "Material Square & Bucket", [], "",
+		"Adds a square brush, a flood-fill paint bucket and a\nper-material Hide Borders option to the Material Tool.")
 	debug_settings.register_mod("edit_points_toggle", "", [], "",
 		"Adds a quick toggle to switch in/out of point-edit\nmode for floor and pattern shapes.")
 	debug_settings.register_mod("right_click_util", "", [], "",
@@ -2496,10 +2691,14 @@ func _register_debug_mods() -> void:
 		"Adds collapse arrows to SelectTool panel sections so\nyou can hide controls you don't use.")
 	debug_settings.register_mod("slider_scroll_fix", "", [], "slider_scroll_fix",
 		"Mousewheel over a slider/spinbox changes its value\ninstead of scrolling the surrounding panel.")
+	debug_settings.register_mod("export_snap_crop", "", [], "export_snap_crop",
+		"Adds a 'Snap to Grid' ON/OFF toggle (+ 'S' shortcut)\nnext to Crop / Reset Crop in the Export window.")
 	debug_settings.register_mod("eyedropper", "", [], "picker_tool_enter",
 		"Pressing Enter in the Picker Tool selects the asset\nunder the cursor (instead of needing a click).")
 	debug_settings.register_mod("preserve_selection_undo", "", [], "undo_preserves_selection",
 		"Undo/redo restores the previous selection state\ninstead of clearing it.")
+	debug_settings.register_mod("zorder_undo", "", ["undo_lib"], "zorder_undo",
+		"Makes the Bring to Front / Send to Back buttons\nundoable with Ctrl+Z (vanilla skips the history).")
 	debug_settings.register_mod("light_fix", "", [], "hide_lights_transform_box",
 		"Hides the SelectTool transform box on lights (lights\nare typically positioned, not transformed).")
 	debug_settings.register_mod("light_tool_fix", "", [], "light_tool_object_like",
@@ -2508,6 +2707,8 @@ func _register_debug_mods() -> void:
 		"Lets you reposition portals along their wall while in\nEdit Points mode.")
 	debug_settings.register_mod("prefabs_thumbnails", "", [], "prefab_preview",
 		"Generates thumbnail previews for every prefab with\nmultiple display modes.")
+	debug_settings.register_mod("prefab_walls", "", ["ui_util"], "prefab_walls",
+		"Adds walls and their portals to prefabs (saving,\nghost preview and placement).")
 	debug_settings.register_mod("popup_blur", "", [], "blurred_popup_background",
 		"Blurs the editor background behind dialog popups.")
 	# Settings-tied: 1 mod = multiple settings entries (Array)
@@ -2528,6 +2729,8 @@ func _register_debug_mods() -> void:
 		"Adds 'Free Transform' to the right-click context menu\nin the SelectTool.")
 	debug_settings.register_mod("rotate_context", "Rotate Context", [], "",
 		"Adds 'Rotate 90°' to the right-click context menu and\ndisables RotateAndJiggle's right-click auto-rotation.")
+	debug_settings.register_mod("prefab_context", "Prefab Context", ["right_click_util"], "",
+		"Adds 'Make Prefab' and 'Separate Prefab' to the\nright-click context menu in the SelectTool.")
 	# Pas de depends_on sur overlay_tool : no_micro_drag ne lui emprunte que
 	# _is_mouse_on_wall() (helper de geometrie pure), sur un seul site deja
 	# null-garde. Sans overlay_tool on perd uniquement le bypass sur les walls,
