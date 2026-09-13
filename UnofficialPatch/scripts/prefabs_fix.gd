@@ -642,8 +642,17 @@ func _discover_prefab_tool_panel() -> void:
 
 
 func _on_prefab_set_selected(index: int) -> void:
-	Engine.set_meta("pfx_last_prefab_set", index)
-	print("[PrefabsFix] PrefabTool set saved: index=%d" % index)
+	# Stored by NAME: prefab_set_context can remove/rename dropdown entries,
+	# which shifts indices.
+	var panel = _g.Editor.Toolset.GetToolPanel("PrefabTool")
+	var set_option = panel.get("setOption") if panel != null else null
+	if not (set_option is OptionButton):
+		return
+	if index < 0 or index >= set_option.get_item_count():
+		return
+	var set_name = set_option.get_item_text(index)
+	Engine.set_meta("pfx_last_prefab_set", set_name)
+	print("[PrefabsFix] PrefabTool set saved: '%s'" % set_name)
 
 
 func _on_prefab_panel_visibility_changed() -> void:
@@ -652,20 +661,31 @@ func _on_prefab_panel_visibility_changed() -> void:
 		return
 	if not Engine.has_meta("pfx_last_prefab_set"):
 		return
-	var saved_index = int(Engine.get_meta("pfx_last_prefab_set"))
 	var set_option = panel.get("setOption")
 	if not (set_option is OptionButton):
 		return
-	if saved_index < set_option.get_item_count() and set_option.selected != saved_index:
-		set_option.select(saved_index)
-		var t = _g.World.get_tree().create_timer(0.05)
-		t.connect("timeout", self, "_emit_prefab_set_selected", [set_option, saved_index])
-		print("[PrefabsFix] PrefabTool set restoring: index=%d" % saved_index)
+	# Deferred: DD's Enable() and prefab_set_context's filtering both rebuild
+	# the dropdown right around now; resolve the name once things settled.
+	var t = _g.World.get_tree().create_timer(0.05)
+	t.connect("timeout", self, "_restore_prefab_set", [set_option])
 
 
-func _emit_prefab_set_selected(set_option: OptionButton, index: int) -> void:
+func _restore_prefab_set(set_option: OptionButton) -> void:
+	if not is_instance_valid(set_option) or not Engine.has_meta("pfx_last_prefab_set"):
+		return
+	var saved = Engine.get_meta("pfx_last_prefab_set")
+	if not (saved is String):
+		return
+	var index := -1
+	for i in range(set_option.get_item_count()):
+		if set_option.get_item_text(i) == saved:
+			index = i
+			break
+	if index < 0 or set_option.selected == index:
+		return
+	set_option.select(index)
 	set_option.emit_signal("item_selected", index)
-	print("[PrefabsFix] PrefabTool set restored: index=%d" % index)
+	print("[PrefabsFix] PrefabTool set restored: '%s' (index=%d)" % [saved, index])
 
 
 func _hook_select_tool_buttons() -> void:

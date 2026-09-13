@@ -580,6 +580,8 @@ var _wcov_val := false
 var _pcov_mouse := Vector2.INF
 var _pcov_id := 0
 var _pcov_val := false
+var _wcov_filter := -1
+var _pcov_filter := -1
 
 
 func _aabb_miss(node, mouse_world: Vector2, margin: float) -> bool:
@@ -599,12 +601,46 @@ func _is_path_covered(path = null) -> bool:
 		return false
 	var mouse_world = _g.WorldUI.MousePosition
 	var pid = path.get_instance_id()
-	if _pcov_mouse == mouse_world and _pcov_id == pid:
+	var fm = _filter_mask()
+	if _pcov_mouse == mouse_world and _pcov_id == pid and _pcov_filter == fm:
 		return _pcov_val
 	_pcov_mouse = mouse_world
 	_pcov_id = pid
+	_pcov_filter = fm
 	_pcov_val = _compute_path_covered(path, mouse_world)
 	return _pcov_val
+
+
+
+# ── Select Tool type filter ─────────────────────────────────────────────────
+# An element whose type is unchecked in the Select Tool FILTER popup is not
+# selectable, so it must not count as "covering" a path/wall underneath it:
+# the path/wall is what the click would pick. Outside the Select Tool the
+# filter does not apply (everything counts).
+func _filter_allows(key: String) -> bool:
+	if not _is_select_tool_active():
+		return true
+	var filter = select_tool.get("Filter")
+	if filter is Dictionary and filter.has(key):
+		return bool(filter[key])
+	return true
+
+
+# Bitmask of the current filter state, part of the coverage cache key so a
+# filter toggle invalidates the cached result without a mouse move.
+func _filter_mask() -> int:
+	if not _is_select_tool_active():
+		return -1
+	var filter = select_tool.get("Filter")
+	if not (filter is Dictionary):
+		return -1
+	var m = 0
+	var i = 0
+	for key in ["Walls", "Portals", "Objects", "Paths", "Lights", "Patterns", "Roofs"]:
+		if bool(filter.get(key, true)):
+			m |= (1 << i)
+		i += 1
+	return m
 
 
 func _compute_path_covered(path, mouse_world: Vector2) -> bool:
@@ -623,7 +659,7 @@ func _compute_path_covered(path, mouse_world: Vector2) -> bool:
 
 	# Lights (toujours rendues au sommet) : GetWidget() n'est pas accessible
 	# depuis GDScript -> detection par proximite de l'icone (petit rayon).
-	var lights = level.get("Lights")
+	var lights = level.get("Lights") if _filter_allows("Lights") else null
 	if lights != null:
 		for light in lights.get_children():
 			if light == null or not is_instance_valid(light):
@@ -634,7 +670,7 @@ func _compute_path_covered(path, mouse_world: Vector2) -> bool:
 				return true
 
 	# Roofs
-	var roofs = level.get("Roofs")
+	var roofs = level.get("Roofs") if _filter_allows("Roofs") else null
 	if roofs != null:
 		for roof in roofs.get_children():
 			if roof == null or not is_instance_valid(roof) or not (roof is CanvasItem):
@@ -643,7 +679,7 @@ func _compute_path_covered(path, mouse_world: Vector2) -> bool:
 				return true
 
 	# Portals libres
-	var portals = level.get("Portals")
+	var portals = level.get("Portals") if _filter_allows("Portals") else null
 	if portals != null:
 		for portal in portals.get_children():
 			if portal == null or not is_instance_valid(portal) or not (portal is CanvasItem):
@@ -651,13 +687,15 @@ func _compute_path_covered(path, mouse_world: Vector2) -> bool:
 			if portal.has_method("IsMouseWithin") and portal.IsMouseWithin() and _is_above_z(portal, 2, pz):
 				return true
 
-	# Objects : PIXEL-PERFECT
-	var objs = level.get("Objects")
+	# Objects : PIXEL-PERFECT (type filter + per-layer object filter)
+	var objs = level.get("Objects") if _filter_allows("Objects") else null
 	if objs != null:
 		for child in objs.get_children():
 			if child == null or not is_instance_valid(child) or child == path:
 				continue
 			if _aabb_miss(child, mouse_world, 8.0):
+				continue
+			if _is_select_tool_active() and _layer_pick_blocked(child):
 				continue
 			var spr = child.get("Sprite")
 			if spr == null or not is_instance_valid(spr) or not spr.has_method("is_pixel_opaque"):
@@ -666,7 +704,7 @@ func _compute_path_covered(path, mouse_world: Vector2) -> bool:
 				return true
 
 	# Walls
-	var walls = level.get("Walls")
+	var walls = level.get("Walls") if _filter_allows("Walls") else null
 	if walls != null:
 		for wall in walls.get_children():
 			if wall == null or not is_instance_valid(wall) or not (wall is CanvasItem):
@@ -680,7 +718,7 @@ func _compute_path_covered(path, mouse_world: Vector2) -> bool:
 
 	# PatternShapes : imbriques (PatternShapes.Layers[key] non accessible depuis
 	# GDScript) -> on descend recursivement et on lit le calque via GetLayer().
-	var ps = level.get("PatternShapes")
+	var ps = level.get("PatternShapes") if _filter_allows("Patterns") else null
 	if ps != null and _scan_patterns(ps, pz, 0):
 		return true
 	return false
@@ -691,10 +729,12 @@ func _is_wall_covered(wall) -> bool:
 		return false
 	var mouse_world = _g.WorldUI.MousePosition
 	var wid = wall.get_instance_id()
-	if _wcov_mouse == mouse_world and _wcov_id == wid:
+	var fm = _filter_mask()
+	if _wcov_mouse == mouse_world and _wcov_id == wid and _wcov_filter == fm:
 		return _wcov_val
 	_wcov_mouse = mouse_world
 	_wcov_id = wid
+	_wcov_filter = fm
 	_wcov_val = _compute_wall_covered(wall, mouse_world)
 	return _wcov_val
 
@@ -711,7 +751,7 @@ func _compute_wall_covered(wall, mouse_world: Vector2) -> bool:
 	var wall_rank = 3  # rang visuel du Wall
 
 	# Lights (toujours au sommet)
-	var lights = level.get("Lights")
+	var lights = level.get("Lights") if _filter_allows("Lights") else null
 	if lights != null:
 		for light in lights.get_children():
 			if light == null or not is_instance_valid(light):
@@ -722,7 +762,7 @@ func _compute_wall_covered(wall, mouse_world: Vector2) -> bool:
 				return true
 
 	# Roofs
-	var roofs = level.get("Roofs")
+	var roofs = level.get("Roofs") if _filter_allows("Roofs") else null
 	if roofs != null:
 		for roof in roofs.get_children():
 			if roof == null or not is_instance_valid(roof) or not (roof is CanvasItem):
@@ -731,7 +771,7 @@ func _compute_wall_covered(wall, mouse_world: Vector2) -> bool:
 				return true
 
 	# Portals libres
-	var portals = level.get("Portals")
+	var portals = level.get("Portals") if _filter_allows("Portals") else null
 	if portals != null:
 		for portal in portals.get_children():
 			if portal == null or not is_instance_valid(portal) or not (portal is CanvasItem):
@@ -739,13 +779,15 @@ func _compute_wall_covered(wall, mouse_world: Vector2) -> bool:
 			if portal.has_method("IsMouseWithin") and portal.IsMouseWithin() and _is_above_z(portal, 2, wz, wall_rank):
 				return true
 
-	# Objects : PIXEL-PERFECT
-	var objs = level.get("Objects")
+	# Objects : PIXEL-PERFECT (type filter + per-layer object filter)
+	var objs = level.get("Objects") if _filter_allows("Objects") else null
 	if objs != null:
 		for child in objs.get_children():
 			if child == null or not is_instance_valid(child):
 				continue
 			if _aabb_miss(child, mouse_world, 8.0):
+				continue
+			if _is_select_tool_active() and _layer_pick_blocked(child):
 				continue
 			var spr = child.get("Sprite")
 			if spr == null or not is_instance_valid(spr) or not spr.has_method("is_pixel_opaque"):
@@ -754,7 +796,7 @@ func _compute_wall_covered(wall, mouse_world: Vector2) -> bool:
 				return true
 
 	# Autres walls au-dessus (calque dominant ; meme calque ne couvre pas)
-	var walls = level.get("Walls")
+	var walls = level.get("Walls") if _filter_allows("Walls") else null
 	if walls != null:
 		for w in walls.get_children():
 			if w == null or not is_instance_valid(w) or w == wall or not (w is CanvasItem):
@@ -769,7 +811,7 @@ func _compute_wall_covered(wall, mouse_world: Vector2) -> bool:
 	# Pathways : hit-test fiable via overlay_tool. Le wall est rendu au-dessus
 	# des paths a calque egal -> un path ne couvre que sur un calque superieur.
 	if overlay_tool != null and is_instance_valid(overlay_tool) \
-	and overlay_tool.has_method("_is_mouse_on_path"):
+	and overlay_tool.has_method("_is_mouse_on_path") and _filter_allows("Paths"):
 		var pathways = level.get("Pathways")
 		if pathways != null:
 			for line in pathways.get_children():
@@ -781,7 +823,7 @@ func _compute_wall_covered(wall, mouse_world: Vector2) -> bool:
 					return true
 
 	# PatternShapes (calque dominant uniquement, rang < Wall)
-	var ps2 = level.get("PatternShapes")
+	var ps2 = level.get("PatternShapes") if _filter_allows("Patterns") else null
 	if ps2 != null and _scan_patterns(ps2, wz, 0, wall_rank):
 		return true
 	return false
@@ -870,7 +912,16 @@ func _fix_dd_highlight() -> void:
 	var hl = select_tool.get("highlighted")
 	if hl == null or not is_instance_valid(hl):
 		_clear_pattern_highlight()
-		_unforce_path_widget()
+		# DD highlights nothing here (typically: the cursor is on a pattern
+		# that is unchecked in the FILTER, off the path's center line). If a
+		# path is under the cursor and not covered by a selectable element,
+		# it IS what a click picks: show its native widget so the user gets a
+		# visual cue (the overlay does it itself when active).
+		if not _is_path_covered(_hovered_path) and not _paths_overlay_active() \
+		and not _is_thing_selected(_hovered_path):
+			_force_path_widget(_hovered_path)
+		else:
+			_unforce_path_widget()
 		return
 	var t = hl.get("Thing")
 	if t == null or not is_instance_valid(t):
@@ -1234,6 +1285,10 @@ func _topmost_pattern_above(path):
 	# Renvoie le PatternShape (Polygon2D) le plus haut dessine au-dessus du path
 	# sous le curseur, ou null.
 	if path == null or not is_instance_valid(path) or not (path is CanvasItem):
+		return null
+	# Patterns unchecked in the Select Tool filter are not selectable: never
+	# redirect a path/wall pick (or its hover box) to one of them.
+	if not _filter_allows("Patterns"):
 		return null
 	var level = _g.World.GetCurrentLevel()
 	if level == null:

@@ -513,14 +513,16 @@ func _ob_matches_levels(ob) -> bool:
 	return true
 
 
+# Select by INDEX, not by label: two levels may share the same name, and a
+# label match would always pick the first one. The dropdown lists levels in
+# the same order as World.levels (see _ob_matches_levels), so the index maps 1:1.
 func _switch_via_dropdown(lvl) -> bool:
 	var ob = _find_level_dropdown()
 	if ob == null:
 		return false
-	var target = str(lvl.Label)
-	for i in range(ob.get_item_count()):
-		if ob.get_item_text(i) == target:
-			ob.select(i)
-			ob.emit_signal("item_selected", i)
-			return true
-	return false
+	var idx = _level_index(lvl)
+	if idx < 0 or idx >= ob.get_item_count():
+		return false
+	ob.select(idx)
+	ob.emit_signal("item_selected", idx)
+	return true

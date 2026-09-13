@@ -225,12 +225,18 @@ func _store_copy_ft_data() -> void:
 			data["crop_soft"] = _g.ModMapData["_ft_crop_soft"][key]
 		if _g.ModMapData.has("_ft_crop_feather") and _g.ModMapData["_ft_crop_feather"].has(key):
 			data["crop_feather"] = _g.ModMapData["_ft_crop_feather"][key]
+		if _g.ModMapData.has("_ft_crop_opacity") and _g.ModMapData["_ft_crop_opacity"].has(key):
+			data["crop_opacity"] = _g.ModMapData["_ft_crop_opacity"][key]
+		# Edge Crop (props simples) : réglages paramétriques, rien à décaler.
+		if _g.ModMapData.has("_ft_edgecrop") and _g.ModMapData["_ft_edgecrop"].has(key):
+			data["edgecrop"] = _g.ModMapData["_ft_edgecrop"][key].duplicate()
+		# Blur (props simples) : {r, m, a}, indépendant de la position.
+		if _g.ModMapData.has("_ft_blur") and _g.ModMapData["_ft_blur"].has(key):
+			data["blur"] = _g.ModMapData["_ft_blur"][key].duplicate()
 
-		if data.has("distort"):
-			pass
 		if data.has("shear") or data.has("distort") or data.has("pattern_orig") \
 				or data.has("pattern_orig_pos") or data.has("pattern_reset") or data.has("pattern_world") \
-				or data.has("crop"):
+				or data.has("crop") or data.has("edgecrop") or data.has("blur"):
 			_copied_ft[type].append(data)
 			found += 1
 		count[type] += 1
@@ -345,6 +351,20 @@ func _apply_ft_to_pasted_nodes(from_id: int, to_id: int, attempt: int = 0) -> vo
 					if not _g.ModMapData.has("_ft_crop_feather"):
 						_g.ModMapData["_ft_crop_feather"] = {}
 					_g.ModMapData["_ft_crop_feather"][new_key] = data["crop_feather"]
+				if data.has("crop_opacity"):
+					if not _g.ModMapData.has("_ft_crop_opacity"):
+						_g.ModMapData["_ft_crop_opacity"] = {}
+					_g.ModMapData["_ft_crop_opacity"][new_key] = data["crop_opacity"]
+			if data.has("edgecrop"):
+				# free_transform (_restore_edgecrop_from_store) re-cuira la texture.
+				if not _g.ModMapData.has("_ft_edgecrop"):
+					_g.ModMapData["_ft_edgecrop"] = {}
+				_g.ModMapData["_ft_edgecrop"][new_key] = data["edgecrop"].duplicate()
+			if data.has("blur"):
+				# free_transform (_restore_blur_from_store) installe le material.
+				if not _g.ModMapData.has("_ft_blur"):
+					_g.ModMapData["_ft_blur"] = {}
+				_g.ModMapData["_ft_blur"][new_key] = data["blur"].duplicate()
 			# NE PAS stocker pattern_world ici — _restore_distort_from_store
 			# le recalcule depuis distort + node.position actuel.
 
@@ -415,7 +435,8 @@ func _copy_ft_data_to_new_level(source_level_index: int) -> void:
 	var store_keys = [
 		"_ft_transforms", "_ft_distort",
 		"_ft_pattern_orig", "_ft_pattern_orig_pos", "_ft_pattern_reset", "_ft_pattern_world",
-		"_ft_crop", "_ft_crop_soft", "_ft_crop_feather",
+		"_ft_crop", "_ft_crop_soft", "_ft_crop_feather", "_ft_crop_opacity",
+		"_ft_edgecrop", "_ft_blur",
 	]
 
 	for store_name in store_keys:

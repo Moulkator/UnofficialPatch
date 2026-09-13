@@ -49,7 +49,10 @@ var _st_synced_sig := ""
 
 var _syncing := false
 var _drag_snapshot = null      # [[nid, iid, spacing, curve], ...] at drag start
+var _slider_dragging := false  # true between drag_started / drag_ended on any slider
+var _commit_scheduled := false # deferred undo commit pending (spinbox / wheel / reset)
 var _save_btn_connected := false
+var text_tool_fix = null       # injected by Main.gd (anchor update after recentering)
 
 
 func initialize():
@@ -98,8 +101,10 @@ func _build_text_panel_ui(align):
 		align.move_child(row2[0], insert_idx + 1)
 	_tt_spacing.connect("value_changed", self, "_on_slider_changed", ["tt"])
 	_tt_curve.connect("value_changed", self, "_on_slider_changed", ["tt"])
-	_tt_spacing.connect("drag_ended", self, "_on_drag_ended")
-	_tt_curve.connect("drag_ended", self, "_on_drag_ended")
+	_connect_slider_drag(_tt_spacing)
+	_connect_slider_drag(_tt_curve)
+	row1[2].connect("pressed", self, "_on_reset_pressed", ["tt", "spacing"])
+	row2[2].connect("pressed", self, "_on_reset_pressed", ["tt", "curve"])
 	_tt_setup_done = true
 	print("[TextStyleExtra] Text Tool panel UI injected")
 
@@ -126,8 +131,10 @@ func _try_setup_select_panel():
 	_st_rows = [row1[0], row2[0]]
 	_st_spacing.connect("value_changed", self, "_on_slider_changed", ["st"])
 	_st_curve.connect("value_changed", self, "_on_slider_changed", ["st"])
-	_st_spacing.connect("drag_ended", self, "_on_drag_ended")
-	_st_curve.connect("drag_ended", self, "_on_drag_ended")
+	_connect_slider_drag(_st_spacing)
+	_connect_slider_drag(_st_curve)
+	row1[2].connect("pressed", self, "_on_reset_pressed", ["st", "spacing"])
+	row2[2].connect("pressed", self, "_on_reset_pressed", ["st", "curve"])
 	_st_setup_done = true
 	print("[TextStyleExtra] Select Tool panel UI injected")
 
@@ -147,7 +154,64 @@ func _make_slider_row(label_text: String, vmin: float, vmax: float, step: float)
 	slider.size_flags_vertical = Control.SIZE_SHRINK_CENTER
 	slider.focus_mode = Control.FOCUS_NONE  # never steal focus from the LineEdit
 	row.add_child(slider)
-	return [row, slider]
+	# SpinBox sharing the slider's Range (value/min/max/step stay in sync both ways)
+	var spin = SpinBox.new()
+	spin.rect_min_size = Vector2(58, 0)
+	spin.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	slider.share(spin)
+	row.add_child(spin)
+	var reset = Button.new()
+	reset.icon = _load_icon("icons/reset.png", 0.5)
+	reset.hint_tooltip = "Reset to 0"
+	reset.focus_mode = Control.FOCUS_NONE
+	reset.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	row.add_child(reset)
+	return [row, slider, reset, spin]
+
+
+func _load_icon(icon_path: String, scale: float = 1.0) -> ImageTexture:
+	var image = Image.new()
+	image.load(_g.Root + icon_path)
+	if scale != 1.0:
+		image.resize(int(image.get_width() * scale), int(image.get_height() * scale), Image.INTERPOLATE_LANCZOS)
+	var texture = ImageTexture.new()
+	texture.create_from_image(image)
+	return texture
+
+
+func _connect_slider_drag(slider: HSlider) -> void:
+	slider.connect("drag_started", self, "_on_drag_started")
+	slider.connect("drag_ended", self, "_on_drag_ended")
+
+
+func _on_drag_started() -> void:
+	_slider_dragging = true
+
+
+func _on_reset_pressed(which: String, prop: String) -> void:
+	var slider = null
+	if prop == "spacing":
+		slider = _tt_spacing if which == "tt" else _st_spacing
+	else:
+		slider = _tt_curve if which == "tt" else _st_curve
+	if slider != null and slider.value != 0:
+		slider.value = 0  # value_changed -> _on_slider_changed -> deferred commit
+
+
+# Undo commit for value changes that are not part of a slider drag
+# (SpinBox typing/arrows, mouse wheel on the slider, reset button).
+func _schedule_commit() -> void:
+	if _commit_scheduled:
+		return
+	_commit_scheduled = true
+	call_deferred("_deferred_commit")
+
+
+func _deferred_commit() -> void:
+	_commit_scheduled = false
+	if _slider_dragging:
+		return
+	_on_drag_ended(true)
 
 
 # ── Target resolution ────────────────────────────────────────────────────────
@@ -214,14 +278,14 @@ func _on_slider_changed(_value, which: String):
 		_drag_snapshot = []
 		for t in targets:
 			var st = _get_style(t.get_instance_id())
-			_drag_snapshot.append([_get_node_id(t), t.get_instance_id(), st["spacing"], st["curve"]])
+			_drag_snapshot.append([_get_node_id(t), t.get_instance_id(), st["spacing"], st["curve"], _get_pos(t)])
 	var spacing = int((_tt_spacing if which == "tt" else _st_spacing).value)
 	var curve = float((_tt_curve if which == "tt" else _st_curve).value)
 	if which == "tt":
 		_default_spacing = spacing
 		_default_curve = curve
 	for t in targets:
-		_styles[t.get_instance_id()] = {"spacing": spacing, "curve": curve}
+		_apply_style_centered(t, {"spacing": spacing, "curve": curve})
 	# Mirror the other panel's sliders
 	_syncing = true
 	if which == "tt" and _st_setup_done:
@@ -231,9 +295,12 @@ func _on_slider_changed(_value, which: String):
 		_tt_spacing.value = spacing
 		_tt_curve.value = curve
 	_syncing = false
+	if not _slider_dragging:
+		_schedule_commit()
 
 
 func _on_drag_ended(value_changed: bool):
+	_slider_dragging = false
 	if not value_changed or _drag_snapshot == null:
 		_drag_snapshot = null
 		return
@@ -246,7 +313,7 @@ func _on_drag_ended(value_changed: bool):
 			st = _get_style(e[1])
 		if st == null:
 			continue
-		after.append([e[0], e[1], st["spacing"], st["curve"]])
+		after.append([e[0], e[1], st["spacing"], st["curve"], _get_pos(instance_from_id(e[1]))])
 	var undo = _g.ModMapData.get("_undo_lib") if _g.ModMapData is Dictionary else null
 	if undo != null and after.size() > 0:
 		undo.record_callback(self, "_undo_apply", [before], self, "_undo_apply", [after])
@@ -259,7 +326,50 @@ func _undo_apply(entries: Array) -> void:
 		if t == null:
 			continue
 		_styles[t.get_instance_id()] = {"spacing": int(e[2]), "curve": float(e[3])}
+		_enforce_style(t, _styles[t.get_instance_id()])
+		if e.size() > 4 and e[4] is Vector2 and t is Control:
+			t.rect_position = e[4]
+			_after_reposition(t)
 	_write_mod_map_data()
+
+
+func _get_pos(t):
+	if t != null and is_instance_valid(t) and t is Control:
+		return t.rect_position
+	return null
+
+
+# Applies a style so that a spacing change grows/shrinks the text from its
+# center instead of its left edge: the width delta is compensated by shifting
+# rect_position along the text's local X axis.
+func _apply_style_centered(t: Node, st: Dictionary) -> void:
+	var iid = t.get_instance_id()
+	if not (t is Control):
+		_styles[iid] = st
+		return
+	var old_w = t.rect_size.x * t.rect_scale.x
+	_styles[iid] = st
+	_enforce_style(t, st)  # rect_size = ZERO re-fits the LineEdit synchronously
+	var dw = t.rect_size.x * t.rect_scale.x - old_w
+	if abs(dw) < 0.01:
+		return
+	t.rect_position += Vector2(-dw * 0.5, 0).rotated(deg2rad(t.rect_rotation))
+	_after_reposition(t)
+
+
+# Keeps DD's dataOnFocus and text_tool_fix's alignment anchor consistent with
+# a position we changed ourselves (otherwise they would snap the text back).
+func _after_reposition(t: Control) -> void:
+	var dof = t.get("dataOnFocus")
+	if dof is Dictionary and dof.has("position"):
+		dof["position"] = t.rect_position
+		t.set("dataOnFocus", dof)
+	if text_tool_fix != null:
+		var anchors = text_tool_fix.get("_anchors")
+		var iid = t.get_instance_id()
+		if anchors is Dictionary and anchors.has(iid):
+			var mode = int(anchors[iid]["mode"])
+			anchors[iid]["x"] = text_tool_fix._anchor_x_from_rect_mode(t, mode)
 
 
 func _resolve_text(nid, iid: int):

@@ -311,7 +311,12 @@ func _UNUSED() -> void:
 func _reindex_current_set() -> void:
 	var set_key = _find_set_key(_current_set_name)
 	if set_key == "":
-		return
+		# Set unknown to the startup index (created or renamed in-session by
+		# prefab_set_context): index it now.
+		_build_prefab_index()
+		set_key = _find_set_key(_current_set_name)
+		if set_key == "":
+			return
 	for root in ["user://prefabs", "res://prefabs"]:
 		var sub = Directory.new()
 		if sub.open(root + "/" + set_key) != OK:

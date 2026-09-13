@@ -182,6 +182,16 @@ func _get_active_drawing_tool():
 		
 		return tool
 	
+	# Better Terrain Tool (standalone mod): its Draw mode drives WorldUI's
+	# native polyline exactly like a ShapeTool, but the tool lives outside
+	# editor.Tools. It publishes its impl in Engine metadata and exposes
+	# the same duck-typed surface (isDrawing + FinishShape()), so the
+	# pattern-shape code path applies as-is.
+	if Engine.has_meta("BetterTerrainTool.impl"):
+		var btt = Engine.get_meta("BetterTerrainTool.impl")
+		if btt != null and btt.get("isDrawing") == true:
+			return btt
+	
 	return null
 
 

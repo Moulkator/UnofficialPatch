@@ -155,6 +155,15 @@ func is_mouse_over_blocking_window() -> bool:
 
 
 func _on_right_click() -> void:
+	# Right-click inside a textbox: the LineEdit/TextEdit shows its own native
+	# copy/paste menu, ours must not stack on top of it. update() polls the RAW
+	# mouse state, so the GUI consuming the click cannot stop us — we check the
+	# focus owner instead. Godot processed the click (focus grab + native menu)
+	# during input handling, BEFORE this _process poll, so the focused control
+	# already tells us the click belongs to the textbox.
+	if _is_mouse_in_text_edit():
+		return
+
 	# A mod dialog (Map Gallery and friends) is under the cursor: it handles
 	# its own right-click menu, we must stay out of the way.
 	if is_mouse_over_blocking_window():
@@ -318,6 +327,30 @@ func _on_popup_closed() -> void:
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
+# True when the right-click landed inside a focused text-editing control.
+# Focus owner is read through the SelectTool panel (any Control of the editor
+# UI viewport works — get_focus_owner() is viewport-wide). The mouse-inside-
+# rect test uses local coordinates, like is_mouse_over_blocking_window(), so
+# UI scaling cannot skew it. A textbox merely KEEPING focus while the user
+# right-clicks elsewhere on the map does not suppress the menu (rect test).
+func _is_mouse_in_text_edit() -> bool:
+	if _g == null or _g.get("Editor") == null:
+		return false
+	var editor = _g.Editor
+	if not is_instance_valid(editor) or editor.get("Toolset") == null:
+		return false
+	var panel = editor.Toolset.GetToolPanel("SelectTool")
+	if panel == null or not is_instance_valid(panel) or not panel.is_inside_tree():
+		return false
+	var focus = panel.get_focus_owner()
+	if focus == null or not is_instance_valid(focus):
+		return false
+	if not (focus is LineEdit or focus is TextEdit):
+		return false
+	if not focus.is_visible_in_tree():
+		return false
+	return Rect2(Vector2.ZERO, focus.rect_size).has_point(focus.get_local_mouse_position())
 
 func _get_select_tool():
 	if not _g.Editor or not is_instance_valid(_g.Editor):

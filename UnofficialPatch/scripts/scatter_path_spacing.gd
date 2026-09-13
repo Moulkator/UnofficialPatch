@@ -137,21 +137,10 @@ var _warned_no_next := false
 var _mu_mirror_btn = null
 var _mu_btn_frame := -100
 
-# [DIAG] instrumentation — printed once per distinct reason/state change.
-var _diag_last := {}
-
-
-func _diag(key: String, msg: String) -> void:
-	if _diag_last.get(key, "") == msg:
-		return
-	_diag_last[key] = msg
-	printerr("[DIAG][SPS] " + msg)
-
 
 func initialize() -> void:
 	_install_input_listener()
 	print("[ScatterPathSpacing] Initialized.")
-	printerr("[DIAG][SPS] diagnostic build active")
 
 
 func update(_delta) -> void:
@@ -281,28 +270,21 @@ func _on_input(event) -> void:
 	if event.button_index != BUTTON_LEFT or not event.pressed:
 		return
 	if not _enabled:
-		_diag("press", "press: ignored, toggle is OFF")
 		return
 	# Ctrl+LMB is vanilla's early-out; leave it alone.
 	if event.control or Input.is_key_pressed(KEY_CONTROL):
-		_diag("press", "press: ignored, Ctrl held")
 		return
 	if _active_tool_name() != "ScatterTool":
-		_diag("press", "press: ignored, active tool = '%s'" % _active_tool_name())
 		return
 	# UI guard: geometry-only variant + explicit popup hit-test, same
 	# rationale as scatter_transform.gd (tooltips are Popups in Godot 3).
 	if ui_util != null:
 		if ui_util.is_mouse_over_popup(input_listener):
-			_diag("press", "press: ignored, popup under cursor")
 			return
 		if ui_util.is_mouse_over_ui(input_listener, true):
-			_diag("press", "press: ignored, cursor over UI")
 			return
 	if _g.World == null or not is_instance_valid(_g.World):
-		_diag("press", "press: ignored, World invalid")
 		return
-	_diag("press", "press: guards passed, starting stroke")
 
 	if _begin_stroke():
 		# Consumed: vanilla never sees the press, so isDrawing stays false
@@ -315,9 +297,7 @@ func _on_input(event) -> void:
 func _begin_stroke() -> bool:
 	var st = _get_scatter_tool()
 	if st == null:
-		_diag("begin", "begin: ScatterTool not reachable")
 		return false
-	printerr("[DIAG][SPS] begin: has_method(Next)=%s" % str(st.has_method("Next")))
 	if not st.has_method("Next"):
 		# Capability gate BEFORE any mutation: without Next() we cannot
 		# rebuild the preview after a stamp, so fall through to vanilla.
@@ -326,11 +306,9 @@ func _begin_stroke() -> bool:
 			printerr("[ScatterPathSpacing] ScatterTool.Next() is not callable in this DD build; Path Spacing disabled, vanilla behavior kept.")
 		return false
 	if _get_preview(st) == null:
-		_diag("begin", "begin: no usable Preview (null or no Texture)")
 		return false
 	var ui = _get_world_ui()
 	if ui == null:
-		_diag("begin", "begin: WorldUI not reachable")
 		return false
 
 	_stroke_entries = []
@@ -362,7 +340,6 @@ func _on_stroke_motion() -> void:
 		return
 	var spacing = _spacing(st, pos)
 	if _accum >= spacing:
-		printerr("[DIAG][SPS] motion: accum=%.1f >= spacing=%.1f, stamping" % [_accum, spacing])
 		if _stamp(st):
 			# Carry the remainder so drops stay evenly spaced along the path.
 			_accum = max(_accum - spacing, 0.0)
@@ -374,7 +351,6 @@ func _on_stroke_motion() -> void:
 
 func _finalize_stroke() -> void:
 	_stroke_active = false
-	printerr("[DIAG][SPS] finalize: %d entries" % _stroke_entries.size())
 	if _stroke_entries.empty():
 		return
 	var entries = _stroke_entries
@@ -425,7 +401,6 @@ func _stamp(st) -> bool:
 	# meaningless anyway.
 	var under: bool = preview.get_index() == 0 and objects.get_child_count() > 1
 
-	printerr("[DIAG][SPS] stamp: pos=%s under=%s" % [str(preview.global_position), str(under)])
 	# Save(bool copy = ...) has a C# default parameter: calling it with no
 	# args from GDScript mis-resolves (returned the Position Vector2!). The
 	# bool MUST be passed explicitly (same convention as SplitPath's
@@ -434,29 +409,37 @@ func _stamp(st) -> bool:
 	# (ColourAndModifyThings and friends tint through that signal).
 	var data = preview.Save(true)
 	var prop = objects.LoadObject(data)
-	printerr("[DIAG][SPS] stamp: LoadObject -> %s" % str(prop))
+	var id = null
+	var record_data = null
+	if prop != null:
+		# ORDER MATTERS: the under fix must run BEFORE Next(). Next() in
+		# Under mode creates the new preview and MoveToBack's it to index 0;
+		# running move_child(prop, 0) afterwards pushed the fresh preview to
+		# index 1, so the next stamp's index-0 under detection failed —
+		# strokes alternated one-under/one-over. Fixing prop first, then
+		# letting Next() put the preview back at index 0, keeps the
+		# invariant every stamp. (The old preview stays alive until the
+		# queue_free below, so the C# Preview field never dangles either
+		# way.)
+		if under:
+			_apply_under_fix(objects, prop)
+		if _minor_utils_mirror_enabled():
+			prop.Mirror = bool(randi() & 1)
+		# Record snapshot AFTER LoadObject: carries the real node_id (stable
+		# across undo/redo) plus any DD-serializable state hook mods just
+		# applied (e.g. CMT custom colors written through DD's custom_color).
+		id = prop.get_meta("node_id")
+		record_data = prop.Save(false)
 	# Rebuild the tool's preview, then dispose the old one (it never got an
-	# id, so a plain queue_free is the whole cleanup). Next() first, so the
-	# C# Preview field never points at a freed node.
+	# id, so a plain queue_free is the whole cleanup).
 	st.call("Next", false)
 	preview.queue_free()
 	if prop == null:
 		printerr("[ScatterPathSpacing] LoadObject failed; drop skipped.")
 		return false
-	if under:
-		_apply_under_fix(objects, prop)
-	if _minor_utils_mirror_enabled():
-		prop.Mirror = bool(randi() & 1)
-	# Record snapshot AFTER LoadObject: carries the real node_id (stable
-	# across undo/redo) plus any DD-serializable state hook mods just
-	# applied (e.g. CMT custom colors written through DD's custom_color).
-	var id = prop.get_meta("node_id")
-	var record_data = prop.Save(false)
-	printerr("[DIAG][SPS] stamp: id=%s" % str(id))
 
 	_last_stamp_pos = _last_pos
 	_prev_size = _rect_size_of(prop)
-	printerr("[DIAG][SPS] stamp: prev_size=%s" % str(_prev_size))
 
 	_stroke_entries.append({
 		"id": id,
@@ -549,21 +532,17 @@ func _record_undo(record) -> void:
 			# Already gone (freed by another record, e.g. a Select delete
 			# that was itself redone). Same tolerance as vanilla, which
 			# prints "[Error] Failed to undo already deleted object."
-			printerr("[DIAG][SPS] undo: id=%s already deleted, skipped" % str(id))
 			continue
-		var ok = _g.World.DeleteNodeByID(id)
-		printerr("[DIAG][SPS] undo: DeleteNodeByID(%s) -> %s" % [str(id), str(ok)])
+		_g.World.DeleteNodeByID(id)
 
 
 func _record_redo(record) -> void:
 	var objects = _resolve_objects(record.level_id)
 	if objects == null:
-		printerr("[DIAG][SPS] redo: Objects for level %d unreachable" % record.level_id)
 		return
 	for e in record.entries:
 		var id = e["id"]
 		if _g.World.has_method("HasNodeID") and _g.World.HasNodeID(id):
-			printerr("[DIAG][SPS] redo: id=%s already present, skipped" % str(id))
 			continue
 		# LoadObject minus the object count (see header): CreateObject's
 		# SortMode arg is irrelevant here because move_child fixes the final
@@ -572,7 +551,6 @@ func _record_redo(record) -> void:
 		prop.Load(e["data"])
 		objects.AddToSearchTable(prop, e["under"])
 		objects.move_child(prop, int(min(e["child_index"], objects.get_child_count() - 1)))
-		printerr("[DIAG][SPS] redo: recreated id=%s under=%s" % [str(id), str(e["under"])])
 
 
 func _resolve_objects(level_id: int):
@@ -611,24 +589,18 @@ func _ensure_toggle() -> void:
 	_btn_frame = f
 	var st = _get_scatter_tool()
 	if st == null:
-		_diag("toggle", "toggle: ScatterTool not reachable")
 		return
 	var spread_node = st.get("Spread")
 	if spread_node == null or not is_instance_valid(spread_node):
-		_diag("toggle", "toggle: st.Spread is null/invalid")
 		return
 	if not spread_node.is_inside_tree():
-		_diag("toggle", "toggle: Spread node not in tree")
 		return
 	var row = spread_node.get_parent()
 	if row == null:
-		_diag("toggle", "toggle: Spread has no parent")
 		return
 	var parent = row.get_parent()
 	if parent == null:
-		_diag("toggle", "toggle: Spread row has no parent")
 		return
-	_diag("toggle", "toggle: inserting after row '%s' in parent '%s' (%s)" % [row.name, parent.name, parent.get_class()])
 	# Duplicate-mod guard.
 	for child in parent.get_children():
 		if child is CheckButton and child.name == "NaturalSpacingButton":
@@ -644,12 +616,10 @@ func _ensure_toggle() -> void:
 	parent.move_child(btn, row.get_index() + 1)
 	_toggle_btn = btn
 	print("[ScatterPathSpacing] 'Natural Spacing' toggle added to the Scatter panel.")
-	printerr("[DIAG][SPS] toggle button added, visible=%s, rect=%s" % [str(btn.visible), str(btn.get_global_rect())])
 
 
 func _on_toggle(pressed: bool) -> void:
 	_enabled = pressed
-	printerr("[DIAG][SPS] toggle -> %s" % str(pressed))
 	if not _enabled and _stroke_active:
 		_finalize_stroke()
 

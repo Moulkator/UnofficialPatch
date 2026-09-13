@@ -11,6 +11,7 @@
 #   Z + wheel          rotate by +/-5 deg   (fine)
 #   Shift + Z + wheel  rotate by +/-1 deg   (precision)
 #   Alt + wheel        scale  by +/-0.1
+#   right click        rotate by +90 deg
 #
 # Scope: the override is written straight onto the live preview node, so it
 # only affects the asset in hand. ScatterTool._Update() only rewrites
@@ -58,6 +59,7 @@
 const ROT_STEP_DEG := 15.0
 const ROT_STEP_FINE_DEG := 5.0
 const ROT_STEP_PRECISE_DEG := 1.0
+const ROT_STEP_RIGHT_CLICK_DEG := 90.0
 const SCALE_STEP := 0.1
 const SCALE_MIN := 0.05
 const SCALE_MAX := 20.0
@@ -193,14 +195,15 @@ func _on_input(event) -> void:
 		return
 	if not (event is InputEventMouseButton) or not event.pressed:
 		return
-	if event.button_index != BUTTON_WHEEL_UP and event.button_index != BUTTON_WHEEL_DOWN:
+	var right_click: bool = event.button_index == BUTTON_RIGHT
+	if not right_click and event.button_index != BUTTON_WHEEL_UP and event.button_index != BUTTON_WHEEL_DOWN:
 		return
 	# Ctrl belongs to the zoom. Bail out before touching anything else.
-	if event.control or Input.is_key_pressed(KEY_CONTROL):
+	if not right_click and (event.control or Input.is_key_pressed(KEY_CONTROL)):
 		return
 	var tool_name = _active_tool_name()
 	if tool_name != "ScatterTool":
-		_dbg("wheel ignored: active tool is '%s'" % tool_name)
+		_dbg("input ignored: active tool is '%s'" % tool_name)
 		return
 	# Never steal the wheel from a UI control (object library, sliders, ...).
 	# See the header note: geometry-only test, plus an explicit hit-test of
@@ -219,6 +222,15 @@ func _on_input(event) -> void:
 	var preview = _get_preview()
 	if preview == null:
 		_dbg("wheel ignored: ScatterTool has no usable Preview")
+		return
+
+	# Right click: quarter turn, no modifier handling. Consumed so DD's
+	# ScatterTool never sees the click; right_click_util polls the raw mouse
+	# state and only shows its menu in SelectTool, so it is unaffected.
+	if right_click:
+		_rotate_preview(preview, true, ROT_STEP_RIGHT_CLICK_DEG)
+		_dbg("right click: rot=%.1f deg" % rad2deg(preview.global_rotation))
+		input_listener.get_tree().set_input_as_handled()
 		return
 
 	var up: bool = event.button_index == BUTTON_WHEEL_UP

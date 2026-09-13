@@ -729,6 +729,10 @@ func _apply_extra_pass(cat: Dictionary, scale: float) -> void:
 	for node in unique_targets:
 		if not (node is ItemList):
 			continue
+		# Third-party mods can tag their lists with `_uir_skip` to keep full
+		# control of their own thumbnail sizing (e.g. Better Terrain Tool).
+		if node.has_meta("_uir_skip"):
+			continue
 		var fis_native = _native_value(node, "fixed_icon_size", node.fixed_icon_size)
 		var is_native = _native_value(node, "icon_scale", node.icon_scale)
 		if fis_native is Vector2 and fis_native.x > 0:

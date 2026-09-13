@@ -3,7 +3,15 @@
 #
 # Fix 1: Map resize limit raised from 128x128 to 200x200.
 # Fix 2: Terrain splat cropped from wrong side on negative Left/Top resize.
-# Fix 3: Cave walls/mesh offset on negative Left/Top resize.
+# Fix 3: Cave floor/walls misalignment on Left/Top resize.
+#        - Negative Left/Top: DD's BlitBitmap drops the content shift, so the
+#          cave bitmaps must be restored with the proper crop.
+#        - Any Left/Top offset: CaveMesh.Resize() rebuilds the floor mesh via
+#          UpdateMesh() but only regenerates the border walls
+#          (FinalizeMeshAndBorders) when the 'Update brush borders live'
+#          preference is OFF -- it never sets isMeshesDirty, so with the
+#          preference ON the old walls are left behind, offset from the
+#          shifted floor. We always re-finalize + re-clip after resize.
 # Fix 4: Trace image not shifted when tiles are added/removed on Left/Top.
 # Fix 5: text_tool_fix anchor X coords go stale on Left resize, snapping
 #        texts back horizontally after DD moved them correctly.
@@ -1081,6 +1089,7 @@ func _on_ok_pressed():
 	var right = int(_right_sb.value)
 	var bottom = int(_bottom_sb.value)
 	var fix = (left < 0 or top < 0)
+	var cave_fix = (left != 0 or top != 0)
 
 	# ── Gather pre-resize data ──────────────────────────────────────────
 	var lvls = []
@@ -1101,22 +1110,24 @@ func _on_ok_pressed():
 			trace_img = _ti
 			trace_pre_pos = _ti.position
 
-	if fix:
+	if fix or cave_fix:
 		var levels = _g.World.get("levels")
 		if levels != null:
 			for lv in levels:
-				var ter = lv.get("Terrain")
-				if ter != null:
-					lvls.append(lv)
-					sp1s.append(ter.CloneSplatImage())
-					var s2 = null
-					if ter.get("ExpandedSlots"):
-						s2 = ter.CloneSplatImage2()
-					sp2s.append(s2)
-					tws.append(ter.get("width"))
-					ths.append(ter.get("height"))
-				var snap = _snapshot_cave(lv)
-				cave_snaps.append(snap)
+				if fix:
+					var ter = lv.get("Terrain")
+					if ter != null:
+						lvls.append(lv)
+						sp1s.append(ter.CloneSplatImage())
+						var s2 = null
+						if ter.get("ExpandedSlots"):
+							s2 = ter.CloneSplatImage2()
+						sp2s.append(s2)
+						tws.append(ter.get("width"))
+						ths.append(ter.get("height"))
+				if cave_fix:
+					var snap = _snapshot_cave(lv)
+					cave_snaps.append(snap)
 
 	# ── Call original C# resize handler ─────────────────────────────────
 	print("[MapResizeFix] Calling original resize handler...")
@@ -1125,9 +1136,9 @@ func _on_ok_pressed():
 	print("[MapResizeFix] Original resize done, applying fixes...")
 
 	# ── Apply fixes ─────────────────────────────────────────────────────
-	if fix:
-		if lvls.size() > 0:
-			_fix_splats(lvls, sp1s, sp2s, tws, ths, left, top)
+	if fix and lvls.size() > 0:
+		_fix_splats(lvls, sp1s, sp2s, tws, ths, left, top)
+	if cave_fix:
 		_fix_caves(cave_snaps, old_w, old_h, left, top)
 
 	# Fix 4: shift the trace image so it stays aligned with the map content
@@ -1141,6 +1152,13 @@ func _on_ok_pressed():
 		if _tse != null and is_instance_valid(_tse) and _tse.has_method("on_map_resized"):
 			_tse.on_map_resized(left, top, old_w, old_h)
 
+	# Fix 6: after a resize, parts of level content shifted beyond the old
+	# map bounds can render broken (e.g. cave fill invisible depending on
+	# camera position/zoom) until the level canvas items are refreshed.
+	# Opening/closing the Export window fixes it as a side effect because it
+	# hides and re-shows the levels; replicate that cycle here.
+	_refresh_levels_render_state(old_w, old_h)
+
 	# Fix 5: DD's Texts.Resize shifts texts correctly, but text_tool_fix keeps
 	# per-text anchor X in world coords -- shift those too, or _apply_alignment
 	# will snap the texts back to their pre-resize X.
@@ -1148,6 +1166,28 @@ func _on_ok_pressed():
 		var _ttf = _g.ModMapData.get("_ttf_handler")
 		if _ttf != null and is_instance_valid(_ttf) and _ttf.has_method("on_map_resized"):
 			_ttf.on_map_resized(left * _g.WorldUI.CellSize.x)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Fix 6 – stale level render state after resize
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Same hide/show cycle the Export window performs (AboutToShow calls
+# HideAllLevels + SetSourceLevel, PopupHide calls RestoreLevelsPostExport),
+# which forces the VisualServer to rebuild the levels' canvas item state and
+# refreshes their render targets. Without it, content shifted beyond the old
+# map bounds can stay invisible depending on camera position/zoom.
+func _refresh_levels_render_state(old_w, old_h):
+	if _g.World.Width == old_w and _g.World.Height == old_h:
+		return
+	var current = _g.World.get("CurrentLevelId")
+	if current == null:
+		print("[MapResizeFix] Level refresh: CurrentLevelId not reachable")
+		return
+	_g.World.HideAllLevels()
+	_g.World.SetSourceLevel(current)
+	_g.World.RestoreLevelsPostExport()
+	print("[MapResizeFix] Level render state refreshed")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1289,54 +1329,115 @@ func _fix_caves(cave_snaps, old_w, old_h, left, top):
 		if cave == null:
 			continue
 
+		# Exact bitmap-cells-per-map-tile ratio (TileSize / CellSize). The
+		# cave bitmaps have a constant border (+1 + 2*edge buffer), so the
+		# ratio can be derived exactly from the size delta of the resize
+		# itself; the old size/width division only approximates it and
+		# rounds the offset wrong for large Left/Top values.
+		var cpt = _cave_cells_per_tile(snap, cave, old_w, old_h, new_w, new_h)
+		var ox = -left * cpt
+		var oy = -top * cpt
+
 		var something_fixed = false
+
+		# Restore the main cave bitmap FIRST (raw field write, no UpdateMesh),
+		# then the entrance bitmap via SetEntranceBitmap(), whose UpdateMesh()
+		# call rebuilds Tris and EntranceMeshes from both final bitmaps.
+		if snap.has("grid_bm"):
+			var prop = snap["grid_prop"]
+			var ok = _restore_grid_with_offset(snap["grid_bm"], cave, prop, ox, oy)
+			if ok:
+				print("[MapResizeFix] Restored cave grid '%s'" % prop)
+				something_fixed = true
 
 		if snap.has("entrance_bm"):
 			var ok = _restore_bitmap_with_offset(
-				snap["entrance_bm"], snap["entrance_sz"],
-				cave, "entranceBitmap", "SetEntranceBitmap",
-				old_w, old_h, new_w, new_h, left, top
+				snap["entrance_bm"], cave,
+				"entranceBitmap", "SetEntranceBitmap", ox, oy
 			)
 			if ok:
 				print("[MapResizeFix] Restored entrance bitmap")
 				something_fixed = true
 
-		if snap.has("grid_bm"):
-			var prop = snap["grid_prop"]
-			var ok = _restore_grid_with_offset(
-				snap["grid_bm"], snap["grid_sz"],
-				cave, prop,
-				old_w, old_h, new_w, new_h, left, top
-			)
-			if ok:
-				print("[MapResizeFix] Restored cave grid '%s'" % prop)
-				something_fixed = true
-
-		if something_fixed:
+		# CaveMesh.Resize() never sets isMeshesDirty: with the 'Update brush
+		# borders live' preference ON, vanilla DD rebuilds the floor mesh but
+		# leaves the old border walls in place. Re-finalize + re-clip whenever
+		# the map content shifted, even if the bitmaps themselves were already
+		# correct (positive Left/Top resize).
+		if something_fixed or left > 0 or top > 0:
 			print("[MapResizeFix] Regenerating cave mesh + walls...")
+			# FinalizeMeshAndBorders rebuilds Meshes from Tris and clips the
+			# walls exactly once. Never call SimpleClipWalls/FullClipWalls on
+			# top of it: each standalone call re-appends the closing point to
+			# the shared Meshes paths, and the duplicated points make the
+			# entrance clipping emit long straight ghost walls.
 			cave.FinalizeMeshAndBorders()
-			_reclip_cave_walls(lv, cave)
+			_refresh_cave_aabb(cave)
 			print("[MapResizeFix] Cave fix complete")
 		else:
 			_fallback_offset_walls(cave, left, top)
 
 
-func _restore_bitmap_with_offset(old_bm, old_sz, cave, get_prop, set_method, old_w, old_h, new_w, new_h, left, top) -> bool:
-	var ppx = old_sz.x / float(old_w)
-	var ppy = old_sz.y / float(old_h)
-	var ox = int(round(abs(left) * ppx)) if left < 0 else 0
-	var oy = int(round(abs(top) * ppy)) if top < 0 else 0
+# Diagnostic + safety net for the fill-culling issue: log the mesh bounds
+# DD left after its resize, and re-assert the custom AABB from the current
+# map dimensions in case a stale AABB is culling the floor mesh.
+func _refresh_cave_aabb(cave):
+	var am = cave.get("arrayMesh")
+	if am == null:
+		print("[MapResizeFix] AABB: arrayMesh not reachable")
+		return
+	var mw = cave.get("MapWidth")
+	var mh = cave.get("MapHeight")
+	var cs = cave.get("CellSize")
+	print("[MapResizeFix] AABB before: %s (MapWidth=%s MapHeight=%s CellSize=%s)" % [
+		str(am.custom_aabb), str(mw), str(mh), str(cs)])
+	if mw == null or mh == null or cs == null or float(cs) <= 0.0:
+		return
+	am.custom_aabb = AABB(Vector3.ZERO, Vector3(float(mw) * float(cs), float(mh) * float(cs), 0.0))
+	print("[MapResizeFix] AABB after: %s" % str(am.custom_aabb))
+
+
+# Derive the cave bitmap resolution (cells per map tile) exactly.
+# Both bitmaps span MapWidth x MapHeight = tiles * (TileSize / CellSize)
+# + 1 + 2 * edge buffer, so any change in map tiles changes the bitmap
+# size by exactly (delta tiles) * cells_per_tile.
+func _cave_cells_per_tile(snap, cave, old_w, old_h, new_w, new_h) -> int:
+	var old_sz = null
+	if snap.has("grid_sz"):
+		old_sz = snap["grid_sz"]
+	elif snap.has("entrance_sz"):
+		old_sz = snap["entrance_sz"]
+	if old_sz != null:
+		var cur = cave.get("entranceBitmap")
+		if cur == null or not (cur is BitMap):
+			cur = null
+		if cur != null:
+			var cur_sz = cur.get_size()
+			if new_w != old_w:
+				return int(round((cur_sz.x - old_sz.x) / float(new_w - old_w)))
+			if new_h != old_h:
+				return int(round((cur_sz.y - old_sz.y) / float(new_h - old_h)))
+	# Same final size (e.g. left = -N, right = +N): derive from properties.
+	var cell = cave.get("CellSize")
+	var tile = _g.World.get("TileSize")
+	if cell != null and tile != null and float(cell) > 0.0:
+		return int(round(float(tile) / float(cell)))
+	print("[MapResizeFix] WARNING: could not derive cave cells-per-tile, assuming 2")
+	return 2
+
+
+func _restore_bitmap_with_offset(old_bm, cave, get_prop, set_method, ox, oy) -> bool:
 	if ox == 0 and oy == 0:
 		return false
 
-	var new_bw = int(round(new_w * ppx))
-	var new_bh = int(round(new_h * ppy))
 	var cur = cave.get(get_prop)
-	if cur != null and cur is BitMap:
-		var csz = cur.get_size()
-		if csz.x > 0 and csz.y > 0:
-			new_bw = int(csz.x)
-			new_bh = int(csz.y)
+	if cur == null or not (cur is BitMap):
+		return false
+	var csz = cur.get_size()
+	var new_bw = int(csz.x)
+	var new_bh = int(csz.y)
+	if new_bw <= 0 or new_bh <= 0:
+		return false
 
 	var fixed = BitMap.new()
 	fixed.create(Vector2(new_bw, new_bh))
@@ -1348,11 +1449,7 @@ func _restore_bitmap_with_offset(old_bm, old_sz, cave, get_prop, set_method, old
 	return false
 
 
-func _restore_grid_with_offset(old_bm, old_sz, cave, prop, old_w, old_h, new_w, new_h, left, top) -> bool:
-	var ppx = old_sz.x / float(old_w)
-	var ppy = old_sz.y / float(old_h)
-	var ox = int(round(abs(left) * ppx)) if left < 0 else 0
-	var oy = int(round(abs(top) * ppy)) if top < 0 else 0
+func _restore_grid_with_offset(old_bm, cave, prop, ox, oy) -> bool:
 	if ox == 0 and oy == 0:
 		return false
 
@@ -1375,25 +1472,6 @@ func _restore_grid_with_offset(old_bm, old_sz, cave, prop, old_w, old_h, new_w, 
 		return true
 	print("[MapResizeFix] Grid '%s' is read-only, will use fallback" % prop)
 	return false
-
-
-func _reclip_cave_walls(lv, cave):
-	var dungeon_walls = lv.get("Walls")
-	var has_manual = false
-	if dungeon_walls != null:
-		var children = dungeon_walls.get_children()
-		if children != null:
-			for w in children:
-				var wtype = w.get("Type")
-				if wtype != null and int(wtype) != 2:
-					has_manual = true
-					break
-	if has_manual:
-		cave.FullClipWalls()
-		print("[MapResizeFix]   -> FullClipWalls")
-	else:
-		cave.SimpleClipWalls()
-		print("[MapResizeFix]   -> SimpleClipWalls")
 
 
 func _fallback_offset_walls(cave, left, top):
@@ -1422,7 +1500,9 @@ func _fallback_offset_walls(cave, left, top):
 # ═══════════════════════════════════════════════════════════════════════════
 
 func _blit_bitmap(src: BitMap, dst: BitMap, ox: int, oy: int, dw: int, dh: int):
-	"""Copy set bits from src at offset (ox, oy) into dst of size dw x dh."""
+	"""Copy set bits from src at offset (ox, oy) into dst of size dw x dh.
+	ox/oy may be negative (content shifted right/down, e.g. positive
+	Left/Top resize); out-of-range source cells are skipped."""
 	var sw = int(src.get_size().x)
 	var sh = int(src.get_size().y)
 	for y in range(dh):

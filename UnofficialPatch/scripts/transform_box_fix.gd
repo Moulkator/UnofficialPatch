@@ -391,7 +391,10 @@ func _tbz_style_color(sb, fallback: Color) -> Color:
 		c = sb.get("modulate_color")
 	if c == null or not (c is Color):
 		return fallback
-	return Color(c.r, c.g, c.b, fallback.a)
+	# Keep the stylebox alpha: light_fix hides the lights' box by swapping in
+	# a fully transparent StyleBoxFlat — the overlay must stay invisible too
+	# (it used to redraw it opaque black above the engage zoom).
+	return Color(c.r, c.g, c.b, fallback.a * c.a)
 
 
 func _tbz_make_overlay(tb) -> void:
@@ -417,12 +420,14 @@ func _tbz_make_overlay(tb) -> void:
 		+ "\tvar s = max(get_global_transform_with_canvas().get_scale().x, 0.001)\n" \
 		+ "\tvar hr = handle_px * 0.5 / s\n" \
 		+ "\tvar lw = line_px / s\n" \
+		+ "\tif frame_color.a <= 0.001 and handle_color.a <= 0.001:\n" \
+		+ "\t\treturn\n" \
 		+ "\t_stroke_rect(rect, frame_color, lw)\n" \
 		+ "\tvar pts = [rect.position, Vector2(rect.end.x, rect.position.y), rect.end, Vector2(rect.position.x, rect.end.y)]\n" \
 		+ "\tfor c in pts:\n" \
 		+ "\t\tvar hrect = Rect2(c - Vector2(hr, hr), Vector2(hr * 2.0, hr * 2.0))\n" \
 		+ "\t\t# Fond legerement assombri pour detacher la poignee du decor.\n" \
-		+ "\t\tdraw_rect(hrect, Color(0, 0, 0, 0.25), true)\n" \
+		+ "\t\tdraw_rect(hrect, Color(0, 0, 0, 0.25 * handle_color.a), true)\n" \
 		+ "\t\t_stroke_rect(hrect, handle_color, lw)\n" \
 		+ "# Contour trace en 4 rects REMPLIS : draw_rect non rempli avec une\n" \
 		+ "# largeur < 1.0 locale bascule sur des lignes GL de 1 px device\n" \

@@ -123,6 +123,10 @@ var _portal_offset_applied : Dictionary = {}  # instance_id → true
 # on laisse DD sélectionner puis on RÉTABLIT le verrou dans update(). Seul un
 # clic loin de la transform box (désélection volontaire) lâche le verrou.
 var _ft_lock : Array = []
+# World.nextNodeID when the lock was (re)taken: any selected node with an id
+# at or above it was created afterwards (paste, duplicate) — DD selected it
+# on purpose, so the lock follows instead of fighting it.
+var _ft_lock_next_id := -1
 var _ft_lock_reassert : int = 0
 
 
@@ -230,6 +234,44 @@ var _edgecrop_clip    : Dictionary = {}
 var _edgecrop_default_px := EDGECROP_PX_DEFAULT
 var _edgecrop_default_hard := EDGECROP_HARD_DEFAULT
 var _edgecrop_default_loaded := false
+
+# ── Blur (Gaussian + motion) ─────────────────────────────────────────────────
+# Props only. Lives in the FT ShaderMaterial of the Sprite (the same material
+# as the warp) — see FT_BLUR_HEADER / _ft_inject_blur. Stored per node in
+# ModMapData["_ft_blur"] = { key -> {r: float, m: float, a: float} }.
+#   r : Gaussian radius (texture px)
+#   m : motion blur length (texture px)
+#   a : motion angle (degrees, world/screen space, 0 = right, 90 = down)
+# A zero entry (r == 0 and m == 0) is never stored: no entry = no blur.
+const BLUR_RADIUS_MAX := 32.0
+const BLUR_MOTION_MAX := 256.0
+const BLUR_STEP := 0.5
+const FT_BLUR_TEX_PAD := 192         # transparent padding (px) of the premultiplied copy: >= r + m/2 + 2 sigma
+var _blur_r_row     : Control = null
+var _blur_r_slider  : HSlider = null
+var _blur_r_spin    : SpinBox = null
+# Motion blur: circular dial (same widget as Soft Shadows' projected mode):
+# handle direction = motion direction (screen angle, 0 = right, 90 = down),
+# handle radius (non-linear, BLUR_DIAL_EXP) = motion length. Corner snap
+# buttons lock the angle; the spins mirror the dial.
+const BLUR_DIAL_EXP := 2.0
+var _blur_m_row     : Control = null   # header (spins) + dial
+var _blur_m_spin    : SpinBox = null
+var _blur_a_spin    : SpinBox = null
+var _blur_dial      : Control = null
+var _blur_snap_btns : Dictionary = {}  # key -> TextureButton
+var _blur_tools_row : Control = null
+var _blur_copy_btn  : Button = null
+var _blur_paste_btn : Button = null
+var _blur_syncing   := false
+var _blur_before    : Dictionary = {}   # unified snapshot at the start of a slider burst
+var _blur_before_node : Node2D = null
+var _blur_dirty_ms  := 0
+var _blur_clip      : Dictionary = {}   # session clipboard for Copy / Paste
+# Premultiplied + mipmapped copies of the sampled textures, keyed by the
+# source texture's instance id: { id -> {src: WeakRef, tex: ImageTexture} }.
+# Shared DD asset textures -> one copy per asset, whatever the prop count.
+var _ft_blur_tex_cache : Dictionary = {}
 
 # ── Shader warp (distort / perspective / skew coins) ─────────────────────
 # Warp bilinéaire inverse : 4 coins totalement indépendants.
@@ -388,6 +430,261 @@ const FT_WARP_MERGE_VERTEX_BODY = """
 """
 
 const FT_WARP_MERGE_VERTEX_FN = "void vertex(){" + FT_WARP_MERGE_VERTEX_BODY + "}\n"
+
+
+# ── Blur (Gaussian + motion) : injected into ANY FT shader ────────────────────
+# The blur lives in the FT material of the Sprite (the same one as the warp),
+# so it composes with distort / custom color / CMT merge / the vanilla shadow.
+# _ft_inject_blur rewrites a shader source:
+#   1. FT_BLUR_HEADER (uniforms + ft_blur_* functions) goes before vertex(),
+#   2. vertex(): the quad is grown by ft_blur_margin around its centre so the
+#      halo can spill outside the Sprite rect,
+#   3. warp_uv(): the [0,1] clamp is dropped (outside the quad -> uv outside
+#      [uv_min, uv_max]),
+#   4. every texture(TEXTURE, uv) of fragment() becomes ft_blur_sample(...),
+#      which returns transparent for any tap outside [uv_min, uv_max].
+# Sampling is done in PREMULTIPLIED alpha from ft_blur_tex: a premultiplied
+# + mipmapped copy of the sprite texture built on the CPU (see
+# _ft_blur_get_premul_texture). Without it, mip levels of a straight-alpha
+# texture average colour with transparent black and the halo turns dark /
+# dirty. TEXTURE itself is left untouched (DD's asset lookup relies on it).
+# The copy is padded with FT_BLUR_TEX_PAD transparent px on every side so
+# taps near the texture border read real transparency instead of the
+# clamped border column (no streaks); ft_blur_uvmap maps TEXTURE uvs onto
+# the padded copy. Gaussian: grid over +-r (up to 15x15), sigma = r/2.
+# Motion: up to 21 taps along ft_blur_dir over +-(m/2 + 2 sigma) with a
+# softened box profile (~ box convolved with the Gaussian), up to 11
+# across. Tap spacing = an exact power of two = the texel size of the mip
+# level read (integer lod, no trilinear mix): the bilinear tents of
+# neighbouring taps then sum to a perfectly flat response, so no ripple /
+# moire shows through, whatever the radius. When no copy could
+# be built (ft_blur_has_tex = 0) the shader falls back to TEXTURE and
+# premultiplies per tap (lower quality). {P} = uv_min / uv_max prefix.
+const FT_BLUR_HEADER = """uniform float ft_blur_radius = 0.0;
+uniform float ft_blur_motion = 0.0;
+uniform vec2 ft_blur_dir = vec2(1.0,0.0);
+uniform vec2 ft_blur_margin = vec2(0.0,0.0);
+uniform float ft_blur_lod_max = 0.0;
+uniform sampler2D ft_blur_tex;
+uniform float ft_blur_has_tex = 0.0;
+uniform vec4 ft_blur_uvmap = vec4(1.0,1.0,0.0,0.0);
+uniform vec2 ft_blur_pad_uv = vec2(0.0,0.0);
+bool ft_blur_out(vec2 uv){
+\treturn uv.x<{P}uv_min.x-ft_blur_pad_uv.x||uv.y<{P}uv_min.y-ft_blur_pad_uv.y||uv.x>{P}uv_max.x+ft_blur_pad_uv.x||uv.y>{P}uv_max.y+ft_blur_pad_uv.y;
+}
+vec4 ft_blur_tap(sampler2D tex,vec2 uv,float lod){
+\tif(ft_blur_out(uv)) return vec4(0.0);
+\tif(ft_blur_has_tex>0.5) return textureLod(ft_blur_tex,uv*ft_blur_uvmap.xy+ft_blur_uvmap.zw,lod);
+\tvec4 c=textureLod(tex,uv,lod);
+\treturn vec4(c.rgb*c.a,c.a);
+}
+vec4 ft_blur_sample(sampler2D tex,vec2 ps,vec2 uv){
+\tfloat r=ft_blur_radius;
+\tfloat m=ft_blur_motion;
+\tif(r<0.05&&m<0.05){
+\t\tif(uv.x<{P}uv_min.x||uv.y<{P}uv_min.y||uv.x>{P}uv_max.x||uv.y>{P}uv_max.y) return vec4(0.0);
+\t\treturn textureLod(tex,uv,0.0);
+\t}
+\tvec2 ax=ft_blur_dir;
+\tvec2 ay=vec2(-ax.y,ax.x);
+\tfloat sig=max(r*0.5,0.35);
+\tfloat s2=2.0*sig*sig;
+\tvec4 acc=vec4(0.0);
+\tfloat ws=0.0;
+\tif(m<0.05){
+\t\tfloat sp=exp2(ceil(log2(max(r/7.0,1.0))));
+\t\tfloat lod=clamp(log2(sp),0.0,ft_blur_lod_max);
+\t\tint n=int(min(ceil(r/sp),7.0));
+\t\tfor(int i=-7;i<=7;i++){
+\t\t\tif(i<-n||i>n) continue;
+\t\t\tfor(int j=-7;j<=7;j++){
+\t\t\t\tif(j<-n||j>n) continue;
+\t\t\t\tvec2 o=vec2(float(i),float(j))*sp;
+\t\t\t\tfloat w=exp(-dot(o,o)/s2);
+\t\t\t\tacc+=ft_blur_tap(tex,uv+o*ps,lod)*w;
+\t\t\t\tws+=w;
+\t\t\t}
+\t\t}
+\t}else{
+\t\tfloat hm=m*0.5;
+\t\tfloat ea=hm+2.0*sig;
+\t\tfloat sp=exp2(ceil(log2(max(max(ea/10.0,r/5.0),1.0))));
+\t\tfloat lod=clamp(log2(sp),0.0,ft_blur_lod_max);
+\t\tint na=int(min(ceil(ea/sp),10.0));
+\t\tint nc=int(min(ceil(r/sp),5.0));
+\t\tfor(int i=-10;i<=10;i++){
+\t\t\tif(i<-na||i>na) continue;
+\t\t\tfloat x=float(i)*sp;
+\t\t\tfloat wa=smoothstep(-hm-2.0*sig,-hm+2.0*sig,x)*(1.0-smoothstep(hm-2.0*sig,hm+2.0*sig,x));
+\t\t\tfor(int j=-5;j<=5;j++){
+\t\t\t\tif(j<-nc||j>nc) continue;
+\t\t\t\tfloat y=float(j)*sp;
+\t\t\t\tfloat w=wa*exp(-y*y/s2);
+\t\t\t\tacc+=ft_blur_tap(tex,uv+(ax*x+ay*y)*ps,lod)*w;
+\t\t\t\tws+=w;
+\t\t\t}
+\t\t}
+\t}
+\tif(ws<=0.0||acc.a<=0.0) return vec4(0.0);
+\treturn vec4(acc.rgb/acc.a,acc.a/ws);
+}
+"""
+
+
+# ── Blur for TILED samplers (patterns, walls, paths) ─────────────────────────
+# Same kernels as FT_BLUR_HEADER but for a repeating texture sampled in its
+# own uv space (pattern albedo, wall albedo, Line2D TEXTURE): no quad growth,
+# no padding, taps wrap with the sampler. Coarse mip levels are reconstructed
+# with a cubic B-spline (4 bilinear fetches) so no texel grid shows through.
+# {S} is a suffix so a shader can carry two independent instances (wall:
+# albedo = "", line texture = "2"). ft_blur_px_scale{S} = texels per world
+# px; ft_blur_vclamp{S} = v range outside which taps are transparent (Line2D:
+# 0..1, so the edges of a path / wall fade instead of smearing).
+const FT_BLUR_TILE_HEADER = """uniform float ft_blur_radius{S} = 0.0;
+uniform float ft_blur_motion{S} = 0.0;
+uniform vec2 ft_blur_dir{S} = vec2(1.0,0.0);
+uniform float ft_blur_px_scale{S} = 1.0;
+uniform vec2 ft_blur_vclamp{S} = vec2(-1.0e9,1.0e9);
+uniform sampler2D ft_blur_tex{S};
+uniform float ft_blur_has_tex{S} = 0.0;
+uniform float ft_blur_lod_max{S} = 0.0;
+vec4 ft_blur_cubic{S}(sampler2D tex,vec2 uv,float lod){
+\tvec2 ts=max(vec2(textureSize(tex,0))/exp2(lod),vec2(1.0));
+\tvec2 tc=uv*ts-0.5;
+\tvec2 f=fract(tc);
+\ttc-=f;
+\tvec2 f2=f*f;
+\tvec2 f3=f2*f;
+\tvec2 w0=(1.0-3.0*f+3.0*f2-f3)/6.0;
+\tvec2 w1=(4.0-6.0*f2+3.0*f3)/6.0;
+\tvec2 w2=(1.0+3.0*f+3.0*f2-3.0*f3)/6.0;
+\tvec2 w3=f3/6.0;
+\tvec2 s0=w0+w1;
+\tvec2 s1=w2+w3;
+\tvec2 t0=(tc-1.0+w1/s0+0.5)/ts;
+\tvec2 t1=(tc+1.0+w3/s1+0.5)/ts;
+\treturn (textureLod(tex,vec2(t0.x,t0.y),lod)*s0.x+textureLod(tex,vec2(t1.x,t0.y),lod)*s1.x)*s0.y+(textureLod(tex,vec2(t0.x,t1.y),lod)*s0.x+textureLod(tex,vec2(t1.x,t1.y),lod)*s1.x)*s1.y;
+}
+vec4 ft_blur_tile_tap{S}(sampler2D tex,vec2 uv,float lod){
+\tif(uv.y<ft_blur_vclamp{S}.x||uv.y>ft_blur_vclamp{S}.y) return vec4(0.0);
+\tvec4 c;
+\tif(ft_blur_has_tex{S}>0.5){
+\t\tc=(lod>0.5)?ft_blur_cubic{S}(ft_blur_tex{S},uv,lod):textureLod(ft_blur_tex{S},uv,0.0);
+\t\treturn c;
+\t}
+\tc=(lod>0.5)?ft_blur_cubic{S}(tex,uv,lod):textureLod(tex,uv,0.0);
+\treturn vec4(c.rgb*c.a,c.a);
+}
+vec4 ft_blur_tile{S}(sampler2D tex,vec2 uv){
+\tfloat r=ft_blur_radius{S}*ft_blur_px_scale{S};
+\tfloat m=ft_blur_motion{S}*ft_blur_px_scale{S};
+\tif(r<0.05&&m<0.05) return texture(tex,uv);
+\tvec2 ps=1.0/vec2(textureSize(tex,0));
+\tvec2 ax=ft_blur_dir{S};
+\tvec2 ay=vec2(-ax.y,ax.x);
+\tfloat sig=max(r*0.5,0.35);
+\tfloat s2=2.0*sig*sig;
+\tvec4 acc=vec4(0.0);
+\tfloat ws=0.0;
+\tif(m<0.05){
+\t\tfloat sp=exp2(ceil(log2(max(r/7.0,1.0))));
+\t\tfloat lod=clamp(log2(sp),0.0,ft_blur_lod_max{S});
+\t\tint n=int(min(ceil(r/sp),7.0));
+\t\tfor(int i=-7;i<=7;i++){
+\t\t\tif(i<-n||i>n) continue;
+\t\t\tfor(int j=-7;j<=7;j++){
+\t\t\t\tif(j<-n||j>n) continue;
+\t\t\t\tvec2 o=vec2(float(i),float(j))*sp;
+\t\t\t\tfloat w=exp(-dot(o,o)/s2);
+\t\t\t\tacc+=ft_blur_tile_tap{S}(tex,uv+o*ps,lod)*w;
+\t\t\t\tws+=w;
+\t\t\t}
+\t\t}
+\t}else{
+\t\tfloat hm=m*0.5;
+\t\tfloat ea=hm+2.0*sig;
+\t\tfloat sp=exp2(ceil(log2(max(max(ea/10.0,r/5.0),1.0))));
+\t\tfloat lod=clamp(log2(sp),0.0,ft_blur_lod_max{S});
+\t\tint na=int(min(ceil(ea/sp),10.0));
+\t\tint nc=int(min(ceil(r/sp),5.0));
+\t\tfor(int i=-10;i<=10;i++){
+\t\t\tif(i<-na||i>na) continue;
+\t\t\tfloat x=float(i)*sp;
+\t\t\tfloat wa=smoothstep(-hm-2.0*sig,-hm+2.0*sig,x)*(1.0-smoothstep(hm-2.0*sig,hm+2.0*sig,x));
+\t\t\tfor(int j=-5;j<=5;j++){
+\t\t\t\tif(j<-nc||j>nc) continue;
+\t\t\t\tfloat y=float(j)*sp;
+\t\t\t\tfloat w=wa*exp(-y*y/s2);
+\t\t\t\tacc+=ft_blur_tile_tap{S}(tex,uv+(ax*x+ay*y)*ps,lod)*w;
+\t\t\t\tws+=w;
+\t\t\t}
+\t\t}
+\t}
+\tif(ws<=0.0||acc.a<=0.0) return vec4(0.0);
+\treturn vec4(acc.rgb/acc.a,acc.a/ws);
+}
+"""
+
+# Plain Line2D (paths have no material): the default canvas shader with the
+# blurred TEXTURE read.
+const FT_BLUR_LINE_SHADER_SRC = "shader_type canvas_item;\n{H}\nvoid fragment(){\n\tCOLOR*=ft_blur_tile2(TEXTURE,UV);\n}\n"
+
+
+func _ft_inject_tile_blur(code: String, sampler_names: Array, suffixes = null) -> String:
+	# Rewrites a shader so the given samplers are read through the tiled
+	# blur. sampler_names[i] uses instance suffix suffixes[i] (default: ""
+	# for the first, "2" for the second). Returns "" when the structure is
+	# not recognised.
+	var vp = code.find("void vertex")
+	var fp = code.find("void fragment")
+	if fp < 0:
+		return ""
+	var header = ""
+	for i in range(sampler_names.size()):
+		var sfx = (suffixes[i] if suffixes is Array and i < suffixes.size() else ("" if i == 0 else "2"))
+		var rx = RegEx.new()
+		if rx.compile("\\btexture\\s*\\(\\s*" + sampler_names[i] + "\\s*,") != OK:
+			return ""
+		code = rx.sub(code, "ft_blur_tile" + sfx + "(" + sampler_names[i] + ",", true)
+		header += FT_BLUR_TILE_HEADER.replace("{S}", sfx) + "\n"
+	vp = code.find("void vertex")
+	fp = code.find("void fragment")
+	var ins = fp if (vp < 0 or fp < vp) else vp
+	return code.insert(ins, header)
+
+
+func _ft_inject_blur(code: String, pfx: String) -> String:
+	# Rewrites an FT shader source to carry the blur (see FT_BLUR_HEADER).
+	# pfx = "" for FT's own shaders, "ft_" for a merged (CMT) shader.
+	# Returns "" when the expected structure is not found.
+	var vp = code.find("void vertex")
+	var fp = code.find("void fragment")
+	if fp < 0:
+		return ""
+	# 3. warp_uv: no clamp any more (the halo spills outside the quad).
+	code = code.replace("clamp(vec2(u,v),0.0,1.0)", "vec2(u,v)")
+	# Outside the quad both roots can fall outside [0,1]: pick the one closest
+	# to the quad instead of the in-range test (which would flip branches).
+	code = code.replace("v=(v1>=-0.001&&v1<=1.001)?v1:v2;", "v=abs(v1-0.5)<=abs(v2-0.5)?v1:v2;")
+	# 2. Grow the quad in vertex(), right before v_local is captured (t is
+	# the 0..1 quad coordinate computed by the warp vertex body).
+	var anchor = "\t" + pfx + "v_local=VERTEX;"
+	if code.find(anchor) < 0:
+		return ""
+	code = code.replace(anchor, "\tVERTEX+=(" + pfx + "t-0.5)*2.0*ft_blur_margin;\n" + anchor)
+	# 4. TEXTURE reads -> ft_blur_sample. TEXTURE_PIXEL_SIZE is passed as an
+	# argument: shader builtins are not visible inside custom functions.
+	var rx = RegEx.new()
+	if rx.compile("\\btexture\\s*\\(\\s*TEXTURE\\s*,") != OK:
+		return ""
+	code = rx.sub(code, "ft_blur_sample(TEXTURE,TEXTURE_PIXEL_SIZE,", true)
+	# 1. Header before the first main function (ft_blur_margin is read by
+	# vertex(); uv_min / uv_max are declared at the very top by the warp).
+	vp = code.find("void vertex")
+	fp = code.find("void fragment")
+	var ins = fp if (vp < 0 or fp < vp) else vp
+	code = code.insert(ins, FT_BLUR_HEADER.replace("{P}", pfx) + "\n")
+	return code
 
 
 # Shader pour patterns : warp bilinéaire inverse dans le fragment,
@@ -672,7 +969,7 @@ func _map_save_id() -> String:
 
 # Stores ModMapData à persister dans le fichier JSON.
 const _FT_PERSIST_KEYS = [
-	"_ft_distort", "_ft_crop", "_ft_crop_soft", "_ft_crop_feather", "_ft_crop_opacity", "_ft_edgecrop", "_ft_transforms",
+	"_ft_distort", "_ft_crop", "_ft_crop_soft", "_ft_crop_feather", "_ft_crop_opacity", "_ft_edgecrop", "_ft_blur", "_ft_transforms",
 	"_ft_pattern_orig", "_ft_pattern_orig_pos", "_ft_pattern_reset", "_ft_pattern_world",
 	"_portal_offsets", "_ft_orig_xform", "_ft_width_warp", "_ft_wall_reset",
 	"_ft_path_reset",
@@ -1110,6 +1407,40 @@ func _add_button(align: Node) -> void:
 	_edge_default_btn = dbtn
 	_edge_factory_btn = fbtn
 
+	# Widget "Blur": three rows (Gaussian radius, motion length, motion angle)
+	# + a Copy / Paste tools row. Visible only in blur mode.
+	var br = _make_blur_row(align, "Blur (px)", BLUR_RADIUS_MAX, BLUR_STEP, "px",
+		"_on_blur_r_changed", "r", "Reset blur", group.get_index() + 1)
+	_blur_r_row = br["row"]; _blur_r_slider = br["slider"]; _blur_r_spin = br["spin"]
+	_blur_m_row = _make_blur_motion_widget(align, group.get_index() + 2)
+
+	var bt = VBoxContainer.new()
+	bt.name = "FreeTransformBlurTools"
+	bt.focus_mode = Control.FOCUS_NONE
+	var btr = HBoxContainer.new()
+	btr.focus_mode = Control.FOCUS_NONE
+	var bcbtn = Button.new()
+	bcbtn.text = "Copy"
+	bcbtn.hint_tooltip = "Copy this asset's blur settings"
+	bcbtn.focus_mode = Control.FOCUS_NONE
+	bcbtn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	bcbtn.connect("pressed", self, "_on_blur_copy_pressed")
+	var bpbtn = Button.new()
+	bpbtn.text = "Paste"
+	bpbtn.hint_tooltip = "Paste copied blur settings onto this asset"
+	bpbtn.focus_mode = Control.FOCUS_NONE
+	bpbtn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	bpbtn.connect("pressed", self, "_on_blur_paste_pressed")
+	btr.add_child(bcbtn)
+	btr.add_child(bpbtn)
+	bt.add_child(btr)
+	align.add_child(bt)
+	align.move_child(bt, group.get_index() + 3)
+	bt.visible = false
+	_blur_tools_row = bt
+	_blur_copy_btn  = bcbtn
+	_blur_paste_btn = bpbtn
+
 	_toggle_btn = btn
 	_lock_btn   = lock_btn
 	_ui_group   = group
@@ -1138,6 +1469,10 @@ func set_widget_visible(visible: bool) -> void:
 		_edge_hard_row.visible = false
 	if not visible and _edge_tools_row != null and is_instance_valid(_edge_tools_row):
 		_edge_tools_row.visible = false
+	if not visible:
+		for brow in [_blur_r_row, _blur_m_row, _blur_tools_row]:
+			if brow != null and is_instance_valid(brow):
+				brow.visible = false
 	if not visible and _enabled and _toggle_btn != null and is_instance_valid(_toggle_btn):
 		_toggle_btn.pressed = false
 		_toggle_btn.emit_signal("toggled", false)
@@ -1152,6 +1487,353 @@ func _load_icon(icon_path: String, scale: float = 1.0) -> ImageTexture:
 	var texture = ImageTexture.new()
 	texture.create_from_image(image)
 	return texture
+
+
+# Builds one "label / slider + spinbox + reset" row for the blur widget.
+func _make_blur_row(align: Node, title: String, maxv: float, step: float, suffix: String,
+		cb: String, which: String, reset_tip: String, index: int) -> Dictionary:
+	var box = VBoxContainer.new()
+	box.name = "FreeTransformBlur_" + which
+	box.focus_mode = Control.FOCUS_NONE
+	var lbl = Label.new()
+	lbl.text = title
+	lbl.focus_mode = Control.FOCUS_NONE
+	var row = HBoxContainer.new()
+	row.focus_mode = Control.FOCUS_NONE
+	var sld = HSlider.new()
+	sld.min_value = 0
+	sld.max_value = maxv
+	sld.step = step
+	sld.value = 0
+	sld.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	sld.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	sld.focus_mode = Control.FOCUS_NONE
+	sld.rect_min_size = Vector2(110, 0)
+	var spin = SpinBox.new()
+	spin.min_value = 0
+	spin.max_value = maxv
+	spin.step = step
+	spin.value = 0
+	spin.suffix = suffix
+	spin.focus_mode = Control.FOCUS_CLICK
+	var rst = _make_reset_button(reset_tip)
+	rst.connect("pressed", self, "_on_blur_reset_pressed", [which])
+	row.add_child(sld)
+	row.add_child(spin)
+	row.add_child(rst)
+	box.add_child(lbl)
+	box.add_child(row)
+	align.add_child(box)
+	align.move_child(box, index)
+	box.visible = false
+	sld.connect("value_changed", self, cb)
+	spin.connect("value_changed", self, cb)
+	return {"row": box, "slider": sld, "spin": spin}
+
+
+# Motion blur widget: header [Length spin + reset | Angle spin + reset] then
+# the dial. Same look and behaviour as the Soft Shadows projected-shadow dial.
+func _make_blur_motion_widget(align: Node, index: int) -> Control:
+	var box = VBoxContainer.new()
+	box.name = "FreeTransformBlurMotion"
+	box.focus_mode = Control.FOCUS_NONE
+	var title = Label.new()
+	title.text = "Motion Blur"
+	title.focus_mode = Control.FOCUS_NONE
+	box.add_child(title)
+
+	var header = HBoxContainer.new()
+	header.focus_mode = Control.FOCUS_NONE
+	var mlbl = Label.new()
+	mlbl.text = "Length"
+	mlbl.focus_mode = Control.FOCUS_NONE
+	header.add_child(mlbl)
+	var mspin = SpinBox.new()
+	mspin.min_value = 0
+	mspin.max_value = BLUR_MOTION_MAX
+	mspin.step = BLUR_STEP
+	mspin.value = 0
+	mspin.suffix = "px"
+	mspin.focus_mode = Control.FOCUS_CLICK
+	mspin.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+	mspin.rect_min_size.x = 72
+	mspin.connect("value_changed", self, "_on_blur_m_changed")
+	header.add_child(mspin)
+	var mrst = _make_reset_button("Reset motion length")
+	mrst.connect("pressed", self, "_on_blur_reset_pressed", ["m"])
+	header.add_child(mrst)
+	var albl = Label.new()
+	albl.text = "Angle"
+	albl.focus_mode = Control.FOCUS_NONE
+	header.add_child(albl)
+	var aspin = SpinBox.new()
+	aspin.min_value = 0
+	aspin.max_value = 359
+	aspin.step = 1
+	aspin.value = 0
+	aspin.suffix = "°"
+	aspin.allow_greater = false
+	aspin.allow_lesser = false
+	aspin.focus_mode = Control.FOCUS_CLICK
+	aspin.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+	aspin.rect_min_size.x = 60
+	aspin.connect("value_changed", self, "_on_blur_a_changed")
+	header.add_child(aspin)
+	var arst = _make_reset_button("Reset motion angle")
+	arst.connect("pressed", self, "_on_blur_reset_pressed", ["a"])
+	header.add_child(arst)
+	box.add_child(header)
+
+	var dial_container = CenterContainer.new()
+	dial_container.rect_clip_content = false
+	var dial_margin = MarginContainer.new()
+	dial_margin.rect_clip_content = false
+	for side in ["margin_left", "margin_right", "margin_top", "margin_bottom"]:
+		dial_margin.add_constant_override(side, 8)
+	var dial = _make_blur_dial(90)
+	dial_margin.add_child(dial)
+	dial_container.add_child(dial_margin)
+	box.add_child(dial_container)
+
+	align.add_child(box)
+	align.move_child(box, index)
+	box.visible = false
+	_blur_m_spin = mspin
+	_blur_a_spin = aspin
+	_blur_dial = dial
+	return box
+
+
+func _make_blur_dial(dial_size: int) -> Control:
+	# Concentric rings, diagonal guides, crosshair, handle and four corner
+	# snap buttons (angle locks). Handle = motion direction, radius = length.
+	var dial = Control.new()
+	dial.name = "BlurDial"
+	dial.rect_min_size = Vector2(dial_size, dial_size)
+	dial.rect_size = Vector2(dial_size, dial_size)
+	dial.focus_mode = Control.FOCUS_NONE
+
+	var bg_sprite = TextureRect.new()
+	bg_sprite.texture = _ft_make_circle_texture(dial_size, Color(0.12, 0.12, 0.12, 1.0))
+	bg_sprite.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	dial.add_child(bg_sprite)
+
+	for ring_frac in [0.25, 0.5, 0.75]:
+		var ring_size = int(dial_size * ring_frac)
+		var ring_rect = TextureRect.new()
+		ring_rect.texture = _ft_make_ring_texture(ring_size, Color(0.22, 0.22, 0.22, 1.0))
+		ring_rect.rect_position = Vector2((dial_size - ring_size) / 2.0, (dial_size - ring_size) / 2.0)
+		ring_rect.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		dial.add_child(ring_rect)
+
+	for diag_angle in [45.0, 135.0, 225.0, 315.0]:
+		var diag_rad = deg2rad(diag_angle)
+		var dx = cos(diag_rad)
+		var dy = sin(diag_rad)
+		var line_len = dial_size / 2.0 - 2.0
+		for sd in range(4, int(line_len), 3):
+			var dot_line = ColorRect.new()
+			dot_line.color = Color(0.20, 0.20, 0.20, 0.5)
+			dot_line.rect_min_size = Vector2(1, 1)
+			dot_line.rect_position = Vector2(dial_size / 2.0 + dx * sd, dial_size / 2.0 + dy * sd)
+			dot_line.mouse_filter = Control.MOUSE_FILTER_IGNORE
+			dial.add_child(dot_line)
+
+	var h_line = ColorRect.new()
+	h_line.color = Color(0.25, 0.25, 0.25, 0.6)
+	h_line.rect_position = Vector2(0, dial_size / 2.0 - 0.5)
+	h_line.rect_min_size = Vector2(dial_size, 1)
+	h_line.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	dial.add_child(h_line)
+	var v_line = ColorRect.new()
+	v_line.color = Color(0.25, 0.25, 0.25, 0.6)
+	v_line.rect_position = Vector2(dial_size / 2.0 - 0.5, 0)
+	v_line.rect_min_size = Vector2(1, dial_size)
+	v_line.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	dial.add_child(v_line)
+
+	var center_dot = ColorRect.new()
+	center_dot.color = Color(0.4, 0.4, 0.4, 1.0)
+	center_dot.rect_min_size = Vector2(3, 3)
+	center_dot.rect_position = Vector2(dial_size / 2.0 - 1.5, dial_size / 2.0 - 1.5)
+	center_dot.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	dial.add_child(center_dot)
+
+	var handle = ColorRect.new()
+	handle.name = "Handle"
+	handle.color = Color(0.95, 0.6, 0.1, 1.0)
+	handle.rect_min_size = Vector2(10, 10)
+	handle.rect_position = Vector2(dial_size / 2.0 - 5, dial_size / 2.0 - 5)
+	handle.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	dial.add_child(handle)
+
+	var snap_btn_size = 12
+	var snap_inactive_color = Color(0.3, 0.3, 0.3, 0.8)
+	var snap_active_color = Color(0.353, 0.698, 1.0, 1.0)
+	var snap_positions = {
+		"snap_315": Vector2(dial_size - 8, -4),
+		"snap_45":  Vector2(dial_size - 8, dial_size - 8),
+		"snap_135": Vector2(-4, dial_size - 8),
+		"snap_225": Vector2(-4, -4),
+	}
+	var snap_angles = {"snap_315": 315.0, "snap_45": 45.0, "snap_135": 135.0, "snap_225": 225.0}
+	var snap_tooltips = {"snap_315": "Lock angle: up-right", "snap_45": "Lock angle: down-right",
+		"snap_135": "Lock angle: down-left", "snap_225": "Lock angle: up-left"}
+	_blur_snap_btns = {}
+	for key in snap_positions.keys():
+		var snap_btn = TextureButton.new()
+		snap_btn.name = key
+		snap_btn.texture_normal = _ft_make_circle_texture(snap_btn_size, snap_inactive_color)
+		snap_btn.texture_pressed = _ft_make_circle_texture(snap_btn_size, snap_active_color)
+		snap_btn.toggle_mode = true
+		snap_btn.pressed = false
+		snap_btn.rect_position = snap_positions[key]
+		snap_btn.rect_min_size = Vector2(snap_btn_size, snap_btn_size)
+		snap_btn.hint_tooltip = snap_tooltips[key]
+		snap_btn.focus_mode = Control.FOCUS_NONE
+		snap_btn.connect("toggled", self, "_on_blur_snap_toggled", [key, snap_angles[key]])
+		dial.add_child(snap_btn)
+		_blur_snap_btns[key] = snap_btn
+
+	dial.set_meta("dial_size", dial_size)
+	dial.set_meta("dragging", false)
+	dial.set_meta("snap_angle", -1.0)
+	dial.rect_clip_content = false
+	dial.connect("gui_input", self, "_on_blur_dial_input", [dial])
+	return dial
+
+
+func _ft_make_circle_texture(size: int, color: Color) -> ImageTexture:
+	var img = Image.new()
+	img.create(size, size, false, Image.FORMAT_RGBA8)
+	img.lock()
+	var center = Vector2(size / 2.0, size / 2.0)
+	var radius = size / 2.0
+	for y in range(size):
+		for x in range(size):
+			if Vector2(x, y).distance_to(center) <= radius:
+				img.set_pixel(x, y, color)
+			else:
+				img.set_pixel(x, y, Color(0, 0, 0, 0))
+	img.unlock()
+	var tex = ImageTexture.new()
+	tex.create_from_image(img, 0)
+	return tex
+
+
+func _ft_make_ring_texture(size: int, color: Color) -> ImageTexture:
+	var img = Image.new()
+	img.create(size, size, false, Image.FORMAT_RGBA8)
+	img.lock()
+	var center = Vector2(size / 2.0, size / 2.0)
+	var radius = size / 2.0
+	for y in range(size):
+		for x in range(size):
+			if abs(Vector2(x, y).distance_to(center) - radius) < 1.0:
+				img.set_pixel(x, y, color)
+			else:
+				img.set_pixel(x, y, Color(0, 0, 0, 0))
+	img.unlock()
+	var tex = ImageTexture.new()
+	tex.create_from_image(img, 0)
+	return tex
+
+
+func _blur_len_from_frac(frac: float) -> float:
+	# Dial radius fraction (0..1) -> motion length, non-linear (BLUR_DIAL_EXP).
+	return pow(clamp(frac, 0.0, 1.0), BLUR_DIAL_EXP) * BLUR_MOTION_MAX
+
+
+func _blur_frac_from_len(length: float) -> float:
+	if BLUR_MOTION_MAX <= 0.0:
+		return 0.0
+	return pow(clamp(length / BLUR_MOTION_MAX, 0.0, 1.0), 1.0 / BLUR_DIAL_EXP)
+
+
+func _blur_set_dial_handle(v: Vector2) -> void:
+	# v = direction * radius fraction, in [-1,1]².
+	if _blur_dial == null or not is_instance_valid(_blur_dial):
+		return
+	var dial_size = float(_blur_dial.get_meta("dial_size"))
+	var radius = dial_size / 2.0
+	var handle = _blur_dial.get_node_or_null("Handle")
+	if handle == null:
+		return
+	handle.rect_position = Vector2(dial_size / 2.0 + v.x * radius - 5, dial_size / 2.0 + v.y * radius - 5)
+
+
+func _blur_sync_dial(m: float, a: float) -> void:
+	# Places the handle from the current length / angle values.
+	var frac = _blur_frac_from_len(m)
+	var rad = deg2rad(a)
+	_blur_set_dial_handle(Vector2(cos(rad), sin(rad)) * frac)
+
+
+func _on_blur_dial_input(event: InputEvent, dial: Control) -> void:
+	if event is InputEventMouseButton:
+		if event.button_index == BUTTON_LEFT:
+			dial.set_meta("dragging", event.pressed)
+			if event.pressed:
+				_blur_update_dial_from_mouse(event.position, dial)
+	elif event is InputEventMouseMotion:
+		if dial.get_meta("dragging"):
+			_blur_update_dial_from_mouse(event.position, dial)
+
+
+func _blur_update_dial_from_mouse(pos: Vector2, dial: Control) -> void:
+	var dial_size = float(dial.get_meta("dial_size"))
+	var radius = dial_size / 2.0
+	var delta = pos - Vector2(radius, radius)
+	if delta.length() > radius:
+		delta = delta.normalized() * radius
+	var frac = delta.length() / radius
+	var length = _blur_len_from_frac(frac)
+	length = stepify(length, BLUR_STEP)
+	var snap = float(dial.get_meta("snap_angle"))
+	_blur_syncing = true
+	_blur_m_spin.value = length
+	if snap >= 0.0:
+		# Snap active: the angle is locked, dragging only changes the length.
+		var sr = deg2rad(snap)
+		_blur_set_dial_handle(Vector2(cos(sr), sin(sr)) * _blur_frac_from_len(length))
+	else:
+		_blur_set_dial_handle(delta / radius)
+		if delta.length() > 0.5:
+			var ang = rad2deg(atan2(delta.y, delta.x))
+			if ang < 0.0:
+				ang += 360.0
+			_blur_a_spin.value = round(ang)
+	_blur_syncing = false
+	_apply_blur_from_ui()
+
+
+func _on_blur_snap_toggled(pressed: bool, key: String, angle: float) -> void:
+	if _blur_syncing:
+		return
+	if pressed:
+		_blur_syncing = true
+		for k in _blur_snap_btns.keys():
+			if k != key and is_instance_valid(_blur_snap_btns[k]):
+				_blur_snap_btns[k].pressed = false
+		_blur_a_spin.value = round(angle)
+		_blur_syncing = false
+		if _blur_dial != null and is_instance_valid(_blur_dial):
+			_blur_dial.set_meta("snap_angle", angle)
+		_blur_sync_dial(float(_blur_m_spin.value), angle)
+		_apply_blur_from_ui()
+	elif _blur_dial != null and is_instance_valid(_blur_dial):
+		_blur_dial.set_meta("snap_angle", -1.0)
+
+
+func _blur_deactivate_snaps() -> void:
+	var prev = _blur_syncing
+	_blur_syncing = true
+	for k in _blur_snap_btns.keys():
+		if is_instance_valid(_blur_snap_btns[k]):
+			_blur_snap_btns[k].pressed = false
+	_blur_syncing = prev
+	if _blur_dial != null and is_instance_valid(_blur_dial):
+		_blur_dial.set_meta("snap_angle", -1.0)
 
 
 func _make_reset_button(tooltip: String) -> Button:
@@ -1341,6 +2023,7 @@ func _on_reset_scale() -> void:
 		_remove_distort_shader(nd)
 		_remove_crop(nd)
 		_remove_edgecrop(nd)
+		_remove_blur(nd)
 	if not simple and _select_tool != null:
 		_select_tool.call("RecordTransforms")
 	# After reset, capture and push a unified record that restores
@@ -1564,7 +2247,20 @@ func update(_delta: float) -> void:
 	_update_crop_slider_ui()
 	_update_crop_opacity_ui()
 	_update_edgecrop_ui()
+	_update_blur_ui()
 	_ftp("crop_ui", _ft2)
+	# Blur: one undo record per slider burst (recorded once the mouse is
+	# released and the controls have been idle for a moment).
+	if not _blur_before.empty():
+		if _blur_before_node == null or not is_instance_valid(_blur_before_node):
+			_blur_before = {}
+			_blur_before_node = null
+		elif not Input.is_mouse_button_pressed(BUTTON_LEFT) \
+				and OS.get_ticks_msec() - _blur_dirty_ms >= 250:
+			_record_ft_unified_change(_blur_before, _capture_ft_unified([_blur_before_node]))
+			_save_ft_data()
+			_blur_before = {}
+			_blur_before_node = null
 	if _crop_feather_dirty_node != null:
 		if not is_instance_valid(_crop_feather_dirty_node):
 			_crop_feather_dirty_node = null
@@ -1614,6 +2310,9 @@ func update(_delta: float) -> void:
 	_ft4 = OS.get_ticks_usec()
 	_restore_edgecrop_from_store(not pattern_tool_active)
 	_ftp("restore_edgecrop", _ft4)
+	_ft4 = OS.get_ticks_usec()
+	_restore_blur_from_store(not pattern_tool_active)
+	_ftp("restore_blur", _ft4)
 	_ft4 = OS.get_ticks_usec()
 	_ft_watch_geometric(not pattern_tool_active)
 	_ftp("watch_geo", _ft4)
@@ -1711,6 +2410,7 @@ func update(_delta: float) -> void:
 			if fresh_props.size() > 0:
 				_ft_lock = fresh_props.duplicate()
 				_ft_lock_reassert = 0
+				_ft_lock_next_id = _ft_world_next_id()
 		elif not _same_selection(fresh_props, _ft_lock):
 			# Sélection walls-only : switch DÉLIBÉRÉ vers un wall (compatible
 			# symétrie) → on lâche le verrou au lieu de le rétablir, sinon le
@@ -1718,6 +2418,15 @@ func update(_delta: float) -> void:
 			if fresh_props.size() == 0 and _selected_walls().size() > 0:
 				_ft_lock = []
 				_ft_lock_reassert = 0
+			# Paste / duplicate: DD deselected the locked asset and selected
+			# NEW nodes. Reasserting the lock here would leave the pasted
+			# copies at their spawn point and hand the original to
+			# clipboard_fix's cursor move — the lock follows the new
+			# selection instead.
+			elif _ft_selection_has_new_nodes(fresh_props):
+				_ft_lock = fresh_props.duplicate()
+				_ft_lock_reassert = 0
+				_ft_lock_next_id = _ft_world_next_id()
 			# DD a basculé sur un autre asset → on rétablit le verrou (appels
 			# directs, comme DragSelectWalls / alt_deselect).
 			elif _ft_lock_reassert < 8 and _select_tool != null:
@@ -2353,6 +3062,7 @@ func _capture_ft_unified(nodes: Array) -> Dictionary:
 	var crop_feather_store = _g.ModMapData.get("_ft_crop_feather", {})
 	var crop_opacity_store = _g.ModMapData.get("_ft_crop_opacity", {})
 	var edgecrop_store = _g.ModMapData.get("_ft_edgecrop", {})
+	var blur_store = _g.ModMapData.get("_ft_blur", {})
 	var portal_offsets_store = _g.ModMapData.get("_portal_offsets", {})
 	var pattern_orig_store = _g.ModMapData.get("_ft_pattern_orig", {})
 	var pattern_orig_pos_store = _g.ModMapData.get("_ft_pattern_orig_pos", {})
@@ -2393,6 +3103,8 @@ func _capture_ft_unified(nodes: Array) -> Dictionary:
 			entry["crop_opacity"] = crop_opacity_store[key]
 		if edgecrop_store.has(key):
 			entry["edgecrop"] = edgecrop_store[key].duplicate()
+		if blur_store.has(key):
+			entry["blur"] = blur_store[key].duplicate()
 		# Portal-specific extras.
 		if _is_portal(nd):
 			var radius = nd.get("Radius")
@@ -2421,6 +3133,12 @@ func _capture_ft_unified(nodes: Array) -> Dictionary:
 				entry["pattern_reset"] = pattern_reset_store[key].duplicate(true)
 			if pattern_world_store.has(key):
 				entry["pattern_world"] = pattern_world_store[key].duplicate(true)
+			# Texture rotation: mutated by the bake compensation (folding a
+			# rotated basis moves the angle from the node onto the shader
+			# uniform) — must round-trip through undo.
+			var tex_rot = nd.get("_Rotation")
+			if tex_rot != null:
+				entry["pattern_tex_rot"] = float(tex_rot)
 		out[key] = entry
 	return out
 
@@ -2499,6 +3217,13 @@ func _ft_unified_equal(a: Dictionary, b: Dictionary) -> bool:
 			var gb = eb["edgecrop"]
 			if ga.get("px") != gb.get("px") or ga.get("hard") != gb.get("hard"):
 				return false
+		if ea.has("blur") != eb.has("blur"):
+			return false
+		if ea.has("blur"):
+			var ba = ea["blur"]
+			var bb = eb["blur"]
+			if ba.get("r") != bb.get("r") or ba.get("m") != bb.get("m") or ba.get("a") != bb.get("a"):
+				return false
 		# Portal extras.
 		if ea.get("portal_radius") != eb.get("portal_radius"):
 			return false
@@ -2523,6 +3248,8 @@ func _ft_unified_equal(a: Dictionary, b: Dictionary) -> bool:
 			for i in range(pa.size()):
 				if pa[i] != pb[i]:
 					return false
+		if ea.get("pattern_tex_rot") != eb.get("pattern_tex_rot"):
+			return false
 		if ea.get("pattern_transform") != eb.get("pattern_transform"):
 			return false
 		# pattern_orig / orig_pos / reset / world: compare presence
@@ -2575,6 +3302,9 @@ func _restore_ft_unified(state: Dictionary) -> void:
 	if not _g.ModMapData.has("_ft_edgecrop"):
 		_g.ModMapData["_ft_edgecrop"] = {}
 	var edgecrop_store = _g.ModMapData["_ft_edgecrop"]
+	if not _g.ModMapData.has("_ft_blur"):
+		_g.ModMapData["_ft_blur"] = {}
+	var blur_store = _g.ModMapData["_ft_blur"]
 	var portal_offsets_store = _g.ModMapData["_portal_offsets"]
 	var pattern_orig_store = _g.ModMapData["_ft_pattern_orig"]
 	var pattern_orig_pos_store = _g.ModMapData["_ft_pattern_orig_pos"]
@@ -2639,6 +3369,8 @@ func _restore_ft_unified(state: Dictionary) -> void:
 			if _is_pattern(nd):
 				if entry.has("pattern_transform"):
 					nd.transform = entry["pattern_transform"]
+				if entry.has("pattern_tex_rot"):
+					_set_pattern_texture_rotation(nd, entry["pattern_tex_rot"])
 				# Make sure the stores _apply_distort_pattern reads from
 				# carry the captured values BEFORE we call it (it reads
 				# _ft_pattern_orig via _get_orig_polygon).
@@ -2735,6 +3467,12 @@ func _restore_ft_unified(state: Dictionary) -> void:
 			crop_opacity_store[key] = entry["crop_opacity"]
 		else:
 			crop_opacity_store.erase(key)
+		# Blur: the store is mirrored here; the material itself is dropped
+		# below and rebuilt (with or without blur) by the restore loops.
+		if entry.has("blur"):
+			blur_store[key] = entry["blur"].duplicate()
+		else:
+			blur_store.erase(key)
 		var _had_edge_prev = edgecrop_store.has(key)
 		if entry.has("edgecrop"):
 			edgecrop_store[key] = entry["edgecrop"].duplicate()
@@ -2798,9 +3536,17 @@ func _restore_ft_unified(state: Dictionary) -> void:
 			skip_material_clear = true
 		if not skip_material_clear and _ft_materials.has(key):
 			if nd != null and is_instance_valid(nd):
-				var sprite = _get_sprite_node(nd)
-				if sprite != null:
-					sprite.material = _ft_materials[key].get("original", null)
+				var _mk = _ft_materials[key].get("kind", "prop")
+				if _mk == "path":
+					_ft_line_restore(nd)
+				elif _mk == "pattern":
+					if nd.material == _ft_materials[key].get("warp"):
+						nd.material = _ft_materials[key].get("original", null)
+				else:
+					var sprite = _get_sprite_node(nd)
+					if sprite != null:
+						sprite.material = _ft_materials[key].get("original", null)
+					_ft_reset_shadow_material(nd)
 			_ft_materials.erase(key)
 	# Force walls to re-fit the restored portals.
 	for wall in walls_to_remake:
@@ -3251,6 +3997,44 @@ func _apply_distort_path(st: Dictionary, nc: Array) -> void:
 
 
 
+func _set_pattern_texture_rotation(node: Node2D, rot: float) -> void:
+	# Route the texture rotation through DD's own SetNewRotation so the C#
+	# model (_Rotation, persisted by PatternShape.Save) stays in sync, then
+	# mirror the uniform onto whichever cached material (FT warp / DD
+	# original) is NOT currently on the node — SetNewRotation only writes
+	# the param on node.material.
+	if node.has_method("SetNewRotation"):
+		node.call("SetNewRotation", rot)
+	var key = _ft_node_key(node)
+	if _ft_materials.has(key):
+		for mkey in ["warp", "original"]:
+			var m = _ft_materials[key].get(mkey)
+			if m is ShaderMaterial and m != node.material:
+				m.set_shader_param("rotation", rot)
+
+
+func _bake_pattern_texture_rotation(node: Node2D, basis_t: Transform2D) -> void:
+	# DD stores a pattern's SHAPE rotation on the node (PatternShape.Save:
+	# "shape_rotation" = Rotation) and Pattern.shader samples in LOCAL space
+	# (world_uv = VERTEX / textureSize), so the texture rotates with the
+	# node. When we fold a rotated basis into the polygon and reset the
+	# basis to identity, sampling becomes axis-aligned again and the
+	# texture snaps back to its original angle. Compensate by adding the
+	# basis rotation to the "rotation" uniform: DD's rotate_uv applies
+	# R(-r) to the sampling coords, exactly like the inverse basis R(-theta)
+	# did — same angle, up to a tiling phase offset (invisible on seamless
+	# tiles). For a reflected basis (det < 0, legacy repair) the x column
+	# of R(theta)*diag(1,-1) is still (cos, sin) — the angle is right, the
+	# chirality is carried by the mirrored points.
+	var theta = atan2(basis_t.x.y, basis_t.x.x)
+	if abs(theta) < 0.0005:
+		return
+	var cur = node.get("_Rotation")
+	if cur == null:
+		return  # Null texture: no shader material, nothing to rotate
+	_set_pattern_texture_rotation(node, float(cur) + theta)
+
+
 func _bake_pattern_state(node: Node2D) -> void:
 	# Fusionne toute transformation (scale, shear, distort, perspective) dans le polygon.
 	# Appelé uniquement quand le transform est non-identity.
@@ -3258,6 +4042,7 @@ func _bake_pattern_state(node: Node2D) -> void:
 
 	# Calcule les positions monde des vertices.
 	var world_pts = []
+	var basis_folded = false
 	var has_world_corners = key != "" and _g.ModMapData.has("_ft_pattern_world") \
 			and _g.ModMapData["_ft_pattern_world"].has(key)
 	var orig = _get_orig_polygon(node)
@@ -3282,10 +4067,12 @@ func _bake_pattern_state(node: Node2D) -> void:
 		else:
 			for p in node.polygon:
 				world_pts.append(node.transform.xform(p))
+			basis_folded = true
 	else:
 		var t = node.transform
 		for p in node.polygon:
 			world_pts.append(t.xform(p))
+		basis_folded = true
 
 	# Supprime le shader distort (restaure le material original)
 	if _ft_materials.has(key):
@@ -3300,6 +4087,14 @@ func _bake_pattern_state(node: Node2D) -> void:
 	if _g.ModMapData.has("_ft_pattern_world"):
 		_g.ModMapData["_ft_pattern_world"].erase(key)
 
+	# Compensate the texture angle BEFORE resetting the basis: DD carries
+	# the shape rotation on the node and the texture follows it (see
+	# _bake_pattern_texture_rotation). Only when the basis really got
+	# folded into the points (not the world-corners path, which ignores
+	# the basis).
+	if basis_folded:
+		_bake_pattern_texture_rotation(node, node.transform)
+
 	# Remet le transform à identity en gardant la position DD intacte
 	var orig_pos = node.position
 	node.transform = Transform2D(Vector2(1, 0), Vector2(0, 1), orig_pos)
@@ -3311,15 +4106,12 @@ func _bake_pattern_state(node: Node2D) -> void:
 		for p in world_pts:
 			new_poly.append(p - orig_pos)
 	else:
-		# Plus de 4 vertices (subdivisé) → prend juste les 4 coins AABB
-		var bmn = world_pts[0]; var bmx = world_pts[0]
+		# N vertices (arbitrary polygon) → keep EVERY transformed vertex.
+		# The old collapse to the 4 AABB corners destroyed the shape of any
+		# non-rectangular pattern (symptom: "the pattern fills its whole
+		# transform box" after baking a non-identity basis).
 		for p in world_pts:
-			bmn.x = min(bmn.x, p.x); bmn.y = min(bmn.y, p.y)
-			bmx.x = max(bmx.x, p.x); bmx.y = max(bmx.y, p.y)
-		new_poly.append(Vector2(bmn.x, bmn.y) - orig_pos)
-		new_poly.append(Vector2(bmx.x, bmn.y) - orig_pos)
-		new_poly.append(Vector2(bmx.x, bmx.y) - orig_pos)
-		new_poly.append(Vector2(bmn.x, bmx.y) - orig_pos)
+			new_poly.append(p - orig_pos)
 	node.polygon = new_poly
 	node.uv = PoolVector2Array()
 	# Stocke ces 4 coins comme nouveau working original
@@ -3394,6 +4186,9 @@ func _soft_bake_pattern(node: Node2D) -> void:
 		outline.points = pts
 
 	# 5. Remet le transform a identity (tout est absorbe)
+	# Texture-angle compensation (the basis — rotation included — was just
+	# folded into corners + polygon): see _bake_pattern_texture_rotation.
+	_bake_pattern_texture_rotation(node, t)
 	node.transform = Transform2D(Vector2(1, 0), Vector2(0, 1), t.origin)
 
 	# 6. Met a jour la position de reference
@@ -3401,6 +4196,15 @@ func _soft_bake_pattern(node: Node2D) -> void:
 		if not _g.ModMapData.has("_ft_pattern_orig_pos"):
 			_g.ModMapData["_ft_pattern_orig_pos"] = {}
 		_g.ModMapData["_ft_pattern_orig_pos"][key] = [t.origin.x, t.origin.y]
+
+	# 7. The basis is now IDENTITY (everything absorbed): sync any stored
+	# _ft_transforms entry, otherwise _reapply_shear_transforms would
+	# re-impose next frame the basis we just baked ON TOP of the baked
+	# geometry (double application: the pattern drifted away or vanished —
+	# typical case: symmetry then move).
+	if key != "" and _g.ModMapData.has("_ft_transforms") \
+			and _g.ModMapData["_ft_transforms"].has(key):
+		_store_shear_transform(node, node.transform)
 
 
 # Construit les infos d'arc pour un portal : points du mur, longueurs cumulées, arc initial.
@@ -4874,8 +5678,8 @@ func _draw_overlay(overlay: Node2D) -> void:
 				overlay.draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
 		return
 
-	# ── Edge Crop : cadre simple + label (pas de handles, mode paramétrique) ──
-	if _transform_mode == "edgecrop" and _selected_objects.size() == 1 \
+	# ── Edge Crop / Blur : cadre simple + label (pas de handles, mode paramétrique) ──
+	if (_transform_mode == "edgecrop" or _transform_mode == "blur") and _selected_objects.size() == 1 \
 			and _is_plain_prop(_selected_objects[0]):
 		var ndx = _selected_objects[0]
 		if is_instance_valid(ndx):
@@ -4884,13 +5688,26 @@ func _draw_overlay(overlay: Node2D) -> void:
 			overlay.draw_line(ce[1], ce[2], BOX_COL, lw)
 			overlay.draw_line(ce[2], ce[3], BOX_COL, lw)
 			overlay.draw_line(ce[3], ce[0], BOX_COL, lw)
+			# Blur: motion direction arrow through the centre (world angle).
+			if _transform_mode == "blur":
+				var bp = _blur_params(ndx)
+				if bp["m"] > 0.0:
+					var bc = (ce[0] + ce[1] + ce[2] + ce[3]) * 0.25
+					var bd = _blur_world_dir(bp["a"])
+					var bl = max(bp["m"] * 0.5, 20.0 / zoom)
+					var b0 = bc - bd * bl
+					var b1 = bc + bd * bl
+					overlay.draw_line(b0, b1, BOX_COL, lw)
+					var ah = 8.0 / sqrt(zoom)
+					overlay.draw_line(b1, b1 - bd.rotated(0.5) * ah, BOX_COL, lw)
+					overlay.draw_line(b1, b1 - bd.rotated(-0.5) * ah, BOX_COL, lw)
 			var bb_e = _selection_aabb()
 			if bb_e.size.length() > 1.0:
 				var font_e : Font = null
 				if _toggle_btn != null and is_instance_valid(_toggle_btn):
 					font_e = _toggle_btn.get_font("font")
 				if font_e != null:
-					var elabel = "EDGE CROP"
+					var elabel = "BLUR" if _transform_mode == "blur" else "EDGE CROP"
 					var twe = font_e.get_string_size(elabel).x / zoom
 					var fse = 1.4 / sqrt(zoom)
 					var fpe = Vector2(bb_e.position.x + bb_e.size.x * 0.5 - (twe * fse * 0.5),
@@ -5026,7 +5843,7 @@ func _allowed_handle_indices() -> Array:
 			return [0, 2, 4, 6]          # coins uniquement
 		"crop", "softcrop":
 			return []                    # handles gérés séparément (polygone dynamique)
-		"edgecrop":
+		"edgecrop", "blur":
 			return []                    # paramétrique (sliders), cadre inerte
 		_:  # "free"
 			return [0, 1, 2, 3, 4, 5, 6, 7]
@@ -5389,7 +6206,8 @@ func _reapply_shear_transforms(select_active: bool = true) -> void:
 		# Auto-réparation : une base stockée qui est une ROTATION PURE
 		# (colonnes orthonormées, det ≈ +1, non identité) sur un pattern
 		# n'est jamais un état FT légitime (les entrées légitimes portent
-		# du shear, du scale ou un flip det<0). C'est un artefact de
+		# du shear ou du scale — flips are now baked into the distort
+		# corners, never into the basis). C'est un artefact de
 		# l'ancien bug "bande de rotation sur pattern" : on purge
 		# l'entrée et on remet la base à l'identité pour libérer le
 		# pattern (il redevient déplaçable/éditable normalement).
@@ -5410,6 +6228,24 @@ func _reapply_shear_transforms(select_active: bool = true) -> void:
 					and abs(cx.dot(cy)) < 0.001 and det > 0.0:
 				print("[FreeTransform] Pattern : base rotation-pure purgée (artefact), node libéré")
 				nd.transform = Transform2D(Vector2(1, 0), Vector2(0, 1), nd.position)
+				dead_keys.append(key)
+				continue
+			# Legacy repair: a REFLECTED basis (det < 0) stored on a
+			# pattern comes from the old symmetry implementation (maps
+			# saved before the fix). Fold it ONCE into the geometry
+			# (mirrored appearance preserved) then purge the entry —
+			# symmetries now live in the distort corners.
+			if det < 0.0:
+				nd.transform = Transform2D(
+					Vector2(d.xx, d.xy),
+					Vector2(d.yx, d.yy),
+					Vector2(d.ox, d.oy)
+				)
+				if _has_distort_corners(nd):
+					_soft_bake_pattern(nd)
+				else:
+					_bake_pattern_state(nd)
+				print("[FreeTransform] Pattern: legacy reflected basis baked into geometry, entry purged")
 				dead_keys.append(key)
 				continue
 		# Pour les patterns, DD peut reset la position — on utilise la
@@ -5716,6 +6552,10 @@ func _apply_distort_pattern(node: Node2D, world_corners: Array, orig_polygon = n
 	var need_shader = not _ft_materials.has(id)
 	if not need_shader and node.material != _ft_materials[id].get("warp"):
 		need_shader = true
+	# A blur-only material (DD's pattern shader + blur, no warp corners) must
+	# be replaced by the warp shader (which carries the blur too).
+	if not need_shader and not (node.material is ShaderMaterial and node.material.has_meta("_ft_warp")):
+		need_shader = true
 
 	if need_shader:
 		var orig_mat = node.material
@@ -5734,7 +6574,13 @@ func _apply_distort_pattern(node: Node2D, world_corners: Array, orig_polygon = n
 
 		var mat = ShaderMaterial.new()
 		var sh  = Shader.new()
-		sh.code = PATTERN_DISTORT_SHADER_CUSTOM_COLOR_SRC if has_custom_color else PATTERN_DISTORT_SHADER_SRC
+		var _pcode = PATTERN_DISTORT_SHADER_CUSTOM_COLOR_SRC if has_custom_color else PATTERN_DISTORT_SHADER_SRC
+		var _pblur = _blur_active(node)
+		if _pblur:
+			var _pbc = _ft_inject_tile_blur(_pcode, ["albedo"])
+			if _pbc != "":
+				_pcode = _pbc
+		sh.code = _pcode
 		mat.shader = sh
 		mat.set_meta("_ft_warp", true)
 
@@ -5768,8 +6614,9 @@ func _apply_distort_pattern(node: Node2D, world_corners: Array, orig_polygon = n
 			if dd_wear != null:
 				mat.set_shader_param("wear", dd_wear)
 
-		_ft_materials[id] = {"warp": mat, "original": orig_mat}
+		_ft_materials[id] = {"warp": mat, "original": orig_mat, "blur": _pblur, "kind": "pattern"}
 		node.material = mat
+		_ft_apply_blur_uniforms(node)
 
 	var mat = _ft_materials[id]["warp"]
 	if node.material != mat:
@@ -5926,14 +6773,19 @@ func _ft_cmt_data_fingerprint(node) -> String:
 	return JSON.print(store["data"][key])
 
 
-func _ft_get_merged_warp_shader(src_code: String):
+func _ft_get_merged_warp_shader(src_code: String, with_blur: bool = false):
 	# Retourne le Shader warp fusionné pour ce code source (ou null si la
 	# fusion échoue). Mis en cache par hash : CMT ne possède que 2-3 shaders
 	# distincts (universalshader, colorable_hsl), le cache reste minuscule.
-	var ck = str(src_code.hash()) + "_" + str(src_code.length())
+	# with_blur: the blur is injected on top of the merged warp (own cache key).
+	var ck = str(src_code.hash()) + "_" + str(src_code.length()) + ("_blur" if with_blur else "")
 	if _ft_merged_shader_cache.has(ck):
 		return _ft_merged_shader_cache[ck]
 	var code = _ft_merge_warp_into_shader(src_code)
+	if with_blur and code != "":
+		var bcode = _ft_inject_blur(code, "ft_")
+		if bcode != "":
+			code = bcode
 	var sh = null
 	if code != "":
 		sh = Shader.new()
@@ -6053,17 +6905,34 @@ func _ft_copy_shader_params(src_mat, dst_mat) -> void:
 			dst_mat.set_shader_param(pname, v)
 
 
-func _apply_distort_shader(node: Node2D, world_corners: Array, shader_corners = null) -> void:
-	# Crop et distort sont mutuellement exclusifs sur un même node.
+func _apply_distort_shader(node: Node2D, world_corners: Array, shader_corners = null, blur_only: bool = false) -> void:
+	# blur_only: installs the same material with IDENTITY corners (the warp
+	# is then a no-op, only the blur acts). Nothing is stored in _ft_distort
+	# and crop / edge crop are left alone (the blur composes with them).
 	var _ck = _ft_node_key(node)
-	if _ck != "" and _g.ModMapData.has("_ft_crop") and _g.ModMapData["_ft_crop"].has(_ck):
-		_remove_crop(node)
-	_remove_edgecrop(node)
+	if not blur_only:
+		# Crop et distort sont mutuellement exclusifs sur un même node.
+		if _ck != "" and _g.ModMapData.has("_ft_crop") and _g.ModMapData["_ft_crop"].has(_ck):
+			_remove_crop(node)
+		_remove_edgecrop(node)
 	var sprite = _get_sprite_node(node)
 	if sprite == null: return
+	var _blur_on = _blur_active(node)
 
 	var lc = []
-	if shader_corners is Array and shader_corners.size() == 4:
+	if blur_only:
+		# Identity corners = the Sprite rect in vertex space (+-real/2).
+		var _bt = sprite.get("texture")
+		var _brr = sprite.get("region_rect")
+		var _bw = 128.0
+		var _bh = 128.0
+		if _bt != null and _brr is Rect2 and _brr.size.length() > 0.0:
+			_bw = _brr.size.x; _bh = _brr.size.y
+		elif _bt != null:
+			_bw = _bt.get_size().x; _bh = _bt.get_size().y
+		lc = [Vector2(-_bw * 0.5, -_bh * 0.5), Vector2(_bw * 0.5, -_bh * 0.5),
+			Vector2(_bw * 0.5, _bh * 0.5), Vector2(-_bw * 0.5, _bh * 0.5)]
+	elif shader_corners is Array and shader_corners.size() == 4:
 		# Coins DÉJÀ en espace shader (±real/2), tels que stockés dans
 		# _ft_distort : réinstallation directe, AUCUNE reconversion. La
 		# reconversion monde→local→ratio de padding n'est PAS un aller-retour
@@ -6143,7 +7012,7 @@ func _apply_distort_shader(node: Node2D, world_corners: Array, shader_corners = 
 		if original_mat is ShaderMaterial and original_mat.shader != null:
 			var src_m = original_mat.shader.code
 			if ("apply_grayscale" in src_m) or ("apply_hsl" in src_m):
-				merged_sh = _ft_get_merged_warp_shader(src_m)
+				merged_sh = _ft_get_merged_warp_shader(src_m, _blur_on)
 
 		if merged_sh != null:
 			mat.shader = merged_sh
@@ -6156,7 +7025,12 @@ func _apply_distort_shader(node: Node2D, world_corners: Array, shader_corners = 
 			# material (cf. _ft_cmt_data_fingerprint).
 			mat.set_meta("_ft_cmt_fp", _ft_cmt_data_fingerprint(node))
 		else:
-			sh.code = DISTORT_SHADER_CUSTOM_COLOR_SRC if has_custom_color else DISTORT_SHADER_SRC
+			var _code = DISTORT_SHADER_CUSTOM_COLOR_SRC if has_custom_color else DISTORT_SHADER_SRC
+			if _blur_on:
+				var _bcode = _ft_inject_blur(_code, "")
+				if _bcode != "":
+					_code = _bcode
+			sh.code = _code
 			mat.shader = sh
 			mat.set_meta("_ft_warp", true)
 
@@ -6184,7 +7058,9 @@ func _apply_distort_shader(node: Node2D, world_corners: Array, shader_corners = 
 			mat.set_shader_param(_uvp + "uv_min", Vector2.ZERO)
 			mat.set_shader_param(_uvp + "uv_max", Vector2.ONE)
 
-		_ft_materials[id] = {"warp": mat, "original": original_mat}
+		# "blur" = blur requested when this material was built; the restore
+		# loops compare it with _blur_active() and rebuild on mismatch.
+		_ft_materials[id] = {"warp": mat, "original": original_mat, "blur": _blur_on}
 		sprite.material = mat
 
 	var mat = _ft_materials[id]["warp"]
@@ -6195,7 +7071,8 @@ func _apply_distort_shader(node: Node2D, world_corners: Array, shader_corners = 
 	mat.set_shader_param(_cpfx + "corner_bl", lc[3])
 
 	# Stocke les coins en local pour persistance entre drags
-	_store_distort_corners(node, lc)
+	if not blur_only:
+		_store_distort_corners(node, lc)
 
 	# L'ombre vanilla (child 0) suit la distorsion. On NE partage PAS le matériau
 	# du prop (il sortirait l'ombre en couleurs) : on lui met un matériau de warp
@@ -6211,10 +7088,16 @@ func _apply_distort_shader(node: Node2D, world_corners: Array, shader_corners = 
 			var ssh = Shader.new()
 			# Reproduit le ObjectShadow.shader vanilla (noir pur, alpha de la
 			# texture * 0.18) mais avec la déformation warp appliquée.
-			ssh.code = DISTORT_SHADER_SRC.replace(
+			var _scode = DISTORT_SHADER_SRC.replace(
 				"COLOR=texture(TEXTURE,warp_uv(v_local));",
 				"COLOR=vec4(0.0,0.0,0.0,texture(TEXTURE,warp_uv(v_local)).a*0.18);")
+			if _ft_materials[id].get("blur", false):
+				var _sbcode = _ft_inject_blur(_scode, "")
+				if _sbcode != "":
+					_scode = _sbcode
+			ssh.code = _scode
 			smat.shader = ssh
+			smat.set_meta("_ft_shadow_warp", true)
 			# UV calculée depuis la texture de l'ombre elle-même.
 			var s_tex = _shadow_d.get("texture")
 			var s_rr = _shadow_d.get("region_rect")
@@ -6232,6 +7115,9 @@ func _apply_distort_shader(node: Node2D, world_corners: Array, shader_corners = 
 		smat.set_shader_param("corner_tr", lc[1])
 		smat.set_shader_param("corner_br", lc[2])
 		smat.set_shader_param("corner_bl", lc[3])
+
+	# Blur uniforms (sprite + shadow) — no-op when the material has no blur.
+	_ft_apply_blur_uniforms(node)
 
 
 func _remove_distort_shader(node: Node2D) -> void:
@@ -6281,8 +7167,10 @@ func _restore_distort_from_store(select_active: bool = true) -> void:
 			# Vérifie si le shader est encore sur le node (DD peut le réinitialiser)
 			if _ft_materials.has(key):
 				var expected_mat = _ft_materials[key].get("warp")
+				if nd.material == expected_mat and _ft_materials[key].get("blur", false) == _blur_active(nd):
+					continue  # shader encore en place, état blur inchangé
 				if nd.material == expected_mat:
-					continue  # shader encore en place
+					nd.material = _ft_materials[key].get("original", null)   # blur toggled: rebuild
 				_ft_materials.erase(key)
 			# Ne réinstalle le shader pattern que si PatternShapeTool n'est pas actif.
 			# Sinon, DD a besoin de travailler avec le pattern propre pour la création.
@@ -6296,46 +7184,685 @@ func _restore_distort_from_store(select_active: bool = true) -> void:
 		else:
 			var sprite = _get_sprite_node(nd)
 			if sprite == null: continue
-			if _ft_materials.has(key):
-				var cur = sprite.material
-				if cur == _ft_materials[key].get("warp"):
-					# Shader encore en place. Cas particulier : material FUSIONNÉ
-					# dont la config CMT a changé SANS swap — c'est la
-					# désactivation CMT, dont la garde échoue sur notre shader
-					# fusionné (elle compare les instances de Shader) : CMT ne
-					# nettoie pas le material, donc rien à détecter côté swap.
-					# L'empreinte de config stockée à la fusion nous le dit ; on
-					# repart alors d'un material NU et on rebâtit un warp non
-					# fusionné (couleurs d'origine). Les materials d'avant cette
-					# version n'ont pas d'empreinte -> comportement inchangé.
-					var fp_stale = false
-					if cur is ShaderMaterial and cur.has_meta("_ft_merged") and cur.has_meta("_ft_cmt_fp"):
-						fp_stale = cur.get_meta("_ft_cmt_fp") != _ft_cmt_data_fingerprint(nd)
-					if not fp_stale:
-						continue  # shader encore en place, config CMT inchangée
-					sprite.material = null
-					cur = null  # tombe dans le rebuild ci-dessous (swap reconnu: null)
-				# Le material du sprite n'est plus notre warp. On ne rebâtit que
-				# sur un swap RECONNU : null (reset CMT/DD) ou shader CMT /
-				# custom color (CMT crée un NOUVEAU ShaderMaterial à chaque
-				# changement de réglage). Tout autre material est transitoire —
-				# le highlight de survol de DD remplace lui aussi le material et
-				# restaure le nôtre de lui-même au unhover ; rebâtir pendant le
-				# survol écraserait le highlight et churnait à chaque frame.
-				var recognized = (cur == null)
-				if not recognized and cur is ShaderMaterial and cur.shader != null:
-					var cc = cur.shader.code
-					if ("apply_grayscale" in cc) or ("apply_hsl" in cc) or ("tint_r" in cc):
-						recognized = true
-				if not recognized:
-					continue
-				_ft_materials.erase(key)
+			var mstate = _ft_prop_material_state(nd, sprite, key)
+			if mstate != "rebuild":
+				continue  # "ok" (in place) or "skip" (transient foreign material)
 			# Réinstalle avec les coins stockés TELS QUELS (espace shader) —
 			# jamais via la reconversion monde (non idempotente, cf. plus haut).
 			_apply_distort_shader(nd, [], lc)
 	for key in dead_keys:
 		store.erase(key)
 		_ft_materials.erase(key)
+
+
+func _ft_prop_material_state(nd: Node2D, sprite, key: String) -> String:
+	# State of the FT material (warp and/or blur) of a prop:
+	#   "ok"      our material is on the sprite and up to date (shadow re-synced)
+	#   "rebuild" missing, recognised swap (null / CMT / custom color), CMT
+	#             config disabled, or blur state changed -> caller rebuilds
+	#   "skip"    transient foreign material (DD hover highlight) -> leave it
+	if not _ft_materials.has(key):
+		return "rebuild"
+	var ent = _ft_materials[key]
+	var cur = sprite.material
+	if cur == ent.get("warp"):
+		# Shader encore en place. Cas particulier : material FUSIONNÉ dont la
+		# config CMT a changé SANS swap — c'est la désactivation CMT, dont la
+		# garde échoue sur notre shader fusionné (elle compare les instances
+		# de Shader) : CMT ne nettoie pas le material, donc rien à détecter
+		# côté swap. L'empreinte de config stockée à la fusion nous le dit ;
+		# on repart alors d'un material NU et on rebâtit un warp non fusionné
+		# (couleurs d'origine). Les materials d'avant cette version n'ont pas
+		# d'empreinte -> comportement inchangé.
+		var fp_stale = false
+		if cur is ShaderMaterial and cur.has_meta("_ft_merged") and cur.has_meta("_ft_cmt_fp"):
+			fp_stale = cur.get_meta("_ft_cmt_fp") != _ft_cmt_data_fingerprint(nd)
+		if fp_stale:
+			sprite.material = null
+			_ft_materials.erase(key)
+			return "rebuild"
+		# Blur toggled on/off since the build: the shader code must change.
+		if ent.get("blur", false) != _blur_active(nd):
+			sprite.material = ent.get("original", null)
+			_ft_materials.erase(key)
+			return "rebuild"
+		# Vanilla shadow: a crop unbake / third-party restore may have handed
+		# it its original material back while ours is still on the sprite.
+		var smat = ent.get("shadow_warp", null)
+		if smat is ShaderMaterial:
+			var shadow = _get_shadow_sprite(nd)
+			if shadow != null and shadow.material != smat:
+				_shadow_capture_orig(nd, shadow)
+				shadow.material = smat
+		return "ok"
+	# Le material du sprite n'est plus notre warp. On ne rebâtit que sur un
+	# swap RECONNU : null (reset CMT/DD) ou shader CMT / custom color (CMT
+	# crée un NOUVEAU ShaderMaterial à chaque changement de réglage). Tout
+	# autre material est transitoire — le highlight de survol de DD remplace
+	# lui aussi le material et restaure le nôtre de lui-même au unhover ;
+	# rebâtir pendant le survol écraserait le highlight et churnait à chaque
+	# frame.
+	var recognized = (cur == null)
+	if not recognized and cur is ShaderMaterial and cur.shader != null:
+		var cc = cur.shader.code
+		if ("apply_grayscale" in cc) or ("apply_hsl" in cc) or ("tint_r" in cc):
+			recognized = true
+	if not recognized:
+		return "skip"
+	_ft_materials.erase(key)
+	return "rebuild"
+
+
+func _ft_drop_prop_material(node: Node2D) -> void:
+	# Removes the FT material from the sprite (and the shadow) WITHOUT
+	# touching the stores or the textures (a baked crop stays shared with
+	# the shadow). The restore loops rebuild whatever is still needed.
+	var key = _ft_node_key(node)
+	var sprite = _get_sprite_node(node)
+	if sprite != null and _ft_materials.has(key):
+		sprite.material = _ft_materials[key].get("original", null)
+	_ft_materials.erase(key)
+	_ft_reset_shadow_material(node)
+
+
+func _ft_reset_shadow_material(node: Node2D) -> void:
+	# Gives the vanilla shadow its original material back (texture untouched:
+	# a baked crop may still be sharing it). The capture entry is kept while
+	# a crop / edge crop is active so _unbake_crop_texture can restore it.
+	var key = _ft_node_key(node)
+	var shadow = _get_shadow_sprite(node)
+	if shadow == null:
+		return
+	if _ft_shadow_orig.has(key):
+		shadow.material = _ft_shadow_orig[key].get("material", null)
+		if not (_has_crop(node) or _has_edgecrop(node)):
+			_ft_shadow_orig.erase(key)
+	elif shadow.material is ShaderMaterial and shadow.material.has_meta("_ft_shadow_warp"):
+		shadow.material = null
+
+
+# ══ Blur (Gaussian + motion) ══════════════════════════════════════════════════
+# Props only. Composes with distort (same material), crop / edge crop (baked
+# textures) and the vanilla shadow. See FT_BLUR_HEADER for the shader side.
+
+func _has_blur_entry(node) -> bool:
+	var key = _ft_node_key(node)
+	if key == "": return false
+	return _g.ModMapData.get("_ft_blur", {}).has(key)
+
+
+func _blur_active(node) -> bool:
+	# True when the node needs the blur in its material (r > 0 or m > 0).
+	if node == null or not is_instance_valid(node): return false
+	if not _g.ModMapData.has("_ft_blur"): return false
+	var p = _blur_params(node)
+	return p["r"] > 0.0 or p["m"] > 0.0
+
+
+func _blur_params(node) -> Dictionary:
+	var out = {"r": 0.0, "m": 0.0, "a": 0.0}
+	var key = _ft_node_key(node)
+	if key == "": return out
+	var st = _g.ModMapData.get("_ft_blur", {})
+	if st.has(key):
+		var e = st[key]
+		out["r"] = clamp(float(e.get("r", 0.0)), 0.0, BLUR_RADIUS_MAX)
+		out["m"] = clamp(float(e.get("m", 0.0)), 0.0, BLUR_MOTION_MAX)
+		out["a"] = fmod(float(e.get("a", 0.0)), 360.0)
+	return out
+
+
+func _set_blur(node, r: float, m: float, a: float) -> void:
+	# r == 0 and m == 0 -> the entry is removed (no entry = no blur).
+	var key = _ft_node_key(node)
+	if key == "": return
+	r = clamp(r, 0.0, BLUR_RADIUS_MAX)
+	m = clamp(m, 0.0, BLUR_MOTION_MAX)
+	a = fmod(a, 360.0)
+	if not _g.ModMapData.has("_ft_blur"):
+		_g.ModMapData["_ft_blur"] = {}
+	if r <= 0.0 and m <= 0.0:
+		_g.ModMapData["_ft_blur"].erase(key)
+	else:
+		_g.ModMapData["_ft_blur"][key] = {"r": r, "m": m, "a": a}
+
+
+func _remove_blur(node: Node2D) -> void:
+	if node == null: return
+	if not _has_blur_entry(node):
+		return
+	_g.ModMapData["_ft_blur"].erase(_ft_node_key(node))
+	# Drop the material: the restore loops rebuild it (without blur) if a
+	# distort is still active, otherwise the node keeps its original one.
+	_ft_drop_blur_material(node)
+
+
+func _ft_drop_blur_material(node: Node2D) -> void:
+	match _blur_kind(node):
+		"prop":
+			_ft_drop_prop_material(node)
+		"pattern":
+			var key = _ft_node_key(node)
+			if _ft_materials.has(key):
+				if node.material == _ft_materials[key].get("warp"):
+					node.material = _ft_materials[key].get("original", null)
+				_ft_materials.erase(key)
+		"path":
+			_ft_line_restore(node)
+
+
+func _blur_kind(nd) -> String:
+	# "prop" / "pattern" / "path" / "" (not blurrable).
+	if nd == null or not is_instance_valid(nd):
+		return ""
+	if _is_pattern(nd):
+		return "pattern"
+	if _is_path(nd):
+		return "path"
+	if _is_plain_prop(nd):
+		return "prop"
+	return ""   # walls are not supported (no reliable material to hook)
+
+
+func _blur_target() -> Node2D:
+	# One blurrable asset selected: a plain prop, a pattern, a path, or a
+	# single wall (walls are not in _selected_objects).
+	if _selected_objects.size() == 1 and is_instance_valid(_selected_objects[0]) \
+			and _blur_kind(_selected_objects[0]) != "":
+		return _selected_objects[0]
+	return null
+
+
+func _blur_world_dir(angle_deg: float) -> Vector2:
+	# Screen convention, same as the dial: 0 = right, 90 = down.
+	var rad = deg2rad(angle_deg)
+	return Vector2(cos(rad), sin(rad))
+
+
+func _ft_apply_blur_uniforms(node: Node2D) -> void:
+	# Pushes the blur uniforms to the node's FT material(s). Cheap enough to
+	# call every frame: a signature string skips redundant sets (the motion
+	# direction is world-relative, so it follows the node's rotation).
+	var key = _ft_node_key(node)
+	if key == "" or not _ft_materials.has(key): return
+	var ent = _ft_materials[key]
+	if not ent.get("blur", false): return
+	var kind = ent.get("kind", "prop")
+	if kind != "prop":
+		_ft_apply_tile_blur_uniforms(node, ent, kind)
+		return
+	var sprite = _get_sprite_node(node)
+	if sprite == null: return
+	var p = _blur_params(node)
+	# Premultiplied + mipmapped copy of the sprite texture (cached per
+	# texture). Follows crop / edge crop bakes since they swap the texture.
+	var tex = sprite.get("texture")
+	var btex = _ft_blur_get_premul_texture(tex)
+	var lod_max = 6.0 if btex != null else 0.0
+	var btex_id = btex.get_instance_id() if btex != null else 0
+	# TEXTURE uv -> padded copy uv, and how far outside [uv_min,uv_max] the
+	# taps may read (only when the sprite uses the whole texture: with a
+	# region_rect the padding would expose the neighbouring sprites).
+	var uvmap = Color(1.0, 1.0, 0.0, 0.0)
+	var pad_uv = Vector2.ZERO
+	if btex != null and tex is Texture:
+		var ts = tex.get_size()
+		var padded = ts + Vector2(2 * FT_BLUR_TEX_PAD, 2 * FT_BLUR_TEX_PAD)
+		if ts.x > 0.0 and ts.y > 0.0 and padded.x > 0.0 and padded.y > 0.0:
+			uvmap = Color(ts.x / padded.x, ts.y / padded.y,
+				FT_BLUR_TEX_PAD / padded.x, FT_BLUR_TEX_PAD / padded.y)
+			var rr = sprite.get("region_rect")
+			var has_region = sprite.get("region_enabled") == true and rr is Rect2 and rr.size.length() > 0.0
+			if not has_region:
+				pad_uv = Vector2(FT_BLUR_TEX_PAD / ts.x, FT_BLUR_TEX_PAD / ts.y)
+	# World direction -> sprite vertex space (follows node rotation / flip).
+	var wd = _blur_world_dir(p["a"])
+	var xf = node.global_transform * sprite.transform
+	var ld = xf.basis_xform_inv(wd)
+	if ld.length() < 0.0001:
+		ld = Vector2(1, 0)
+	ld = ld.normalized()
+	var margin = p["r"] + p["m"] * 0.5 + 2.0
+	var sig = "%.3f|%.3f|%.4f|%.4f|%d" % [p["r"], p["m"], ld.x, ld.y, btex_id]
+	if ent.get("blur_sig", "") == sig:
+		return
+	ent["blur_sig"] = sig
+	for mkey in ["warp", "shadow_warp"]:
+		var m = ent.get(mkey, null)
+		if m is ShaderMaterial:
+			m.set_shader_param("ft_blur_radius", p["r"])
+			m.set_shader_param("ft_blur_motion", p["m"])
+			m.set_shader_param("ft_blur_dir", ld)
+			m.set_shader_param("ft_blur_margin", Vector2(margin, margin))
+			m.set_shader_param("ft_blur_lod_max", lod_max)
+			m.set_shader_param("ft_blur_tex", btex)
+			m.set_shader_param("ft_blur_has_tex", 1.0 if btex != null else 0.0)
+			m.set_shader_param("ft_blur_uvmap", uvmap)
+			m.set_shader_param("ft_blur_pad_uv", pad_uv)
+
+
+func _ft_blur_get_premul_texture(src) -> Texture:
+	# Returns (and caches) a premultiplied, mipmapped, transparent-padded
+	# copy of src (FT_BLUR_TEX_PAD px per side), or null when its pixels
+	# cannot be read back. Done natively by Image (fast).
+	if src == null or not (src is Texture):
+		return null
+	var cid = src.get_instance_id()
+	if _ft_blur_tex_cache.has(cid):
+		var e = _ft_blur_tex_cache[cid]
+		if e["src"].get_ref() == src:
+			return e["tex"]
+		_ft_blur_tex_cache.erase(cid)
+	var img = src.get_data()
+	if img == null or img.is_empty():
+		print("[FreeTransform] Blur: cannot read texture data (", src, ") — fallback to direct sampling")
+		return null
+	img = img.duplicate()
+	if img.is_compressed():
+		if img.decompress() != OK:
+			return null
+	if img.has_mipmaps():
+		img.clear_mipmaps()
+	if img.get_format() != Image.FORMAT_RGBA8:
+		img.convert(Image.FORMAT_RGBA8)
+	# Transparent padding so border taps never hit the clamped edge column.
+	var w = img.get_width()
+	var h = img.get_height()
+	var padded = Image.new()
+	padded.create(w + 2 * FT_BLUR_TEX_PAD, h + 2 * FT_BLUR_TEX_PAD, false, Image.FORMAT_RGBA8)
+	padded.fill(Color(0, 0, 0, 0))
+	padded.blit_rect(img, Rect2(0, 0, w, h), Vector2(FT_BLUR_TEX_PAD, FT_BLUR_TEX_PAD))
+	img = padded
+	img.premultiply_alpha()
+	img.generate_mipmaps()
+	var tex = ImageTexture.new()
+	tex.create_from_image(img, Texture.FLAG_MIPMAPS | Texture.FLAG_FILTER)
+	# Prune copies whose source texture is gone (baked crops get replaced).
+	for k in _ft_blur_tex_cache.keys():
+		if _ft_blur_tex_cache[k]["src"].get_ref() == null:
+			_ft_blur_tex_cache.erase(k)
+	_ft_blur_tex_cache[cid] = {"src": weakref(src), "tex": tex}
+	return tex
+
+
+func _restore_blur_from_store(select_active: bool = true) -> void:
+	# Per-frame heal loop (like _restore_distort_from_store): installs the
+	# blur material on props that need it, keeps uniforms in sync.
+	var store = _g.ModMapData.get("_ft_blur", null)
+	if store == null or not (store is Dictionary) or store.empty(): return
+	var distort_store = _g.ModMapData.get("_ft_distort", {})
+	var dead_keys = []
+	for key in store.keys():
+		var nd = _ft_node_from_key(key)
+		if nd == null or not is_instance_valid(nd):
+			dead_keys.append(key)
+			continue
+		var kind = _blur_kind(nd)
+		if kind == "":
+			continue
+		if not _blur_active(nd):
+			dead_keys.append(key)  # zero entry (should not exist) -> prune
+			continue
+		if kind == "pattern":
+			# Same rule as the distort loop: while PatternShapeTool is active
+			# DD works on its own material (preview / SetOptions) -- never
+			# fight it, the blur comes back on the next Select Tool frame.
+			if not select_active:
+				continue
+			# Distorted: the FT pattern warp carries the blur (distort loop).
+			if distort_store.has(key):
+				_ft_apply_blur_uniforms(nd)
+				continue
+			_ft_ensure_pattern_blur(nd, key)
+			continue
+		if kind == "path":
+			_ft_ensure_line_blur(nd, key, kind)
+			continue
+		if distort_store.has(key):
+			# The warp material already carries the blur (injected by
+			# _apply_distort_shader, rebuilt by the distort loop on change).
+			_ft_apply_blur_uniforms(nd)
+			continue
+		var sprite = _get_sprite_node(nd)
+		if sprite == null: continue
+		var mstate = _ft_prop_material_state(nd, sprite, key)
+		if mstate == "ok":
+			_ft_apply_blur_uniforms(nd)
+			continue
+		if mstate == "skip":
+			continue
+		_apply_distort_shader(nd, [], null, true)
+	for key in dead_keys:
+		store.erase(key)
+
+
+# ── Blur on patterns, paths and walls (tiled samplers) ───────────────────────
+
+func _ft_blur_get_tiled_texture(src) -> Texture:
+	# Mipmapped, premultiplied, REPEATING copy of a tiling texture (no
+	# padding: the taps wrap). Cached like the padded copies.
+	if src == null or not (src is Texture):
+		return null
+	var cid = -src.get_instance_id()   # separate cache slot from the padded copy
+	if _ft_blur_tex_cache.has(cid):
+		var e = _ft_blur_tex_cache[cid]
+		if e["src"].get_ref() == src:
+			return e["tex"]
+		_ft_blur_tex_cache.erase(cid)
+	var img = src.get_data()
+	if img == null or img.is_empty():
+		return null
+	img = img.duplicate()
+	if img.is_compressed():
+		if img.decompress() != OK:
+			return null
+	if img.has_mipmaps():
+		img.clear_mipmaps()
+	if img.get_format() != Image.FORMAT_RGBA8:
+		img.convert(Image.FORMAT_RGBA8)
+	img.premultiply_alpha()
+	img.generate_mipmaps()
+	var tex = ImageTexture.new()
+	tex.create_from_image(img, Texture.FLAG_REPEAT | Texture.FLAG_FILTER | Texture.FLAG_MIPMAPS)
+	for k in _ft_blur_tex_cache.keys():
+		if _ft_blur_tex_cache[k]["src"].get_ref() == null:
+			_ft_blur_tex_cache.erase(k)
+	_ft_blur_tex_cache[cid] = {"src": weakref(src), "tex": tex}
+	return tex
+
+
+func _ft_ensure_pattern_blur(nd: Node2D, key: String) -> void:
+	# Blur-only pattern (no distort): DD's own Pattern / PatternCustomColor
+	# shader code with the albedo read through the tiled blur.
+	if _ft_materials.has(key):
+		var ent = _ft_materials[key]
+		if nd.material == ent.get("warp") and ent.get("blur", false):
+			_ft_apply_blur_uniforms(nd)
+			return
+		if nd.material == ent.get("warp"):
+			nd.material = ent.get("original", null)
+		_ft_materials.erase(key)
+	var orig = nd.material
+	if orig is ShaderMaterial and orig.has_meta("_ft_blur"):
+		orig = orig.get_meta("_ft_orig_mat") if orig.has_meta("_ft_orig_mat") else null
+	if not (orig is ShaderMaterial) or orig.shader == null:
+		return   # plain colour pattern (no texture): nothing to blur
+	var code = _ft_inject_tile_blur(orig.shader.code, ["albedo"])
+	if code == "":
+		return
+	var mat = ShaderMaterial.new()
+	var sh = Shader.new()
+	sh.code = code
+	mat.shader = sh
+	mat.set_meta("_ft_blur", true)
+	mat.set_meta("_ft_orig_mat", orig)
+	_ft_copy_shader_params(orig, mat)
+	_ft_materials[key] = {"warp": mat, "original": orig, "blur": true, "kind": "pattern"}
+	nd.material = mat
+	_ft_apply_blur_uniforms(nd)
+
+
+func _ft_line_nodes(nd: Node2D, _kind: String) -> Array:
+	# The CanvasItem carrying the blur material: the path's own Line2D.
+	return [nd]
+
+
+func _ft_ensure_line_blur(nd: Node2D, key: String, kind: String) -> void:
+	# Paths: a blur material (default canvas shader + blurred TEXTURE)
+	# replaces the null material of the Line2D; re-checked every frame.
+	var lines = _ft_line_nodes(nd, kind)
+	if lines.empty():
+		return
+	var ent = _ft_materials.get(key, null)
+	if ent != null and not ent.get("blur", false):
+		_ft_materials.erase(key)
+		ent = null
+	if ent == null:
+		var orig = lines[0].material
+		if orig is ShaderMaterial and orig.has_meta("_ft_blur"):
+			orig = orig.get_meta("_ft_orig_mat") if orig.has_meta("_ft_orig_mat") else null
+		var code = ""
+		if orig is ShaderMaterial and orig.shader != null:
+			# A material another mod put on the path: blur its TEXTURE read.
+			code = _ft_inject_tile_blur(orig.shader.code, ["TEXTURE"], ["2"])
+		else:
+			code = FT_BLUR_LINE_SHADER_SRC.replace("{H}", FT_BLUR_TILE_HEADER.replace("{S}", "2"))
+		if code == "":
+			return
+		var mat = ShaderMaterial.new()
+		var sh = Shader.new()
+		sh.code = code
+		mat.shader = sh
+		mat.set_meta("_ft_blur", true)
+		mat.set_meta("_ft_orig_mat", orig)
+		if orig is ShaderMaterial:
+			_ft_copy_shader_params(orig, mat)
+		ent = {"warp": mat, "original": orig, "blur": true, "kind": kind}
+		_ft_materials[key] = ent
+	var mat = ent["warp"]
+	for ln in lines:
+		if ln.material != mat:
+			ln.material = mat
+	_ft_apply_blur_uniforms(nd)
+
+
+func _ft_line_restore(nd: Node2D) -> void:
+	var key = _ft_node_key(nd)
+	if not _ft_materials.has(key):
+		return
+	var ent = _ft_materials[key]
+	for ln in _ft_line_nodes(nd, ent.get("kind", "path")):
+		if ln.material == ent.get("warp"):
+			ln.material = ent.get("original", null)
+	_ft_materials.erase(key)
+
+
+func _ft_apply_tile_blur_uniforms(node: Node2D, ent: Dictionary, kind: String) -> void:
+	var mat = ent.get("warp")
+	if not (mat is ShaderMaterial):
+		return
+	var p = _blur_params(node)
+	var wd = _blur_world_dir(p["a"])
+	# World direction -> the node's local space (patterns / walls sample in
+	# local px; a path's line texture runs along the path, see below).
+	var ld = node.global_transform.basis_xform_inv(wd)
+	if ld.length() < 0.0001:
+		ld = Vector2(1, 0)
+	ld = ld.normalized()
+	var sig = ""
+	if kind == "pattern":
+		# Pattern.shader: uv = rotate_uv(VERTEX / size, rotation) -- same
+		# rotation for the direction (albedo texel = 1 local px).
+		var rot = 0.0
+		var rv = mat.get_shader_param("rotation")
+		if rv != null:
+			rot = float(rv)
+		var dr = Vector2(cos(rot) * ld.x + sin(rot) * ld.y, cos(rot) * ld.y - sin(rot) * ld.x)
+		var albedo = mat.get_shader_param("albedo")
+		var btex = _ft_blur_get_tiled_texture(albedo)
+		var bid = btex.get_instance_id() if btex != null else 0
+		sig = "%.3f|%.3f|%.4f|%.4f|%d" % [p["r"], p["m"], dr.x, dr.y, bid]
+		if ent.get("blur_sig", "") == sig:
+			return
+		ent["blur_sig"] = sig
+		mat.set_shader_param("ft_blur_radius", p["r"])
+		mat.set_shader_param("ft_blur_motion", p["m"])
+		mat.set_shader_param("ft_blur_dir", dr)
+		mat.set_shader_param("ft_blur_px_scale", 1.0)
+		mat.set_shader_param("ft_blur_tex", btex)
+		mat.set_shader_param("ft_blur_has_tex", 1.0 if btex != null else 0.0)
+		mat.set_shader_param("ft_blur_lod_max", 6.0 if btex != null else 0.0)
+		return
+	# Path (Line2D texture, instance "2"): tile mode maps one texture height
+	# onto the line width, so texels per world px = tex_h / width. u runs
+	# along the path, v across: the dial angle is taken RELATIVE to the path
+	# (0 = along, 90 = across).
+	var lines = _ft_line_nodes(node, kind)
+	if lines.empty() or not (lines[0] is Line2D):
+		return
+	var ln = lines[0]
+	var ltex = ln.texture
+	var width = max(float(ln.width), 1.0)
+	var pxs2 = 1.0
+	if ltex is Texture and ltex.get_height() > 0:
+		pxs2 = float(ltex.get_height()) / width
+	var btex2 = _ft_blur_get_tiled_texture(ltex)
+	var bid2 = btex2.get_instance_id() if btex2 != null else 0
+	var ang = deg2rad(p["a"])
+	var d2 = Vector2(cos(ang), sin(ang))
+	sig = "%.3f|%.3f|%.4f|%.4f|%.4f|%d" % [p["r"], p["m"], d2.x, d2.y, pxs2, bid2]
+	if ent.get("blur_sig", "") == sig:
+		return
+	ent["blur_sig"] = sig
+	mat.set_shader_param("ft_blur_radius2", p["r"])
+	mat.set_shader_param("ft_blur_motion2", p["m"])
+	mat.set_shader_param("ft_blur_dir2", d2)
+	mat.set_shader_param("ft_blur_px_scale2", pxs2)
+	mat.set_shader_param("ft_blur_vclamp2", Vector2(0.0, 1.0))
+	mat.set_shader_param("ft_blur_tex2", btex2)
+	mat.set_shader_param("ft_blur_has_tex2", 1.0 if btex2 != null else 0.0)
+	mat.set_shader_param("ft_blur_lod_max2", 6.0 if btex2 != null else 0.0)
+
+
+# ── Blur widget (radius / motion / angle + Copy / Paste) ─────────────────────
+
+func _update_blur_ui() -> void:
+	if _blur_r_row == null or not is_instance_valid(_blur_r_row):
+		return
+	var show = _enabled and not _widget_force_hidden and _transform_mode == "blur" \
+			and _blur_target() != null
+	var rows = [_blur_r_row, _blur_m_row, _blur_tools_row]
+	for row in rows:
+		if row != null and is_instance_valid(row):
+			row.visible = show
+	if not show:
+		return
+	# Rows go in gi+1 .. gi+4 right under the Free Transform line.
+	var parent = _blur_r_row.get_parent()
+	if parent != null and _ui_group != null and is_instance_valid(_ui_group) \
+			and _ui_group.get_parent() == parent:
+		var gi = _ui_group.get_index()
+		for i in range(rows.size()):
+			var row = rows[i]
+			if row != null and is_instance_valid(row) and row.get_index() != gi + 1 + i:
+				parent.move_child(row, gi + 1 + i)
+	if _blur_paste_btn != null and is_instance_valid(_blur_paste_btn):
+		_blur_paste_btn.disabled = _blur_clip.empty()
+	var p = _blur_params(_blur_target())
+	_blur_syncing = true
+	_blur_sync_controls(_blur_r_slider, _blur_r_spin, p["r"])
+	_blur_sync_controls(null, _blur_m_spin, p["m"])
+	_blur_sync_controls(null, _blur_a_spin, p["a"])
+	_blur_syncing = false
+	_blur_sync_dial(p["m"], p["a"])
+
+
+func _blur_sync_controls(sld, spin, v: float) -> void:
+	if sld != null and is_instance_valid(sld) and abs(sld.value - v) > 0.001:
+		sld.value = v
+	if spin != null and is_instance_valid(spin) and abs(spin.value - v) > 0.001:
+		spin.value = v
+
+
+func _on_blur_r_changed(value) -> void:
+	if _blur_syncing: return
+	_blur_syncing = true
+	_blur_sync_controls(_blur_r_slider, _blur_r_spin, float(value))
+	_blur_syncing = false
+	_apply_blur_from_ui()
+
+
+func _on_blur_m_changed(_value) -> void:
+	if _blur_syncing: return
+	_blur_sync_dial(float(_blur_m_spin.value), float(_blur_a_spin.value))
+	_apply_blur_from_ui()
+
+
+func _on_blur_a_changed(_value) -> void:
+	if _blur_syncing: return
+	var snap = _blur_dial.get_meta("snap_angle") if (_blur_dial != null and is_instance_valid(_blur_dial)) else -1.0
+	if float(snap) >= 0.0:
+		# Angle locked by a snap button: revert manual edits.
+		_blur_syncing = true
+		_blur_a_spin.value = round(float(snap))
+		_blur_syncing = false
+		return
+	_blur_sync_dial(float(_blur_m_spin.value), float(_blur_a_spin.value))
+	_apply_blur_from_ui()
+
+
+func _apply_blur_from_ui() -> void:
+	var nd = _blur_target()
+	if nd == null:
+		return
+	# Capture the state BEFORE the burst (one undo for the whole drag).
+	if _blur_before.empty():
+		_blur_before = _capture_ft_unified([nd])
+		_blur_before_node = nd
+	_set_blur(nd, float(_blur_r_slider.value), float(_blur_m_spin.value), float(_blur_a_spin.value))
+	_ft_blur_after_change(nd)
+	_blur_dirty_ms = OS.get_ticks_msec()
+
+
+func _ft_blur_after_change(nd: Node2D) -> void:
+	# Live update: uniforms when the material already carries the blur,
+	# otherwise drop the material and let the restore loops rebuild it
+	# (with or without blur) on the next frame.
+	var key = _ft_node_key(nd)
+	if _blur_active(nd):
+		if _ft_materials.has(key) and _ft_materials[key].get("blur", false):
+			_ft_apply_blur_uniforms(nd)
+		elif _ft_materials.has(key):
+			_ft_drop_blur_material(nd)
+	else:
+		_ft_drop_blur_material(nd)
+
+
+func _blur_set_and_record(nd: Node2D, r: float, m: float, a: float) -> void:
+	# Immediate (non-burst) change: reset / paste.
+	var before = _capture_ft_unified([nd])
+	_set_blur(nd, r, m, a)
+	_blur_syncing = true
+	_blur_sync_controls(_blur_r_slider, _blur_r_spin, r)
+	_blur_sync_controls(null, _blur_m_spin, m)
+	_blur_sync_controls(null, _blur_a_spin, a)
+	_blur_syncing = false
+	_blur_sync_dial(m, a)
+	_ft_blur_after_change(nd)
+	_record_ft_unified_change(before, _capture_ft_unified([nd]))
+	_save_ft_data()
+	_blur_before = {}
+	_blur_before_node = null
+
+
+func _on_blur_reset_pressed(which: String) -> void:
+	var nd = _blur_target()
+	if nd == null:
+		return
+	var p = _blur_params(nd)
+	if which == "r":
+		p["r"] = 0.0
+	elif which == "m":
+		p["m"] = 0.0
+	else:
+		_blur_deactivate_snaps()
+		p["a"] = 0.0
+	_blur_set_and_record(nd, p["r"], p["m"], p["a"])
+
+
+func _on_blur_copy_pressed() -> void:
+	var nd = _blur_target()
+	if nd == null:
+		return
+	_blur_clip = _blur_params(nd)
+
+
+func _on_blur_paste_pressed() -> void:
+	var nd = _blur_target()
+	if nd == null or _blur_clip.empty():
+		return
+	_blur_set_and_record(nd, float(_blur_clip.get("r", 0.0)), float(_blur_clip.get("m", 0.0)),
+		float(_blur_clip.get("a", 0.0)))
 
 
 # ══ Crop (masque polygonal) ════════════════════════════════════════════════
@@ -8025,7 +9552,7 @@ func _on_path_warning_choice(id: int) -> void:
 # regles de disponibilite des modes. Retourne [{label, id}] avec {_sep=true}
 # pour les separateurs ; les ids sont ceux de _on_transform_menu_id().
 const _FT_TRANSFORM_MARK_KEYS = [
-	"_ft_distort", "_ft_crop", "_ft_edgecrop", "_ft_transforms", "_ft_orig_xform",
+	"_ft_distort", "_ft_crop", "_ft_edgecrop", "_ft_blur", "_ft_transforms", "_ft_orig_xform",
 	"_ft_width_warp", "_ft_pattern_orig", "_portal_offsets", "_ft_wall_reset",
 	"_ft_path_reset",
 ]
@@ -8092,7 +9619,7 @@ func get_context_menu_options() -> Array:
 			out.append({label = "Reset transform", id = 10})
 		return out
 
-	var labels = {0: "Scale", 1: "Skew", 2: "Distort", 3: "Perspective", 4: "Crop", 5: "Soft Crop", 6: "Edge Crop"}
+	var labels = {0: "Scale", 1: "Skew", 2: "Distort", 3: "Perspective", 4: "Crop", 5: "Soft Crop", 6: "Edge Crop", 7: "Blur"}
 	var all_paths = true
 	var has_path = false
 	for nd in props:
@@ -8105,9 +9632,11 @@ func get_context_menu_options() -> Array:
 	var modes = [0, 1, 2, 3]
 	# Crop : un seul prop simple selectionne, comme dans _show_transform_menu_at.
 	if not all_paths and props.size() == 1 and _is_plain_prop(props[0]):
-		modes = [0, 1, 2, 3, 4, 5, 6]
+		modes = [0, 1, 2, 3, 4, 5, 6, 7]
+	elif walls.empty() and props.size() == 1 and _blur_kind(props[0]) != "":
+		modes = [0, 1, 2, 3, 7]   # pattern / path: Blur only (no crop)
 	for mid in modes:
-		if mid == 4:
+		if mid == 4 or mid == 7:
 			out.append({_sep = true, label = "", id = -1})
 		out.append({label = labels[mid], id = mid})
 	out.append({_sep = true, label = "", id = -1})
@@ -8207,20 +9736,22 @@ func _show_transform_menu_at(pos: Vector2) -> void:
 		menu.add_separator()
 
 		# Items de mode avec marqueur devant le mode actif
-		var mode_to_id = {"free": 0, "skew": 1, "distort": 2, "perspective": 3, "crop": 4, "softcrop": 5, "edgecrop": 6}
+		var mode_to_id = {"free": 0, "skew": 1, "distort": 2, "perspective": 3, "crop": 4, "softcrop": 5, "edgecrop": 6, "blur": 7}
 		var cur_id = mode_to_id.get(_transform_mode, 0)
-		var labels = {0: "Scale", 1: "Skew", 2: "Distort", 3: "Perspective", 4: "Crop", 5: "Soft Crop", 6: "Edge Crop"}
+		var labels = {0: "Scale", 1: "Skew", 2: "Distort", 3: "Perspective", 4: "Crop", 5: "Soft Crop", 6: "Edge Crop", 7: "Blur"}
 		var has_path = _has_any_path()
 		var all_paths = has_path and _all_paths()
 		# Distort/Perspective supportés pour les paths (warp des EditPoints)
 		var modes = [0, 1, 2, 3]
 		# Crop : props simples uniquement (un seul objet sélectionné)
 		if not all_paths and _selected_objects.size() == 1 and _is_plain_prop(_selected_objects[0]):
-			modes = [0, 1, 2, 3, 4, 5, 6]
+			modes = [0, 1, 2, 3, 4, 5, 6, 7]
+		elif _selected_objects.size() == 1 and _blur_kind(_selected_objects[0]) != "":
+			modes = [0, 1, 2, 3, 7]   # pattern / path: Blur only (no crop)
 		for mid in modes:
 			# Les modes Crop forment un bloc a part (ils n'agissent que sur un
-			# prop simple) : separateur juste au-dessus.
-			if mid == 4:
+			# prop simple) : separateur juste au-dessus. Idem pour Blur.
+			if mid == 4 or mid == 7:
 				menu.add_separator()
 			var prefix = "» " if mid == cur_id else "  "
 			menu.add_item(prefix + labels[mid], mid)
@@ -8283,6 +9814,25 @@ func _capture_mode() -> Dictionary:
 		"transform_mode": _transform_mode,
 		"portal_mode": _portal_mode,
 	}
+
+
+func _ft_world_next_id() -> int:
+	if _g.World == null or not is_instance_valid(_g.World):
+		return -1
+	var nid = _g.World.get("nextNodeID")
+	return int(nid) if nid != null else -1
+
+
+func _ft_selection_has_new_nodes(nodes: Array) -> bool:
+	# True if any node was created after the lock was taken (see _ft_lock_next_id).
+	if _ft_lock_next_id < 0:
+		return false
+	for nd in nodes:
+		if nd == null or not is_instance_valid(nd):
+			continue
+		if nd.has_meta("node_id") and int(nd.get_meta("node_id")) >= _ft_lock_next_id:
+			return true
+	return false
 
 
 func _same_selection(a: Array, b: Array) -> bool:
@@ -8395,6 +9945,27 @@ func _flip_selection(horizontal: bool) -> void:
 	# de façon fiable).
 	for nd in flippable:
 		_snapshot_orig_xform(nd)
+		if _is_pattern(nd):
+			# Patterns: NEVER store a basis (a reflected det<0 basis fights
+			# both the distort pipeline and DD: _restore_distort_from_store
+			# and _apply_distort_pattern assume an IDENTITY basis, and
+			# _bake_pattern_state on the next drag destroyed the shape).
+			# Prepare the node BEFORE the undo capture instead: fold any
+			# existing basis into the geometry + initialize the distort
+			# corners (visually identical) — the flip becomes a pure
+			# corner mutation, cleanly undoable.
+			_invalidate_stale_pattern_data(nd)
+			var pt = nd.transform
+			var pt_ident = abs(pt.x.x - 1.0) < 0.001 and abs(pt.x.y) < 0.001 \
+					and abs(pt.y.x) < 0.001 and abs(pt.y.y - 1.0) < 0.001
+			if not pt_ident:
+				if _has_distort_corners(nd):
+					_soft_bake_pattern(nd)
+				else:
+					_bake_pattern_state(nd)
+			if not _has_distort_corners(nd):
+				_apply_distort_pattern(nd, _prop_corners(nd), Array(nd.polygon))
+			continue
 		_store_shear_transform(nd, nd.transform)
 	# Lights incluses dans la capture (restaurées via pos/rot/scale — le
 	# modèle DD ne persiste que position + rotation, voir Lights.SaveLight).
@@ -8465,6 +10036,27 @@ func _flip_selection(horizontal: bool) -> void:
 				nd.scale = Vector2.ONE
 				nd.call("SetEditPoints", new_pts)
 				_refresh_path_widget(nd)
+			_clear_shear_transform(nd)
+			continue
+		elif _is_pattern(nd):
+			# Patterns: bake the mirror into the distort pipeline (mirror
+			# the world corners + rebuild via _apply_distort_pattern)
+			# instead of leaving a reflected basis (det<0) on the node.
+			# A reflected basis broke everything: _restore_distort_from_store
+			# computes wc = lc + position assuming identity (visual double
+			# mirror), _bake_pattern_state on the next drag collapsed the
+			# shape to its AABB, and _soft_bake_pattern left the reflected
+			# _ft_transforms entry that _reapply_shear_transforms re-imposed
+			# on the already-baked geometry (double application → the
+			# pattern vanished). The bilinear warp is equivariant under
+			# reflections: mirroring the 4 corners mirrors shape AND
+			# texture exactly. Reversible: mirroring the corners again
+			# cancels out.
+			var pat_wc = _prop_corners(nd)
+			var pat_new_wc = []
+			for pcorner in pat_wc:
+				pat_new_wc.append(R.xform(pcorner))
+			_apply_distort_pattern(nd, pat_new_wc)
 			_clear_shear_transform(nd)
 			continue
 		else:
@@ -9075,6 +10667,14 @@ func _apply_line_point_widths(line, entry, base_w: float, taper = null, allow_su
 # Réplique le taper Grow/Shrink de DD (Pathway.GrowShrinkEnds) : facteurs
 # par point [0..1] sur les points lissés. null si ni Grow ni Shrink.
 func _path_growshrink_taper(node, count: int):
+	# path_taper mod: when its "Custom Grow/Shrink" is ON for this path, its
+	# linear ramp replaces the vanilla replica below.
+	if Engine.has_meta("up_path_taper"):
+		var pt = Engine.get_meta("up_path_taper")
+		if pt != null and is_instance_valid(pt) and pt.has_method("compute_taper"):
+			var custom = pt.compute_taper(node, count)
+			if custom != null:
+				return custom
 	var grow = bool(node.get("Grow")) if node.get("Grow") != null else false
 	var shrink = bool(node.get("Shrink")) if node.get("Shrink") != null else false
 	if not grow and not shrink:
@@ -9434,7 +11034,7 @@ func _on_transform_menu_id(id: int) -> void:
 		_context_menu = null
 		return
 
-	var id_to_mode = {0: "free", 1: "skew", 2: "distort", 3: "perspective", 4: "crop", 5: "softcrop", 6: "edgecrop"}
+	var id_to_mode = {0: "free", 1: "skew", 2: "distort", 3: "perspective", 4: "crop", 5: "softcrop", 6: "edgecrop", 7: "blur"}
 	var new_mode = id_to_mode.get(id, "free")
 
 	# (Les paths sont désormais réellement warpés en distort/perspective —

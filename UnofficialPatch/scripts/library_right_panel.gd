@@ -22,10 +22,12 @@
 #
 # How a library is moved:
 #   Toolset builds each library as   Label("WALL"), GridMenu   in the same
-#   parent VBox. We move the GridMenu plus every sibling sitting between the
-#   label and the grid (that is where AdditionalSearchOptions injects its
-#   search bars, so they travel with their library), and we hide the original
-#   label -- the right panel carries its own English heading instead.
+#   parent VBox. We move the GridMenu plus every *recognized* companion
+#   sitting between the label and the grid (AdditionalSearchOptions search
+#   bars, favorites controls -- see _is_library_companion), and we hide the
+#   original label -- the right panel carries its own English heading
+#   instead. Unrecognized controls in that span (e.g. Minor Utils' wall
+#   ordering buttons) are left in the tool panel.
 #
 # Visibility:
 #   A moved library must be shown exactly when it would have been shown in
@@ -447,9 +449,12 @@ func _move_entry(e: Dictionary) -> bool:
 	var indices := []
 	for i in range(start, idx + 1):
 		var c = parent.get_child(i)
-		# Anything that opted out stays where it is; only the library itself
-		# is never skipped.
-		if c != node and _keeps_left(c):
+		# Only the library itself is never skipped. Siblings travel with it
+		# only when we can positively identify them as library companions
+		# (ASO search rows, favorites controls): anything else sitting there
+		# -- e.g. Minor Utils' Bring to Front / Send to Back button row,
+		# which is inserted right above the wall grid -- stays on the left.
+		if c != node and (_keeps_left(c) or not _is_library_companion(c)):
 			continue
 		nodes.append(c)
 		indices.append(i)

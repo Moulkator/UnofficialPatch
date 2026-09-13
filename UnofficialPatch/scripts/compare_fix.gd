@@ -34,6 +34,14 @@
 #      grid_fix can lift GridMesh above the stacked levels (grid kept at its
 #      configured layer relative to the topmost visible level). Reset to 0 on
 #      disable/map change.
+# v18: Fix doubled lighting while comparing. Every Level has its own
+#      LightPassRender (full-map ColorRect, light_mask=2) and its Light2D
+#      nodes use item cull mask 2. With two levels visible, each light lit
+#      BOTH light-pass rects (and each level's rect received both levels'
+#      lights), so the light pass was composited twice. We now give every
+#      visible level a unique mask bit via Level.SetAllLightMasks() (current
+#      keeps 2, refs get 4, 8, 16...) so lights, occluders and the light
+#      pass of a level only interact with each other. Restored on disable.
 # v14: Each ref Level gets its own z range (base 1100, step adaptive ≤1100),
 #      assigned in reverse iteration order so higher levels in the list get
 #      higher z. DD's sub-containers are z_as_relative=true so they inherit
@@ -59,6 +67,7 @@ var _saved_child_indices = {}   # {Level: original_index_in_parent}
 var _saved_z_indices = {}        # {Level: original_z_index}
 var _wui_saved = null            # {z, rel} : WorldUI original z state
 var _saved_widget_z = {}         # {Node: original_z} absolute-z WorldUI children
+var _saved_light_masks = {}      # {Level: original LightPassRender.light_mask}
 
 # Original DD controls (hidden, kept for structure)
 var _orig_ref_options = null
@@ -109,6 +118,7 @@ func _on_map_changed() -> void:
 	Engine.set_meta("uu_compare_grid_base", 0)
 	_wui_saved = null
 	_saved_widget_z.clear()
+	_saved_light_masks.clear()
 	_ready = false
 	_frame = 0
 	_comparing = false
@@ -857,6 +867,7 @@ func _apply_compare():
 	# Iterate all_levels (top-to-bottom in the list). idx counts visible
 	# levels as we encounter them; the first visible gets the highest z.
 	var idx = 0
+	var ref_idx = 0
 	for lvl in all_levels:
 		if not is_instance_valid(lvl):
 			continue
@@ -877,6 +888,14 @@ func _apply_compare():
 			elif z < -4096:
 				z = -4096
 			lvl.z_index = z
+			# Isolate this level's lighting from the other visible levels.
+			if lvl == current:
+				_set_level_light_mask(lvl, 2)
+			else:
+				# Godot 3 light masks are 20 bits: bit 1 = current, refs
+				# take bits 2..19 (cycled if ever exceeded).
+				_set_level_light_mask(lvl, 1 << (2 + (ref_idx % 18)))
+				ref_idx += 1
 			idx += 1
 			# Tree-order fallback for the few absolute UI overlays.
 			var parent = lvl.get_parent()
@@ -886,6 +905,29 @@ func _apply_compare():
 				parent.move_child(lvl, parent.get_child_count() - 1)
 		else:
 			lvl.visible = false
+
+
+# ══ Light mask isolation ══════════════════════════════════════════════════════
+
+# Level.SetAllLightMasks(mask) updates the light pass rect, every Light2D's
+# item/shadow cull masks and every wall occluder mask in one go. Originals
+# are saved once per level (first apply that touches it).
+func _set_level_light_mask(lvl, mask: int) -> void:
+	if not _saved_light_masks.has(lvl):
+		var lpr = lvl.get("LightPassRender")
+		var orig = 2
+		if lpr != null and is_instance_valid(lpr):
+			orig = int(lpr.light_mask)
+		_saved_light_masks[lvl] = orig
+	if lvl.has_method("SetAllLightMasks"):
+		lvl.SetAllLightMasks(mask)
+
+
+func _restore_light_masks() -> void:
+	for lvl in _saved_light_masks.keys():
+		if is_instance_valid(lvl) and lvl.has_method("SetAllLightMasks"):
+			lvl.SetAllLightMasks(_saved_light_masks[lvl])
+	_saved_light_masks.clear()
 
 
 # ══ WorldUI overlay handling ══════════════════════════════════════════════════
@@ -942,6 +984,7 @@ func _disable_compare():
 	_comparing = false
 	Engine.set_meta("uu_compare_grid_base", 0)
 	_restore_world_ui()
+	_restore_light_masks()
 	var world = _g.World
 	if world == null:
 		return

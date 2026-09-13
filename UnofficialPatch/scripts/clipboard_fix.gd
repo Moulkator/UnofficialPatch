@@ -313,6 +313,24 @@ func _get_screen_center_world() -> Vector2:
 	return _mouse_world_pos
 
 
+# True when the keyboard focus sits in a text-editing control. The focus owner
+# is read through the SelectTool panel (any Control of the editor UI viewport
+# works — get_focus_owner() is viewport-wide). Our listener node itself lives
+# under _g.World, possibly inside a sub-viewport, so it cannot be used for
+# this check. _input() runs before GUI input, but the focus was grabbed by the
+# earlier click on the textbox, so the state is already correct here.
+func _text_edit_has_focus() -> bool:
+	if _g == null or _g.get("Editor") == null or _g.Editor.get("Toolset") == null:
+		return false
+	var panel = _g.Editor.Toolset.GetToolPanel("SelectTool")
+	if panel == null or not is_instance_valid(panel) or not panel.is_inside_tree():
+		return false
+	var focus = panel.get_focus_owner()
+	if focus == null or not is_instance_valid(focus):
+		return false
+	return focus is LineEdit or focus is TextEdit
+
+
 func _install_input_listener() -> void:
 	input_listener = Node.new()
 	input_listener.name = "ClipboardFixListener"
@@ -330,6 +348,12 @@ func _on_input(event) -> void:
 		_update_mouse_world_pos()
 
 	if event is InputEventKey and event.pressed and event.control:
+		# A text-editing control (LineEdit/TextEdit — DD search boxes, text
+		# inputs, dialogs...) owns the keyboard focus: Ctrl+C/X/V belong to the
+		# native TEXT clipboard of that control. Stay out of the way entirely,
+		# otherwise copying/pasting text also copies/pastes map assets.
+		if _text_edit_has_focus():
+			return
 		if event.scancode == KEY_X:
 			_on_cut()
 		elif event.scancode == KEY_C:

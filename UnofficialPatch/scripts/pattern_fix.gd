@@ -15,6 +15,12 @@
 # We intentionally do NOT use the toggled signal — instead we poll the button state
 # each frame to avoid crashing when calling C# property setters from a signal callback.
 # The outline texture (default_border.png) is loaded from .import at startup.
+#
+# Also injects Over/Under sorting buttons in the PatternShapeTool panel (right
+# below the layer dropdown), mirroring the ones in the PathTool. DD always appends
+# a new PatternShape at the end of its layer node (i.e. on top); when "Under" is
+# active we watch the layer nodes each frame and move newly appended shapes to
+# the bottom of their layer. Icons are borrowed from the PathTool's own buttons.
 
 var _g
 var _select_pattern_list = null
@@ -26,6 +32,11 @@ var _outline_button = null
 var _outline_last_pressed = false
 var _outline_last_shapes = []
 var _cached_outline_texture = null
+
+var _sort_initialized = false
+var _sort_over_button = null
+var _sort_under_button = null
+var _sort_layer_counts = {}  # layer node instance id -> child count last frame
 
 
 func initialize():
@@ -45,6 +56,10 @@ func update(_delta):
 			_select_pattern_list.mouse_filter = Control.MOUSE_FILTER_STOP
 
 	_poll_outline_button()
+
+	if not _sort_initialized:
+		_try_init_sorting()
+	_poll_pattern_sorting()
 
 
 func _try_init():
@@ -271,6 +286,109 @@ func _inject_outline_button(panel):
 		vbox.add_child(_outline_button)
 		vbox.move_child(_outline_button, pattern_list_idx + 1)
 		return
+
+
+# ---------------------------------------------------------------------------
+# Over / Under sorting for the PatternShapeTool
+# ---------------------------------------------------------------------------
+
+func _try_init_sorting():
+	var pat_tool = _g.Editor.Tools["PatternShapeTool"]
+	if pat_tool == null:
+		return
+	var layer_menu = pat_tool.get("LayerMenu")
+	if layer_menu == null or not is_instance_valid(layer_menu):
+		return
+	var parent = layer_menu.get_parent()
+	if parent == null:
+		return
+
+	var icons = _find_path_sorting_icons()
+	var group = ButtonGroup.new()
+	var hbox = HBoxContainer.new()
+	hbox.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+
+	_sort_over_button = _make_sort_button("Over", icons[0], group)
+	_sort_under_button = _make_sort_button("Under", icons[1], group)
+	hbox.add_child(_sort_over_button)
+	hbox.add_child(_sort_under_button)
+	_sort_over_button.pressed = true
+
+	parent.add_child(hbox)
+	parent.move_child(hbox, layer_menu.get_index() + 1)
+	_sort_initialized = true
+
+
+func _make_sort_button(label: String, icon, group: ButtonGroup) -> Button:
+	var b = Button.new()
+	b.text = label
+	b.icon = icon
+	b.toggle_mode = true
+	b.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	b.group = group
+	# No signal connection — state is polled each frame (see _poll_pattern_sorting).
+	return b
+
+
+# Borrow the Over/Under icons from the PathTool panel so both tools look alike.
+func _find_path_sorting_icons() -> Array:
+	var icons = [null, null]
+	var panel = _g.Editor.Toolset.GetToolPanel("PathTool")
+	if panel == null:
+		return icons
+	var buttons = []
+	_find_all_of_class(panel, "Button", buttons)
+	for b in buttons:
+		if not is_instance_valid(b) or not b.toggle_mode:
+			continue
+		if b.text == "Over" and icons[0] == null:
+			icons[0] = b.icon
+		elif b.text == "Under" and icons[1] == null:
+			icons[1] = b.icon
+	return icons
+
+
+# DD appends new shapes at the end of their layer node. When "Under" is active,
+# any shape appended since last frame is moved to the front of the child list
+# (index 0 = drawn first = below everything else on that layer).
+func _poll_pattern_sorting():
+	if _sort_under_button == null or not is_instance_valid(_sort_under_button):
+		return
+	var world = _g.get("World")
+	if world == null:
+		_sort_layer_counts = {}
+		return
+	var level = world.get("Level")
+	if level == null:
+		_sort_layer_counts = {}
+		return
+	var pattern_shapes = level.get("PatternShapes")
+	if pattern_shapes == null or not is_instance_valid(pattern_shapes):
+		_sort_layer_counts = {}
+		return
+
+	# Only reorder while actually drawing with the PatternShapeTool. Ctrl guard:
+	# undo/redo of a deletion also re-appends a shape and must keep DD's order.
+	var should_reorder = _sort_under_button.pressed \
+		and _g.Editor.get("ActiveToolName") == "PatternShapeTool" \
+		and not Input.is_key_pressed(KEY_CONTROL) \
+		and not Input.is_key_pressed(KEY_META)
+
+	var counts = {}
+	for layer_node in pattern_shapes.get_children():
+		if not is_instance_valid(layer_node):
+			continue
+		var id = layer_node.get_instance_id()
+		var n = layer_node.get_child_count()
+		counts[id] = n
+		if should_reorder and _sort_layer_counts.has(id):
+			var prev = _sort_layer_counts[id]
+			if n > prev:
+				# Move the new shapes (indices prev..n-1) to the front, keeping
+				# their relative order.
+				for i in range(prev, n):
+					layer_node.move_child(layer_node.get_child(i), i - prev)
+	_sort_layer_counts = counts
 
 
 func _poll_outline_button():

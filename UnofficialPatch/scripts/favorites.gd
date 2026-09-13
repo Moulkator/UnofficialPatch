@@ -4284,6 +4284,13 @@ func _invalidate_all_draw_overlays() -> void:
 			ovl.invalidate()
 
 
+func _ovl_mod_differs(il, ovl, fav_map, s: int) -> bool:
+	var d = fav_map[s]
+	if not (d is int) or d < 0 or d >= il.get_item_count():
+		return false
+	return ovl.get_item_icon_modulate(s) != il.get_item_icon_modulate(d)
+
+
 func _sync_overlay_modulates(panel: Dictionary, il, ovl) -> void:
 	# Some lists tint via per-item icon modulate applied by DD after our
 	# overlay snapshot. Cheap probe: compare the first mapped item; full
@@ -4294,10 +4301,33 @@ func _sync_overlay_modulates(panel: Dictionary, il, ovl) -> void:
 	var n = min(ovl.get_item_count(), fav_map.size())
 	if n == 0:
 		return
-	var d0 = fav_map[0]
-	if not (d0 is int) or d0 < 0 or d0 >= il.get_item_count():
-		return
-	if ovl.get_item_icon_modulate(0) == il.get_item_icon_modulate(d0):
+	# DD re-tints the whole pattern list in PatternShapeTool.Enable():
+	# Simple Tiles (front of the list) get their tileset colors, "Patterns"
+	# (the large middle region) stay white, "Patterns Colorable" (tail) get
+	# the default brown. A coarse stride probe can land entirely in the
+	# white middle region and miss the change (observed with 513 items and
+	# stride n/8), so probe a bounded prefix + suffix + stride instead --
+	# still O(1) per tick, but it covers the regions DD actually recolors.
+	var changed = false
+	var lim = int(min(32, n))
+	for s in range(lim):
+		if _ovl_mod_differs(il, ovl, fav_map, s):
+			changed = true
+			break
+	if not changed:
+		for s in range(int(max(n - 32, lim)), n):
+			if _ovl_mod_differs(il, ovl, fav_map, s):
+				changed = true
+				break
+	if not changed:
+		var step = int(max(1, n / 32))
+		var p = 0
+		while p < n:
+			if _ovl_mod_differs(il, ovl, fav_map, p):
+				changed = true
+				break
+			p += step
+	if not changed:
 		return
 	for i in range(n):
 		var d = fav_map[i]

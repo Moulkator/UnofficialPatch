@@ -38,6 +38,8 @@ var _z_row_ref = null
 var _opacity_row_ref = null
 var _export_hbox_ref = null
 var _format_dd_ref = null     # ref OptionButton format (PNG/JPG/WEBP) pour cleanup
+var _focus_slider_ref = null  # Export "Focus" slider (blur) - drives the copy's parent
+var _overlay_opt_ref = null   # Export "Overlay level" dropdown - same
 var _destroyed := false
 
 const CONFIG_PATH = "user://UnofficialPatch/grid_fix_settings.cfg"
@@ -181,6 +183,7 @@ func cleanup() -> void:
     if _format_dd_ref.is_connected("item_selected", self, "_on_export_format_changed"):
       _format_dd_ref.disconnect("item_selected", self, "_on_export_format_changed")
   _format_dd_ref = null
+  _disconnect_export_fx_listeners()
   print("[GF] Cleaned up")
 
 
@@ -426,14 +429,34 @@ func create_export_grid_copy():
   # out of the typed containers (see _sweep_stale_export_copies comment):
   # nothing in Level.Save()/Load() or the VTT exporter iterates the
   # Level's direct children with casts, only the containers' children.
+  #
+  # Exception: when the Export "Focus" blur is active, ExportFX (which
+  # redraws the whole screen blurred) sits above the source level
+  # (z -2000) but below the overlay level (z 0). A copy inside the source
+  # level would be blurred with it, so the copy is moved to the overlay
+  # side instead: as a child of the overlay level when there is one
+  # (same relative z, so it keeps its layer position within that level),
+  # else directly under World with the same z, absolute (overlay levels
+  # are at z 0, so this is equivalent).
   copy.z_index = int(clamp(current_z, -4096, 4096))
-  copy.z_as_relative = true
   copy.show_on_top = false
-  var level = get_current_level()
-  if level != null and level is Node:
-    level.add_child(copy)
+  var parent = null
+  if _export_blur_active():
+    var overlay = _g.World.get("OverlayLevel")
+    if overlay != null and is_instance_valid(overlay) and overlay is Node:
+      copy.z_as_relative = true
+      parent = overlay
+    else:
+      copy.z_as_relative = false
+      parent = _g.World
   else:
-    _g.World.add_child(copy)
+    copy.z_as_relative = true
+    var level = get_current_level()
+    if level != null and level is Node:
+      parent = level
+    else:
+      parent = _g.World
+  parent.add_child(copy)
   export_grid_copy = copy
 
   var export_dialog = _g.Editor.Windows["Export"]
@@ -522,10 +545,59 @@ func on_export_grid_toggled(enabled: bool):
     export_grid_copy.visible = enabled
 
 
+# True when the Export window's Focus slider is below 100% (blur on).
+func _export_blur_active() -> bool:
+  if _focus_slider_ref != null and is_instance_valid(_focus_slider_ref):
+    return _focus_slider_ref.value < 100.0
+  return false
+
+
+# Focus slider moved or overlay level changed: the copy's parent may have
+# to change (source level <-> overlay side), so rebuild it.
+func _on_export_fx_changed(_value, _extra = null):
+  if _destroyed:
+    return
+  if export_grid_copy != null:
+    create_export_grid_copy()
+
+
+func _connect_export_fx_listeners():
+  if _destroyed:
+    return
+  var export_dialog = _g.Editor.Windows["Export"]
+  if export_dialog == null:
+    return
+  var focus = export_dialog.find_node("SourceFocusSlider", true, false)
+  if focus != null:
+    _focus_slider_ref = focus
+    if not focus.is_connected("value_changed", self, "_on_export_fx_changed"):
+      focus.connect("value_changed", self, "_on_export_fx_changed")
+  var overlay_opt = export_dialog.find_node("OverlayLevelOptions", true, false)
+  if overlay_opt != null:
+    _overlay_opt_ref = overlay_opt
+    if not overlay_opt.is_connected("item_selected", self, "_on_export_fx_changed"):
+      overlay_opt.connect("item_selected", self, "_on_export_fx_changed")
+
+
+func _disconnect_export_fx_listeners():
+  # No _destroyed guard: must also run during hot-unload. Only our own
+  # connections are touched; the nodes belong to DD.
+  if _focus_slider_ref != null and is_instance_valid(_focus_slider_ref):
+    if _focus_slider_ref.is_connected("value_changed", self, "_on_export_fx_changed"):
+      _focus_slider_ref.disconnect("value_changed", self, "_on_export_fx_changed")
+  _focus_slider_ref = null
+  if _overlay_opt_ref != null and is_instance_valid(_overlay_opt_ref):
+    if _overlay_opt_ref.is_connected("item_selected", self, "_on_export_fx_changed"):
+      _overlay_opt_ref.disconnect("item_selected", self, "_on_export_fx_changed")
+  _overlay_opt_ref = null
+
+
 func on_export_window_opened():
   if _destroyed:
     return
   apply_to_current_level()
+  # Listeners first: create_export_grid_copy() reads the Focus slider
+  _connect_export_fx_listeners()
   create_export_grid_copy()
   _connect_ok_listener()
   # Force le resize a l'ouverture : si le format etait deja JPG/WEBP de la
@@ -539,6 +611,7 @@ func on_export_window_closed():
   if _destroyed:
     return
   _disconnect_ok_listener()
+  _disconnect_export_fx_listeners()
   delete_export_grid_copy()
   apply_to_current_level()
 

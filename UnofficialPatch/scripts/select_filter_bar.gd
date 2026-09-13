@@ -242,13 +242,8 @@ func _handle_press(m: Vector2) -> void:
 
 
 func _update_drag(m: Vector2) -> void:
-	var vp = _viewport_size()
-	var size = _panel.rect_size * _cur_scale
-	var p = m - _drag_offset
-	p.x = clamp(p.x, 0.0, max(0.0, vp.x - size.x))
-	p.y = clamp(p.y, 0.0, max(0.0, vp.y - size.y))
-	_pos = p
-	_panel.rect_position = p
+	_pos = _clamp_pos(m - _drag_offset)
+	_panel.rect_position = _pos
 
 
 # Visual (on-screen) rect of a node inside the panel, accounting for the panel's
@@ -373,24 +368,59 @@ func _remap_to_viewport(old_vp: Vector2, new_vp: Vector2) -> void:
 	_save_settings()
 
 
-# Keep the bar inside the current viewport. The saved position may lie outside
-# after a resolution / windowed-fullscreen change; without this the bar ends up
-# hidden under (or beyond) the rest of the UI.
+# Keep the bar inside the free map area. The saved position may lie outside
+# after a resolution / windowed-fullscreen change, or DD's own panels may have
+# grown over it (menubar, tool panel, library panel, floatbar); without this
+# the bar ends up hidden under (or beyond) the rest of the UI.
 func _clamp_to_viewport() -> void:
-	var vp = _viewport_size()
-	var size = _panel.rect_size * _cur_scale
-	var p = _pos
-	p.x = clamp(p.x, 0.0, max(0.0, vp.x - size.x))
-	p.y = clamp(p.y, 0.0, max(0.0, vp.y - size.y))
+	var p = _clamp_pos(_pos)
 	if p != _pos:
 		_pos = p
 		_save_settings()
 
 
+# The screen area not covered by DD's chrome: the map Content rect (which
+# HSplit lays out between the left tool panel and the right library panels,
+# below the menubar), minus the floatbar strip overlaying its bottom. Falls
+# back to the whole viewport while the editor tree isn't ready.
+func _safe_rect() -> Rect2:
+	var vp_rect = Rect2(Vector2.ZERO, _viewport_size())
+	var r = vp_rect
+	if _g.Editor == null or not is_instance_valid(_g.Editor):
+		return r
+	var content = _g.Editor.get_node_or_null("VPartition/Panels/HSplit/Content")
+	if content is Control and is_instance_valid(content) \
+			and content.rect_size.x > 1.0 and content.rect_size.y > 1.0:
+		r = content.get_global_rect()
+	var fb = _g.Editor.get_node_or_null("Floatbar/Floatbar")
+	if fb == null:
+		fb = _g.Editor.get_node_or_null("Floatbar")
+	if fb is Control and is_instance_valid(fb) and fb.is_visible_in_tree():
+		var fr = fb.get_global_rect()
+		# Only trim when the floatbar really sits in the lower half of the
+		# free area (it overlays Content; it isn't laid out by HSplit).
+		if fr.size.y > 1.0 and fr.intersects(r) and fr.position.y > r.position.y + r.size.y * 0.5:
+			r.size.y = fr.position.y - r.position.y
+	r = r.clip(vp_rect)
+	if r.size.x < 1.0 or r.size.y < 1.0:
+		return vp_rect
+	return r
+
+
+# Clamp a top-left position so the (scaled) bar stays inside _safe_rect().
+# A bar wider than the free area is pinned to the area's left/top edge.
+func _clamp_pos(p: Vector2) -> Vector2:
+	var safe = _safe_rect()
+	var size = _panel.rect_size * _cur_scale
+	p.x = clamp(p.x, safe.position.x, max(safe.position.x, safe.end.x - size.x))
+	p.y = clamp(p.y, safe.position.y, max(safe.position.y, safe.end.y - size.y))
+	return p
+
+
 func _default_position() -> Vector2:
-	var vp = _viewport_size()
+	var safe = _safe_rect()
 	var w = _panel.get_combined_minimum_size().x * _cur_scale
-	return Vector2(max(0.0, (vp.x - w) * 0.5), 70.0)
+	return Vector2(max(safe.position.x, safe.position.x + (safe.size.x - w) * 0.5), safe.position.y + 10.0)
 
 
 # Visual scale that matches the floatbar: ratio of a floatbar toggle's current
