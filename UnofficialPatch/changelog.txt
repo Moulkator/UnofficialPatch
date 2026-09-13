@@ -1,5 +1,37 @@
 UNOFFICIAL PATCH
 
+v1.7.0
+
+NEW FEATURES
+- Added Gaussian Blur and Directional Blur to Free Transform for Objects, Paths and Patterns
+- Added spinboxes and reset buttons to the Spacing and Curvature slider in the Text Tool
+- Added self update checker (popup when there's a new version available)
+- Added Layer 1100: Above Lights
+- Added Keep Object Lit option when Block Light is activated on an object
+- Added Rename and Hide (and Restore) options for prefabs sets (right click on the list)
+- Added "Over" and "Under" buttons in the Pattern Tool
+- Added half-grid snapping for in the water brush (when that option is enabled in the Preferences)
+- Added right click 90° rotation in the Scatter Tool
+- Added Custom Grow/Shrink sliders for Paths in the Selection Tool
+- Added Layer jump buttons (arrows next to the Layer dropdown menu)
+- Compatibility between Arc Draw and Better Terrain Tool
+
+FIXES
+- Better compatibility between UI Rescaler and my other mod Better Terrain Tool
+- Fixed paths not being selectable under patterns, even with filters
+- Fixed conflict with copying text while an asset was selected
+- Fixed Over/Under buttons not working properly with the Natural Spacing option in the Scatter Tool
+- Fixed Bring to Front/Send to Back buttons for selected walls appearing on the right side instead of the left side
+- Fixed colored patterns appearing white in the library until you cycle the Show button
+- Fixed various issues with Free Transform's symmetry on patterns
+- Fixed the Resize Map Fix various issues with the Cave Tool (offset, unwanted walls, disappearing floor...)
+- Fixed impossibility to select levels with the same name in the Level Settings tool
+- Fixed Compare Levels doubling the lights intensity
+- Fixed Free Transform resetting rotated pattern textures
+- Fixed lights having a black transform box at some zoom levels
+- Fixed vanilla issue where the export blur varied depending on the PPI and wasn't previewed correctly
+- Fixed vanilla bug creating a glitchy file if you minimized DD during the export
+
 v1.6.0
 
 NEW FEATURES:
@@ -29,10 +61,10 @@ FIXES:
 - Fixed some rollback happening sometimes after dragging an asset
 - Fixed Filter Floatbar being hidden between maps if the resolution changed
 - Fixed a vanilla bug that didn't hide the dot cursor in Eyedropper mod in the Water Brush, preventing from choosing a color
-- Fixed Trace Image and Text not being move correctly during a map resize
+- Fixed Trace Image and Text not being moved correctly during a map resize
 - Fixed grid odd behavior after using the Compare Levels tool
 - Fixed layer filters not being applied for walls, paths, portals and patterns
-- Fixed walls, paths, portals and patterns baing selectable even if layer was hidden with Hide Layer Mod
+- Fixed walls, paths, portals and patterns being selectable even if layer was hidden with Hide Layer Mod
 - Fixed freestanding portals not being transformed correctly in a multiple selection symmetry
 - Fixed walls not rotating with portals in Free Transform mode
 - Fixed walls not always having the rotation handle in Free Transform

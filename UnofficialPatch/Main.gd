@@ -103,6 +103,9 @@ var drag_select_focus_fix
 var SelectLayerPickFixScript
 var select_layer_pick_fix
 
+var AboveLightsLayerScript
+var above_lights_layer
+
 var CompareFixScript
 var compare_fix
 
@@ -150,6 +153,11 @@ var wall_allow_light
 
 var WallBevelScript
 var wall_bevel
+var PathTaperScript
+var path_taper
+
+var ObjectKeepLitScript
+var object_keep_lit
 
 var DropFixScript
 var drop_fix
@@ -200,6 +208,9 @@ var prefabs_clone_fix
 
 var PrefabsThumbnailsScript
 var prefabs_thumbnails
+
+var PrefabSetContextScript
+var prefab_set_context
 
 var SaveReminderScript
 var save_reminder
@@ -309,6 +320,9 @@ var grid_ruler
 
 var SelectFilterBarScript
 var select_filter_bar
+
+var LayerJumpScript
+var layer_jump
 
 var LibraryRightPanelScript
 var library_right_panel
@@ -538,6 +552,10 @@ func start() -> void:
 			"Shows the 'Guides' toggle button in the bottom floatbar\nnext to Grid/Snap/Lighting.\nThe Ctrl+R shortcut keeps working either way.",
 			true, self, "_on_ruler_guide_bar_button_toggled",
 			false, "ruler_guide")
+		mod_settings.register_toggle(
+			"layer_jump", "other_tools", "Layer Up/Down Buttons",
+			"Adds two buttons next to the Layer dropdown of the Pattern Shape,\nMaterial Brush, Path, Object, Scatter and Select tools\nto jump to the layer above or below the current one.",
+			true, self, "_on_layer_jump_toggled")
 		mod_settings.register_toggle(
 			"select_filter_bar", "selection_tool", "Filter Bar",
 			"Adds a repositionable horizontal bar of asset-type filter\ncheckboxes (Walls, Portals, Objects, ...) that mirrors the\nSelectTool FILTER popup but stays visible at all times.\nOnly shown while the Select Tool is active.",
@@ -828,6 +846,12 @@ func start() -> void:
 		select_layer_pick_fix._g = Global
 		select_layer_pick_fix.initialize()
 
+	if _debug_enabled("above_lights_layer"):
+		AboveLightsLayerScript = ResourceLoader.load(Global.Root + "scripts/above_lights_layer.gd", "GDScript", true)
+		above_lights_layer = AboveLightsLayerScript.new()
+		above_lights_layer._g = Global
+		above_lights_layer.initialize()
+
 	if _debug_enabled("compare_fix"):
 		CompareFixScript = ResourceLoader.load(Global.Root + "scripts/compare_fix.gd", "GDScript", true)
 		compare_fix = CompareFixScript.new()
@@ -973,11 +997,23 @@ func start() -> void:
 		wall_allow_light._g = Global
 		wall_allow_light.initialize()
 
+	if _debug_enabled("object_keep_lit"):
+		ObjectKeepLitScript = ResourceLoader.load(Global.Root + "scripts/object_keep_lit.gd", "GDScript", true)
+		object_keep_lit = ObjectKeepLitScript.new()
+		object_keep_lit._g = Global
+		object_keep_lit.initialize()
+
 	if _debug_enabled("wall_bevel"):
 		WallBevelScript = ResourceLoader.load(Global.Root + "scripts/wall_bevel.gd", "GDScript", true)
 		wall_bevel = WallBevelScript.new()
 		wall_bevel._g = Global
 		wall_bevel.initialize()
+
+	if _debug_enabled("path_taper"):
+		PathTaperScript = ResourceLoader.load(Global.Root + "scripts/path_taper.gd", "GDScript", true)
+		path_taper = PathTaperScript.new()
+		path_taper._g = Global
+		path_taper.initialize()
 
 	if _debug_enabled("drop_fix"):
 		DropFixScript = ResourceLoader.load(Global.Root + "scripts/drop_fix.gd", "GDScript", true)
@@ -1085,6 +1121,15 @@ func start() -> void:
 		prefabs_thumbnails._g = Global
 		prefabs_thumbnails.initialize()
 
+	# PrefabSetContext: right-click on a prefab set (dropdown) to rename or
+	# hide it.
+	if _debug_enabled("prefab_set_context"):
+		PrefabSetContextScript = ResourceLoader.load(Global.Root + "scripts/prefab_set_context.gd", "GDScript", true)
+		if PrefabSetContextScript != null:
+			prefab_set_context = PrefabSetContextScript.new()
+			prefab_set_context._g = Global
+			prefab_set_context.initialize()
+
 	# PrefabWalls is loaded regardless of its toggle: it reads the setting at
 	# runtime, so it can be switched on/off without a restart.
 	if _debug_enabled("prefab_walls"):
@@ -1127,6 +1172,7 @@ func start() -> void:
 		text_style_extra._g = Global
 		text_style_extra.text_transform = text_transform
 		text_style_extra.text_select_style = text_select_style
+		text_style_extra.text_tool_fix = text_tool_fix
 		text_style_extra.initialize()
 
 	if _debug_enabled("scale_unlock"):
@@ -1250,6 +1296,10 @@ func start() -> void:
 	# SelectFilterBar — repositionable filter-type checkbox bar (SelectTool)
 	if mod_settings == null or mod_settings.is_enabled("select_filter_bar"):
 		_load_select_filter_bar()
+
+	# LayerJump — up/down layer buttons next to the Layer dropdown
+	if mod_settings == null or mod_settings.is_enabled("layer_jump"):
+		_load_layer_jump()
 
 	# LibraryRightPanel — moves the left-panel asset libraries to the right.
 	# At startup it keeps its BOOT_DELAY so AdditionalSearchOptions can build
@@ -2296,6 +2346,35 @@ func _on_select_filter_bar_toggled(enabled) -> void:
 		_unload_select_filter_bar()
 
 
+func _load_layer_jump() -> void:
+	if layer_jump != null:
+		return
+	if _debug_enabled("layer_jump"):
+		LayerJumpScript = ResourceLoader.load(Global.Root + "scripts/layer_jump.gd", "GDScript", true)
+	if LayerJumpScript == null:
+		return
+	layer_jump = LayerJumpScript.new()
+	layer_jump._g = Global
+	layer_jump.initialize()
+	print("[UnofficialPatch] LayerJump loaded.")
+
+
+func _unload_layer_jump() -> void:
+	if layer_jump == null:
+		return
+	if layer_jump.has_method("cleanup"):
+		layer_jump.cleanup()
+	layer_jump = null
+	print("[UnofficialPatch] LayerJump unloaded.")
+
+
+func _on_layer_jump_toggled(enabled) -> void:
+	if enabled:
+		_load_layer_jump()
+	else:
+		_unload_layer_jump()
+
+
 func _on_select_filter_bar_bar_button_toggled(enabled) -> void:
 	if select_filter_bar != null and select_filter_bar.has_method("set_bar_button_enabled"):
 		select_filter_bar.set_bar_button_enabled(enabled)
@@ -2466,6 +2545,7 @@ func update(delta) -> void:
 	_pu("select_highlight_fix", select_highlight_fix, delta)
 	_pu("drag_select_focus_fix", drag_select_focus_fix, delta)
 	_pu("select_layer_pick_fix", select_layer_pick_fix, delta)
+	_pu("above_lights_layer", above_lights_layer, delta)
 	_pu("compare_fix", compare_fix, delta)
 	_pu("export_light_fix", export_light_fix, delta)
 	_pu("export_brightness_fix", export_brightness_fix, delta)
@@ -2494,6 +2574,7 @@ func update(delta) -> void:
 	_pu("water_square_bucket", water_square_bucket, delta)
 	_pu("material_square_bucket", material_square_bucket, delta)
 	_pu("prefabs_thumbnails", prefabs_thumbnails, delta)
+	_pu("prefab_set_context", prefab_set_context, delta)
 	_pu("prefab_walls", prefab_walls, delta)
 	_pu("save_reminder", save_reminder, delta)
 	_pu("text_tool_fix", text_tool_fix, delta)
@@ -2580,6 +2661,8 @@ func _register_debug_mods() -> void:
 		"Recovers a drag-select box left stuck when the window\nloses focus mid-drag (Alt+Tab while holding the click),\nby finalizing the orphaned selection on return.")
 	debug_settings.register_mod("select_layer_pick_fix", "", [], "",
 		"Fixes a vanilla bug where an object stacked under another\non the same layer stops being hover-detectable after the\ntop object's layer is changed and changed back.")
+	debug_settings.register_mod("above_lights_layer", "", [], "",
+		"Adds a default '1100: Above Lights' user layer (z-index 1100)\nto every level, injected through the native layer-loading\npath so it saves, reloads, and renames like any user layer.")
 	debug_settings.register_mod("compare_fix", "", [], "",
 		"Fixes the 'Compare' window behavior when toggling\nbetween before/after states.")
 	debug_settings.register_mod("export_light_fix", "", [], "",
@@ -2600,8 +2683,12 @@ func _register_debug_mods() -> void:
 		"Fixes camera pan glitches when middle-clicking or\nholding space during certain actions.")
 	debug_settings.register_mod("wall_allow_light", "", [], "",
 		"Adds a per-wall toggle to let light pass through\nspecific walls (useful for windows, archways).")
+	debug_settings.register_mod("object_keep_lit", "", [], "",
+		"Adds a Keep Object Lit toggle to the SelectTool so objects\nwith Block Light cast shadows without being shadowed themselves.")
 	debug_settings.register_mod("wall_bevel", "", [], "",
 		"Adds a Bevel Corners toggle to the SelectTool for\nswitching selected walls between beveled and sharp corners.")
+	debug_settings.register_mod("path_taper", "", [], "",
+		"Adds a Custom Grow/Shrink toggle with Grow and Shrink sliders\nto the SelectTool: linear taper over a chosen percentage of\nthe selected path(s) (100% = whole path) instead of the fixed\nvanilla ramp.")
 	debug_settings.register_mod("drop_fix", "", [], "",
 		"Fixes file-drop behavior (image embedding, prefab\nfiles, etc.).")
 	debug_settings.register_mod("pattern_fix", "", [], "",
@@ -2671,6 +2758,8 @@ func _register_debug_mods() -> void:
 		"Asset favoriting system: star/recolor assets, custom\npack of favorites, right-click actions.")
 	debug_settings.register_mod("grid_ruler", "", [], "ruler_guide",
 		"Photoshop-like ruler overlay around the map viewport\nwith a 'Guides' button (Ctrl+R).")
+	debug_settings.register_mod("layer_jump", "Layer Up/Down Buttons", [], "layer_jump",
+		"Adds Up/Down buttons next to the Layer dropdown of the\nPattern Shape, Material Brush, Path, Object, Scatter and\nSelect tools to jump to the adjacent layer.")
 	debug_settings.register_mod("select_filter_bar", "", [], "select_filter_bar",
 		"Repositionable horizontal bar of asset-type filter\ncheckboxes for the Select Tool ('Filters' floatbar button).")
 	debug_settings.register_mod("library_right_panel", "Library Right Panel", [], "library_right_panel",
@@ -2707,6 +2796,8 @@ func _register_debug_mods() -> void:
 		"Lets you reposition portals along their wall while in\nEdit Points mode.")
 	debug_settings.register_mod("prefabs_thumbnails", "", [], "prefab_preview",
 		"Generates thumbnail previews for every prefab with\nmultiple display modes.")
+	debug_settings.register_mod("prefab_set_context", "Prefab Set Context", [], "",
+		"Right-click a prefab set in the PrefabTool dropdown to\nrename or hide it.")
 	debug_settings.register_mod("prefab_walls", "", ["ui_util"], "prefab_walls",
 		"Adds walls and their portals to prefabs (saving,\nghost preview and placement).")
 	debug_settings.register_mod("popup_blur", "", [], "blurred_popup_background",

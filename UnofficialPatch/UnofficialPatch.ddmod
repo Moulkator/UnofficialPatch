@@ -1,7 +1,7 @@
 {
     "name": "Unofficial Patch",
     "unique_id": "Moulk.BugFixes",
-    "version": "1.6.0",
+    "version": "1.7.0",
     "author": "Moulk & friends",
     "description": "Various bug fixes and features",
     "dd_version": "1.2.0.1"
