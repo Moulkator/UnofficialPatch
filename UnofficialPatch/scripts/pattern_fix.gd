@@ -299,7 +299,13 @@ func _try_init_sorting():
 	var layer_menu = pat_tool.get("LayerMenu")
 	if layer_menu == null or not is_instance_valid(layer_menu):
 		return
+	# LayerJump wraps the LayerMenu into a "LayerJumpRow" HBox; anchor the
+	# Over/Under row on that wrapper (so it lands below it), not inside it.
+	var anchor = layer_menu
 	var parent = layer_menu.get_parent()
+	if parent != null and parent.name == "LayerJumpRow":
+		anchor = parent
+		parent = parent.get_parent()
 	if parent == null:
 		return
 
@@ -315,7 +321,7 @@ func _try_init_sorting():
 	_sort_over_button.pressed = true
 
 	parent.add_child(hbox)
-	parent.move_child(hbox, layer_menu.get_index() + 1)
+	parent.move_child(hbox, anchor.get_index() + 1)
 	_sort_initialized = true
 
 
