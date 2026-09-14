@@ -1,5 +1,10 @@
 UNOFFICIAL PATCH
 
+1.7.1
+- Fixed Under and Over buttons being at the wrong place in the Patter Tool
+- Fixed Above Lights layers not showing in all tools until you open the Object Tool
+- Fixed Above Lights layer label displaying twice "1100:"
+
 v1.7.0
 
 NEW FEATURES
