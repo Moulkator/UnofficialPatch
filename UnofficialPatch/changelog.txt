@@ -1,7 +1,12 @@
 UNOFFICIAL PATCH
 
+1.7.2
+- Added a right-click API in right_click_util.gd
+- Better compatibility between the Free Transform mode and the Layer Panel mod
+- Fixed Edit Points not being saved on Free Transformed pattern shapes
+
 1.7.1
-- Fixed Under and Over buttons being at the wrong place in the Patter Tool
+- Fixed Under and Over buttons being at the wrong place in the Pattern Tool
 - Fixed Above Lights layers not showing in all tools until you open the Object Tool
 - Fixed Above Lights layer label displaying twice "1100:"
 
