@@ -128,6 +128,13 @@ var _ft_lock : Array = []
 # on purpose, so the lock follows instead of fighting it.
 var _ft_lock_next_id := -1
 var _ft_lock_reassert : int = 0
+# The lock only fights selection changes caused by a canvas click (DD picking
+# an overlapping / nearby asset) or by undo/redo. Any other change — another
+# mod's panel (e.g. Layer Panel list), a keyboard shortcut — is deliberate:
+# the lock follows it. Tracked from _on_input.
+const _FT_LOCK_CAUSE_WINDOW_MS := 400
+var _ft_lock_cause_ms := -100000
+var _ft_canvas_press := false
 
 
 # ── Curseurs ──────────────────────────────────────────────────────────────
@@ -1972,6 +1979,7 @@ func _on_reset_scale() -> void:
 			nd.rotation = 0.0
 			nd.transform = Transform2D(Vector2(1, 0), Vector2(0, 1), nd.position)
 		elif _is_pattern(nd):
+			_ft_absorb_pattern_edit(nd)
 			# Restaure la position originale
 			var key = _ft_node_key(nd)
 			if key != "" and _g.ModMapData.has("_ft_pattern_orig_pos") \
@@ -2339,7 +2347,9 @@ func update(_delta: float) -> void:
 		if _raw == null or _raw.size() == 0:
 			# DD a tout désélectionné. Si on est verrouillé et que ce n'est PAS
 			# une désélection volontaire (clic loin), on rétablit le verrou.
-			if _enabled and _ft_lock.size() > 0:
+			# Only when a canvas click / undo can be the cause: a deselection
+			# coming from elsewhere (another mod's panel…) is deliberate.
+			if _enabled and _ft_lock.size() > 0 and _ft_lock_cause_recent():
 				if _ft_lock_reassert < 8 and _select_tool != null:
 					_ft_lock_reassert += 1
 					_select_tool.transformMode = 0
@@ -2424,6 +2434,13 @@ func update(_delta: float) -> void:
 			# clipboard_fix's cursor move — the lock follows the new
 			# selection instead.
 			elif _ft_selection_has_new_nodes(fresh_props):
+				_ft_lock = fresh_props.duplicate()
+				_ft_lock_reassert = 0
+				_ft_lock_next_id = _ft_world_next_id()
+			# Selection changed without any recent canvas click / undo: it
+			# comes from another mod (e.g. Layer Panel list) or a shortcut —
+			# deliberate, the lock follows the new selection.
+			elif not _ft_lock_cause_recent():
 				_ft_lock = fresh_props.duplicate()
 				_ft_lock_reassert = 0
 				_ft_lock_next_id = _ft_world_next_id()
@@ -2742,6 +2759,33 @@ func _reset_cursor() -> void:
 
 # ══ Input ══════════════════════════════════════════════════════════════════
 
+# Records left clicks made on the canvas (not over the UI): they are the only
+# mouse events that can make DD switch the selection against the FT lock.
+func _ft_track_canvas_click(event: InputEventMouseButton) -> void:
+	if event.pressed:
+		var over_ui := false
+		if _ui_util != null:
+			if _ui_util.has_method("is_mouse_over_hud"):
+				over_ui = _ui_util.is_mouse_over_hud(_input_listener)
+			else:
+				over_ui = _ui_util.is_mouse_over_ui(_input_listener)
+		_ft_canvas_press = not over_ui
+		if _ft_canvas_press:
+			_ft_lock_cause_ms = OS.get_ticks_msec()
+	elif _ft_canvas_press:
+		_ft_canvas_press = false
+		_ft_lock_cause_ms = OS.get_ticks_msec()
+
+
+# True while a selection change can still be blamed on a canvas click / undo.
+func _ft_lock_cause_recent() -> bool:
+	# Release missed (FT toggled / tool changed mid-press): don't stay stuck.
+	if _ft_canvas_press and not Input.is_mouse_button_pressed(BUTTON_LEFT):
+		_ft_canvas_press = false
+	return _ft_canvas_press \
+			or OS.get_ticks_msec() - _ft_lock_cause_ms < _FT_LOCK_CAUSE_WINDOW_MS
+
+
 func _on_input(event: InputEvent) -> void:
 	if _viewport_path.is_empty(): return
 	var tree = _g.World.get_tree()
@@ -2749,14 +2793,21 @@ func _on_input(event: InputEvent) -> void:
 
 	# Observe Ctrl+Z pour sauvegarder la sélection — sans jamais consommer
 	if event is InputEventKey:
-		if event.pressed and not event.echo and event.control and event.scancode == KEY_Z:
-			_save_selection_for_undo()
+		if event.pressed and not event.echo and event.control \
+				and (event.scancode == KEY_Z or event.scancode == KEY_Y):
+			# Undo/redo makes DD drop the selection: keep the lock able to
+			# restore it (observed only, never consumed).
+			_ft_lock_cause_ms = OS.get_ticks_msec()
+			if event.scancode == KEY_Z:
+				_save_selection_for_undo()
 		return
 
 	if not (event is InputEventMouseButton or event is InputEventMouseMotion): return
 	_mod_shift = event.shift; _mod_alt = event.alt
 
 	if not _enabled: return
+	if event is InputEventMouseButton and event.button_index == BUTTON_LEFT:
+		_ft_track_canvas_click(event)
 	if _selected_objects.size() == 0 and _active_handle < 0:
 		# Sélection walls-only (un ou plusieurs murs, aucun prop FT) : on
 		# laisse passer les événements souris — la box verte FT porte les
@@ -3055,6 +3106,12 @@ func _capture_ft_unified(nodes: Array) -> Dictionary:
 	# by _bake_pattern_state) plus every pattern-related ModMapData
 	# store (orig polygon, orig pos, reset baseline, world corners).
 	var out: Dictionary = {}
+	# Fold pending point edits of warped patterns in first, so the snapshot
+	# (polygon + stores) is self-consistent. Must run before the stores are
+	# fetched below: it may create _ft_pattern_reset.
+	for nd in nodes:
+		if is_instance_valid(nd) and _is_pattern(nd):
+			_ft_absorb_pattern_edit(nd)
 	var transforms_store = _g.ModMapData.get("_ft_transforms", {})
 	var distort_store = _g.ModMapData.get("_ft_distort", {})
 	var crop_store = _g.ModMapData.get("_ft_crop", {})
@@ -4038,6 +4095,7 @@ func _bake_pattern_texture_rotation(node: Node2D, basis_t: Transform2D) -> void:
 func _bake_pattern_state(node: Node2D) -> void:
 	# Fusionne toute transformation (scale, shear, distort, perspective) dans le polygon.
 	# Appelé uniquement quand le transform est non-identity.
+	_ft_absorb_pattern_edit(node)
 	var key = _ft_node_key(node)
 
 	# Calcule les positions monde des vertices.
@@ -6407,6 +6465,10 @@ func _invalidate_stale_pattern_data(node: Node2D) -> void:
 			and _g.ModMapData["_ft_distort"].has(key)
 	var has_active_shear = _g.ModMapData.has("_ft_transforms") \
 			and _g.ModMapData["_ft_transforms"].has(key)
+	if has_active_distort:
+		# Point edits made under the warp: fold them in before the drag
+		# rebuilds the polygon from the stored original.
+		_ft_absorb_pattern_edit(node)
 	if has_active_distort or has_active_shear: return
 
 	var poly = node.polygon
@@ -6474,6 +6536,178 @@ func _get_orig_polygon(node: Node2D) -> Array:
 				pts.append(Vector2(flat[i], flat[i + 1]))
 			return pts
 	return []
+
+
+# ── Pattern point edits under an active distort ──────────────────────────
+# The warped polygon is REBUILT from _ft_pattern_orig + the distort corners
+# (next handle drag, undo, every reload…). A polygon edited by DD's Edit
+# Points (or another mod) while the warp is in place was therefore thrown
+# away by the next rebuild. Before any rebuild: compare the node's polygon
+# with what the stored data would produce; if it differs, map the edited
+# vertices back to the original (texture) space through the inverse
+# bilinear warp and make THAT the new original (working + reset). The
+# corner quad is re-derived for the new AABB so the bilinear mapping — hence
+# the texture — stays exactly the same. Returns true when the stores changed.
+func _ft_absorb_pattern_edit(node: Node2D) -> bool:
+	var key = _ft_node_key(node)
+	if key == "": return false
+	if not _g.ModMapData.has("_ft_distort") or not _g.ModMapData["_ft_distort"].has(key):
+		return false
+	var raw = _g.ModMapData["_ft_distort"][key]
+	if not (raw is Array) or raw.size() != 8: return false
+	var orig = _get_orig_polygon(node)
+	if orig.size() < 3: return false
+	var poly = node.polygon
+	if poly == null or poly.size() < 3: return false
+	var lc = [Vector2(raw[0], raw[1]), Vector2(raw[2], raw[3]),
+	          Vector2(raw[4], raw[5]), Vector2(raw[6], raw[7])]
+	var mn = orig[0]; var mx = orig[0]
+	for q in orig:
+		mn.x = min(mn.x, q.x); mn.y = min(mn.y, q.y)
+		mx.x = max(mx.x, q.x); mx.y = max(mx.y, q.y)
+	var src_size = mx - mn
+	if src_size.x < 0.1 or src_size.y < 0.1: return false
+
+	# Expected polygon = exactly what _apply_distort_pattern builds.
+	var expected = _ft_warp_pattern_polygon(orig, lc, mn, src_size)
+	if expected.size() == poly.size():
+		var same = true
+		for i in range(poly.size()):
+			if poly[i].distance_squared_to(expected[i]) > 0.25:
+				same = false
+				break
+		if same:
+			return false
+
+	# Edited: invert the warp for every vertex → original space.
+	var new_orig := []
+	for q in poly:
+		var uv = _ft_inv_bilinear_nearest(q, lc)
+		new_orig.append(Vector2(mn.x + uv.x * src_size.x, mn.y + uv.y * src_size.y))
+	# Drop the edge subdivision points (collinear in original space) so
+	# the vertex count doesn't grow ×SUBDIV at each edit.
+	var tol = max(0.05, 0.002 * max(src_size.x, src_size.y))
+	new_orig = _ft_decimate_collinear(new_orig, tol)
+	if new_orig.size() < 3: return false
+
+	var nmn = new_orig[0]; var nmx = new_orig[0]
+	for q in new_orig:
+		nmn.x = min(nmn.x, q.x); nmn.y = min(nmn.y, q.y)
+		nmx.x = max(nmx.x, q.x); nmx.y = max(nmx.y, q.y)
+	var nsize = nmx - nmn
+	if nsize.x < 0.1 or nsize.y < 0.1: return false
+	# Same bilinear map, re-parametrised on the new AABB.
+	var nlc := []
+	for c in [Vector2(nmn.x, nmn.y), Vector2(nmx.x, nmn.y),
+			Vector2(nmx.x, nmx.y), Vector2(nmn.x, nmx.y)]:
+		var u = (c.x - mn.x) / src_size.x
+		var v = (c.y - mn.y) / src_size.y
+		var top    = lc[0].linear_interpolate(lc[1], u)
+		var bottom = lc[3].linear_interpolate(lc[2], u)
+		nlc.append(top.linear_interpolate(bottom, v))
+
+	var flat := []
+	for q in new_orig:
+		flat.append(q.x); flat.append(q.y)
+	if not _g.ModMapData.has("_ft_pattern_orig"):
+		_g.ModMapData["_ft_pattern_orig"] = {}
+	if not _g.ModMapData.has("_ft_pattern_reset"):
+		_g.ModMapData["_ft_pattern_reset"] = {}
+	_g.ModMapData["_ft_pattern_orig"][key] = flat
+	_g.ModMapData["_ft_pattern_reset"][key] = flat.duplicate()
+	_store_distort_corners(node, nlc)
+	if not _g.ModMapData.has("_ft_pattern_world"):
+		_g.ModMapData["_ft_pattern_world"] = {}
+	var wflat := []
+	for c in nlc:
+		wflat.append(c.x + node.position.x); wflat.append(c.y + node.position.y)
+	_g.ModMapData["_ft_pattern_world"][key] = wflat
+	print("[FreeTransform] Pattern %s: point edit absorbed into distort data (%d vertices)" % [key, new_orig.size()])
+	return true
+
+
+# Inverse bilinear with BOTH roots evaluated: outside the quad the two
+# pre-images are both valid, so pick the one closest to the unit square
+# (edited vertices dragged out of the box stay near their edge).
+func _ft_inv_bilinear_nearest(p: Vector2, quad: Array) -> Vector2:
+	var a: Vector2 = quad[0]; var b: Vector2 = quad[1]
+	var c: Vector2 = quad[2]; var d: Vector2 = quad[3]
+	var e = b - a; var f = d - a; var g = a - b + c - d; var h = p - a
+	var k2 = g.cross(f)
+	var k1 = e.cross(f) + h.cross(g)
+	var k0 = h.cross(e)
+	var vs := []
+	if abs(k2) < 1e-9 * (abs(k1) + 1.0):
+		vs.append(-k0 / k1 if abs(k1) > 0.000000000001 else 0.0)
+	else:
+		var sq = sqrt(max(k1 * k1 - 4.0 * k0 * k2, 0.0))
+		var qq = -0.5 * (k1 + (sq if k1 >= 0.0 else -sq))
+		vs.append(qq / k2)
+		if abs(qq) > 0.000000000001:
+			vs.append(k0 / qq)
+	var best := Vector2.ZERO
+	var best_d := INF
+	for v in vs:
+		var den = e + g * v
+		var u: float
+		if abs(den.x) > abs(den.y):
+			u = (h.x - f.x * v) / den.x if abs(den.x) > 0.000000000001 else 0.0
+		else:
+			u = (h.y - f.y * v) / den.y if abs(den.y) > 0.000000000001 else 0.0
+		var du = max(0.0, max(-u, u - 1.0))
+		var dv = max(0.0, max(-v, v - 1.0))
+		var dist = du * du + dv * dv
+		if dist < best_d:
+			best_d = dist
+			best = Vector2(u, v)
+	return best
+
+
+# Warped polygon (SUBDIV points per edge) — shared by _apply_distort_pattern
+# and _ft_absorb_pattern_edit so both produce bit-identical vertices.
+const PATTERN_WARP_SUBDIV := 8
+func _ft_warp_pattern_polygon(orig: Array, lc: Array, mn: Vector2, src_size: Vector2) -> PoolVector2Array:
+	var out = PoolVector2Array()
+	var n_pts = orig.size()
+	for edge_i in range(n_pts):
+		var p0 = orig[edge_i]
+		var p1 = orig[(edge_i + 1) % n_pts]
+		for sub in range(PATTERN_WARP_SUBDIV):
+			var t_sub = float(sub) / float(PATTERN_WARP_SUBDIV)
+			var q = p0.linear_interpolate(p1, t_sub)
+			var u = (q.x - mn.x) / src_size.x
+			var v = (q.y - mn.y) / src_size.y
+			var top    = lc[0].linear_interpolate(lc[1], u)
+			var bottom = lc[3].linear_interpolate(lc[2], u)
+			out.append(top.linear_interpolate(bottom, v))
+	return out
+
+
+# Removes vertices lying (within tol) on the segment joining their
+# neighbours. Closed polygon; duplicates are removed as well.
+func _ft_decimate_collinear(pts: Array, tol: float) -> Array:
+	var n = pts.size()
+	if n < 4: return pts
+	var tol2 = tol * tol
+	var keep := []
+	for i in range(n):
+		var prev = keep[keep.size() - 1] if keep.size() > 0 else pts[n - 1]
+		var next = pts[(i + 1) % n]
+		if pts[i].distance_squared_to(prev) <= tol2:
+			continue
+		if _dist2_point_seg(pts[i], prev, next) <= tol2:
+			continue
+		keep.append(pts[i])
+	# Wrap-around: the first kept point was tested against the raw last
+	# input point, re-test it against the real neighbours.
+	if keep.size() > 3:
+		if _dist2_point_seg(keep[0], keep[keep.size() - 1], keep[1]) <= tol2:
+			keep.remove(0)
+	if keep.size() > 3:
+		var last = keep.size() - 1
+		if _dist2_point_seg(keep[last], keep[last - 1], keep[0]) <= tol2:
+			keep.remove(last)
+	return keep
 
 
 func _apply_distort_pattern(node: Node2D, world_corners: Array, orig_polygon = null) -> void:
@@ -6638,20 +6872,7 @@ func _apply_distort_pattern(node: Node2D, world_corners: Array, orig_polygon = n
 	# Subdivise les arêtes du polygon pour que la triangulation de Godot
 	# approxime mieux la surface bilinéaire (sinon un quad 4-vertex produit
 	# 2 triangles → le shader inv_bilinear diverge pour les quads non-parallelogrammes).
-	var SUBDIV = 8  # subdivisions par arête
-	var new_poly = PoolVector2Array()
-	var n_pts = orig.size()
-	for edge_i in range(n_pts):
-		var p0 = orig[edge_i]
-		var p1 = orig[(edge_i + 1) % n_pts]
-		for sub in range(SUBDIV):
-			var t_sub = float(sub) / float(SUBDIV)
-			var p = p0.linear_interpolate(p1, t_sub)
-			var u = (p.x - mn.x) / src_size.x
-			var v = (p.y - mn.y) / src_size.y
-			var top    = lc[0].linear_interpolate(lc[1], u)
-			var bottom = lc[3].linear_interpolate(lc[2], u)
-			new_poly.append(top.linear_interpolate(bottom, v))
+	var new_poly = _ft_warp_pattern_polygon(orig, lc, mn, src_size)
 	node.polygon = new_poly
 	node.uv = PoolVector2Array()
 
@@ -6719,6 +6940,7 @@ func _scale_pattern_geometry(node: Node2D, world_corners: Array, orig_polygon = 
 
 
 func _remove_distort_pattern(node: Node2D) -> void:
+	_ft_absorb_pattern_edit(node)
 	var key = _ft_node_key(node)
 	# Restaure le matériau original
 	if _ft_materials.has(key):
@@ -7176,6 +7398,12 @@ func _restore_distort_from_store(select_active: bool = true) -> void:
 			# Sinon, DD a besoin de travailler avec le pattern propre pour la création.
 			if not select_active:
 				continue
+			# Points edited (Edit Points, other mod) since the warp was last
+			# built — typically a save/reload: fold them in before rebuilding.
+			if _ft_absorb_pattern_edit(nd):
+				var nraw = store[key]
+				lc = [Vector2(nraw[0], nraw[1]), Vector2(nraw[2], nraw[3]),
+						Vector2(nraw[4], nraw[5]), Vector2(nraw[6], nraw[7])]
 			# Utilise les coins locaux stockés + position courante du node
 			var wc = []
 			for c in lc:

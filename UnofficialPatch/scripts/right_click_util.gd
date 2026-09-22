@@ -24,6 +24,30 @@
 # right-click handling while the cursor is inside one of them. The registry
 # lives on Engine meta so a mod that only knows the key can feed it without
 # holding a reference to this script.
+#
+# ── Public API for other mods (version 1) ───────────────────────────────────
+# Other mods cannot reach this script instance, and their start() may run
+# before or after ours, so the API is two Engine meta keys:
+#
+#   "_up_rcm_host"      (written by us) {world = Global.World, version = 1}
+#       Tells a mod that this menu is live for the CURRENT map. Must be tested
+#       lazily (at right-click time, not in start()) because of load order.
+#   "_up_rcm_providers" (written by them) Array of
+#       {id: String, provider: Object, world: Global.World, order: int}
+#       Read every time the menu opens, so load order does not matter.
+#
+# Engine meta survives map changes while mod instances do not, and mods are
+# enabled per map: `world` is the session stamp. An entry (or the host flag)
+# whose world is freed or is not the current Global.World is stale and ignored.
+# Re-registering an `id` replaces the previous entry.
+#
+# External providers implement get_context_items(raw), optionally
+# get_void_context_items(), and on_context_action(action_id, raw) — same
+# contract as internal ones, minus check_right_click(). Their items may also
+# be {separator = true}, and any item may carry `disabled = true` (greyed out
+# but still listed). They get their own divider group and default to
+# order 1000 (after the patch entries, which use 10..60).
+# Shift + right-click shows each top-level entry's order next to its label.
 
 var _g
 var ui_util
@@ -35,9 +59,20 @@ var _popup_layer: CanvasLayer = null
 var _item_map := {}   # menu id -> {provider, action_id}
 var _last_raw = null
 var _register_seq := 0
+var _ext_seen := {}   # external provider ids already logged
+
+
+const EXT_HOST_META := "_up_rcm_host"
+const EXT_PROVIDERS_META := "_up_rcm_providers"
+const EXT_API_VERSION := 1
+const EXT_DEFAULT_ORDER := 1000
+const EXT_SEQ_BASE := 1000000
 
 
 func initialize() -> void:
+	# Public API: advertise the menu for this map session (see header).
+	if _g != null and _g.get("World") != null and is_instance_valid(_g.World):
+		Engine.set_meta(EXT_HOST_META, {world = _g.World, version = EXT_API_VERSION})
 	print("[RightClickUtil] Initialized with ", _providers.size(), " provider(s)")
 
 
@@ -228,9 +263,16 @@ func _on_right_click() -> void:
 	var entries := []
 	for e in _providers:
 		entries.append(e)
+	for e in _external_entries():
+		entries.append(e)
 	entries.sort_custom(self, "_sort_entries")
 
-	var last_group = null
+	# Groups are compared as strings: internal ones are ints, external ones
+	# are "ext:<id>", and Godot 3 errors on int != String.
+	var last_group := ""
+	# Shift + right-click: suffix every top-level entry with its provider's
+	# order, so users / modders can see where a given `order` value lands.
+	var show_order := Input.is_key_pressed(KEY_SHIFT)
 	for e in entries:
 		if not _setting_enabled(e.setting):
 			continue
@@ -242,16 +284,21 @@ func _on_right_click() -> void:
 		else:
 			if p.has_method("get_void_context_items"):
 				items = p.get_void_context_items()
-		if items == null or items.size() == 0:
+		# Sanitized copies: a malformed item from another mod must not abort
+		# the whole menu (a missing Dictionary key is a hard error in GDScript).
+		items = _normalize_items(items, p, true)
+		if items.size() == 0:
 			continue
 		# Separator between divider groups only, and never leading.
-		if all_items.size() > 0 and e.group != last_group:
+		var gkey := str(e.group)
+		if all_items.size() > 0 and gkey != last_group:
 			all_items.append({label = "", icon = null, action_id = "", _sep = true})
-		last_group = e.group
+		last_group = gkey
 		for item in items:
-			var copy = item.duplicate()
-			copy["_provider"] = p
-			all_items.append(copy)
+			# Items are sanitized copies: relabeling never touches the provider's data.
+			if show_order and not item.get("_sep", false):
+				item.label = "%s  [%d]" % [item.label, int(e.order)]
+			all_items.append(item)
 
 	if all_items.size() == 0:
 		return
@@ -283,19 +330,26 @@ func _show_popup(items: Array) -> void:
 				sub.add_item(sub_item.label, next_id)
 				if sub_item.get("icon", null) != null:
 					sub.set_item_icon(sub.get_item_index(next_id), sub_item.icon)
+				if sub_item.get("disabled", false):
+					sub.set_item_disabled(sub.get_item_index(next_id), true)
 				_item_map[next_id] = {provider = item["_provider"], action_id = sub_item.action_id}
 				next_id += 1
 			sub.connect("id_pressed", self, "_on_item_pressed")
 			_context_menu.add_child(sub)
 			# A submenu parent never emits id_pressed, so it needs no mapping.
 			_context_menu.add_submenu_item(item.label, sub.name, next_id)
-			if item.icon != null:
+			if item.get("icon", null) != null:
 				_context_menu.set_item_icon(_context_menu.get_item_index(next_id), item.icon)
+			# A disabled submenu parent stays listed but does not open.
+			if item.get("disabled", false):
+				_context_menu.set_item_disabled(_context_menu.get_item_index(next_id), true)
 			next_id += 1
 			continue
 		_context_menu.add_item(item.label, next_id)
-		if item.icon != null:
+		if item.get("icon", null) != null:
 			_context_menu.set_item_icon(_context_menu.get_item_index(next_id), item.icon)
+		if item.get("disabled", false):
+			_context_menu.set_item_disabled(_context_menu.get_item_index(next_id), true)
 		_item_map[next_id] = {provider = item["_provider"], action_id = item.action_id}
 		next_id += 1
 
@@ -324,6 +378,93 @@ func _on_popup_closed() -> void:
 	if _context_menu and is_instance_valid(_context_menu):
 		_context_menu.queue_free()
 		_context_menu = null
+
+
+# ── Public API (other mods) ──────────────────────────────────────────────────
+
+# Providers registered by other mods for the current map session, shaped like
+# _providers entries. Stale entries (previous map) are pruned from the meta.
+func _external_entries() -> Array:
+	var out := []
+	if _g == null or not Engine.has_meta(EXT_PROVIDERS_META):
+		return out
+	var arr = Engine.get_meta(EXT_PROVIDERS_META)
+	if not (arr is Array) or arr.empty():
+		return out
+	var world = _g.World
+	var by_id := {}  # last registration of an id wins
+	for d in arr:
+		if not (d is Dictionary):
+			continue
+		var p = d.get("provider")
+		var w = d.get("world")
+		if p == null or not is_instance_valid(p):
+			continue
+		if w == null or not is_instance_valid(w) or w != world:
+			continue
+		var id = d.get("id")
+		if not (id is String) or id == "":
+			continue
+		by_id[id] = d
+	var kept: Array = by_id.values()
+	if kept.size() != arr.size():
+		Engine.set_meta(EXT_PROVIDERS_META, kept)
+	var i := 0
+	for key in by_id:
+		var entry: Dictionary = by_id[key]
+		var order = entry.get("order")
+		if typeof(order) != TYPE_INT and typeof(order) != TYPE_REAL:
+			order = EXT_DEFAULT_ORDER
+		out.append({
+			provider = entry.provider,
+			order = int(order),
+			group = "ext:" + key,
+			setting = "",
+			seq = EXT_SEQ_BASE + i,
+		})
+		i += 1
+		if not _ext_seen.has(key):
+			_ext_seen[key] = true
+			print("[RightClickUtil] External provider registered: ", key)
+	return out
+
+
+# Returns clean {label, icon, action_id, disabled, _provider[, submenu]} / separator
+# items. Accepts the internal `_sep` and the public `separator` spelling.
+func _normalize_items(items, provider, allow_submenu: bool) -> Array:
+	var out := []
+	if not (items is Array):
+		return out
+	for item in items:
+		if not (item is Dictionary):
+			continue
+		if item.get("separator", false) or item.get("_sep", false):
+			# Never leading, never doubled.
+			if out.size() > 0 and not out[out.size() - 1].get("_sep", false):
+				out.append({label = "", icon = null, action_id = "", _sep = true})
+			continue
+		var label = item.get("label")
+		if not (label is String) or label == "":
+			continue
+		var icon = item.get("icon")
+		if not (icon is Texture):
+			icon = null
+		var clean := {
+			label = label,
+			icon = icon,
+			action_id = item.get("action_id", ""),
+			disabled = (true if item.get("disabled", false) else false),
+			_provider = provider,
+		}
+		if allow_submenu:
+			var sub = _normalize_items(item.get("submenu"), provider, false)
+			if sub.size() > 0:
+				clean["submenu"] = sub
+		out.append(clean)
+	# Never trailing.
+	while out.size() > 0 and out[out.size() - 1].get("_sep", false):
+		out.pop_back()
+	return out
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
