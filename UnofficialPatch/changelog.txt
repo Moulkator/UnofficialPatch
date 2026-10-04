@@ -1,12 +1,10 @@
 UNOFFICIAL PATCH
 
-1.7.4
+1.7.3
 - Added compatibility with the layers keyboard shortcuts from Minor Utils
 - Added compatibility with the Nudge mod for walls
 - Fixed a display issue with small thumbnails in the Map Gallery
 - Fixed Free Transform turning blurred patterns via Colour and Modify Things into solid white
-
-1.7.3
 - Improved the right-click API in right_click_util.gd to add cascading sub menus
 
 1.7.2
