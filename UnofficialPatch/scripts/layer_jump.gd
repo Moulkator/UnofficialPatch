@@ -4,8 +4,12 @@
 # Material Brush, Path Tool, Object Tool, Scatter Tool and Select Tool.
 # "Up" jumps to the next higher z-index layer, "Down" to the next lower one.
 #
-# The native OptionButton is reparented into an HBoxContainer placed at its
-# original position, so the tool keeps its LayerMenu reference untouched.
+# The buttons are added as CHILDREN of the native OptionButton (anchored to
+# its right edge) and the dropdown arrow is shifted left through the
+# "arrow_margin" theme constant. The OptionButton itself is never moved, so
+# the panel tree stays vanilla: other mods that look up the dropdown as the
+# sibling following the "Layer" label (e.g. Minor Utils' layer hotkeys) keep
+# working whatever the mod load order.
 # The jump goes through the tool's native HotChangeLayer(int) when it exists
 # (same path as the 1/2/3/4 hotkeys) — otherwise it selects the item and
 # emits item_selected so the tool applies the change itself.
@@ -24,9 +28,10 @@ const _TOOL_NAMES = [
 	"ObjectTool", "ScatterTool", "SelectTool",
 ]
 
-const _BUTTON_SIZE = Vector2(27, 27)
+const _BUTTON_WIDTH = 27
+const _BUTTON_GAP = 2
 
-# tool_name -> { "tool", "menu", "parent", "index", "hbox", "up", "down" }
+# tool_name -> { "tool", "menu", "hbox", "arrow_margin" }
 var _entries := {}
 var _tex_up = null
 var _tex_down = null
@@ -45,12 +50,10 @@ func cleanup() -> void:
 		var e = _entries[name]
 		var menu = e["menu"]
 		var hbox = e["hbox"]
-		var parent = e["parent"]
-		if is_instance_valid(menu) and is_instance_valid(hbox) and is_instance_valid(parent):
-			hbox.remove_child(menu)
-			parent.add_child(menu)
-			parent.move_child(menu, min(e["index"], parent.get_child_count() - 1))
-			menu.size_flags_horizontal = e["flags"]
+		if is_instance_valid(menu):
+			menu.add_constant_override("arrow_margin", e["arrow_margin"])
+			if is_instance_valid(hbox) and hbox.get_parent() == menu:
+				menu.remove_child(hbox)
 		if is_instance_valid(hbox):
 			hbox.queue_free()
 	_entries.clear()
@@ -71,21 +74,16 @@ func _inject(tool_name: String) -> void:
 	if menu == null or not (menu is OptionButton):
 		print("[LayerJump] %s: LayerMenu not found" % tool_name)
 		return
-	var parent = menu.get_parent()
-	if parent == null:
-		return
-	var index = menu.get_index()
 
+	# Full-rect, click-through row: only the two buttons catch the mouse, the
+	# rest of the dropdown still opens the popup.
 	var hbox = HBoxContainer.new()
 	hbox.name = "LayerJumpRow"
-	hbox.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-
-	var flags = menu.size_flags_horizontal
-	parent.remove_child(menu)
-	parent.add_child(hbox)
-	parent.move_child(hbox, index)
-	hbox.add_child(menu)
-	menu.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	hbox.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	hbox.alignment = BoxContainer.ALIGN_END
+	hbox.add_constant_override("separation", _BUTTON_GAP)
+	menu.add_child(hbox)
+	hbox.set_anchors_and_margins_preset(Control.PRESET_WIDE)
 
 	var up = _make_button(_tex_up, "▲", "Jump to the layer above")
 	up.connect("pressed", self, "_on_jump", [tool_name, 1])
@@ -94,9 +92,13 @@ func _inject(tool_name: String) -> void:
 	down.connect("pressed", self, "_on_jump", [tool_name, -1])
 	hbox.add_child(down)
 
+	# Move the dropdown arrow out from under the buttons.
+	var arrow_margin = menu.get_constant("arrow_margin")
+	menu.add_constant_override("arrow_margin",
+		arrow_margin + _BUTTON_WIDTH * 2 + _BUTTON_GAP * 2)
+
 	_entries[tool_name] = {
-		"tool": dd_tool, "menu": menu, "parent": parent, "index": index,
-		"flags": flags, "hbox": hbox, "up": up, "down": down,
+		"tool": dd_tool, "menu": menu, "hbox": hbox, "arrow_margin": arrow_margin,
 	}
 
 
@@ -104,8 +106,8 @@ func _make_button(tex, fallback_text: String, tip: String) -> Button:
 	var b = Button.new()
 	b.hint_tooltip = tip
 	b.focus_mode = Control.FOCUS_NONE
-	b.rect_min_size = _BUTTON_SIZE
-	b.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	b.rect_min_size = Vector2(_BUTTON_WIDTH, 0)
+	b.size_flags_vertical = Control.SIZE_FILL
 	if tex != null:
 		b.icon = tex
 	else:

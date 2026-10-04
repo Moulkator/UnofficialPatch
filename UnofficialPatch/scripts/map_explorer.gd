@@ -1150,6 +1150,7 @@ func _show_explorer_window() -> void:
 	_scroll_container = ScrollContainer.new()
 	_scroll_container.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	_scroll_container.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_scroll_container.scroll_horizontal_enabled = false
 	_scroll_container.connect("gui_input", self, "_on_scroll_container_input")
 	main_vbox.add_child(_scroll_container)
 	
@@ -1849,11 +1850,7 @@ func _on_window_resized() -> void:
 		return  # Will trigger another resize event
 	
 	# Update grid columns
-	if _grid_container != null and is_instance_valid(_grid_container):
-		var available_width = current_size.x - 240  # Account for folder panel
-		var card_width = _preview_size + 12
-		var columns = max(1, int(available_width / card_width))
-		_grid_container.columns = columns
+	_update_grid_columns(current_size.x)
 	
 	# Adaptive layout: wrap toolbar to 2 rows when narrow
 	_update_adaptive_layout(current_size.x)
@@ -2062,12 +2059,10 @@ func _refresh_explorer_grid() -> void:
 	_list_container.visible = (_view_mode == "list")
 	
 	# Calculate columns based on window width (for grid mode)
-	var available_width = _window_size.x - 40
+	var window_width = _window_size.x
 	if _explorer_window != null and is_instance_valid(_explorer_window):
-		available_width = _explorer_window.rect_size.x - 40
-	var card_width = _preview_size + 12
-	var columns = max(1, int(available_width / card_width))
-	_grid_container.columns = columns
+		window_width = _explorer_window.rect_size.x
+	_update_grid_columns(window_width)
 	
 	_load_index()
 	
@@ -2495,6 +2490,32 @@ func _do_reorder(source_id: String, target_id: String) -> void:
 	print("[MapExplorer] Reordered: %s moved to position %d" % [source_id, target_idx])
 
 
+# Grid columns from the window width. Cards are exactly _preview_size wide
+# (labels are clipped), so the grid never overflows horizontally.
+func _update_grid_columns(window_width: float) -> void:
+	if _grid_container == null or not is_instance_valid(_grid_container):
+		return
+	# Folder panel (180) + separators/margins + vertical scrollbar
+	var available_width = window_width - 240
+	var card_width = _preview_size + 8  # + grid hseparation
+	_grid_container.columns = int(max(1, floor((available_width + 8) / card_width)))
+
+
+# Truncate text with "..." so it fits in max_width pixels.
+func _fit_text(text: String, max_width: float) -> String:
+	var font : Font = null
+	if _explorer_window != null and is_instance_valid(_explorer_window):
+		font = _explorer_window.get_font("font", "Label")
+	if font == null:
+		return text
+	if font.get_string_size(text).x <= max_width:
+		return text
+	var n = text.length() - 1
+	while n > 1 and font.get_string_size(text.substr(0, n) + "...").x > max_width:
+		n -= 1
+	return text.substr(0, n) + "..."
+
+
 func _create_map_card(map_id: String, info: Dictionary) -> Control:
 	var path = info.get("path", "")
 	var name = info.get("name", "Unknown")
@@ -2603,7 +2624,12 @@ func _create_map_card(map_id: String, info: Dictionary) -> Control:
 	# Name (hidden when _hide_info is true)
 	var name_label = Label.new()
 	var display_name = name if name.length() <= 24 else name.substr(0, 21) + "..."
-	name_label.text = ("[!] " + display_name) if not exists else display_name
+	if not exists:
+		display_name = "[!] " + display_name
+	name_label.text = _fit_text(display_name, _preview_size)
+	name_label.hint_tooltip = name
+	name_label.mouse_filter = Control.MOUSE_FILTER_PASS
+	name_label.clip_text = true
 	name_label.align = Label.ALIGN_CENTER
 	if not exists:
 		name_label.modulate = Color(0.6, 0.6, 0.6, 1.0)
@@ -2613,6 +2639,7 @@ func _create_map_card(map_id: String, info: Dictionary) -> Control:
 	# Size (hidden when _hide_info is true)
 	var size_label = Label.new()
 	size_label.text = "%d × %d" % [map_width, map_height] if map_width > 0 else ""
+	size_label.clip_text = true
 	size_label.align = Label.ALIGN_CENTER
 	size_label.modulate = Color(0.5, 0.5, 0.5, 1.0)
 	size_label.visible = not _hide_info
@@ -2621,6 +2648,7 @@ func _create_map_card(map_id: String, info: Dictionary) -> Control:
 	# Date (hidden when _hide_info is true)
 	var date_label = Label.new()
 	date_label.text = _format_date(last_saved)
+	date_label.clip_text = true
 	date_label.align = Label.ALIGN_CENTER
 	date_label.modulate = Color(0.45, 0.45, 0.45, 1.0)
 	date_label.visible = not _hide_info

@@ -4066,8 +4066,10 @@ func _set_pattern_texture_rotation(node: Node2D, rot: float) -> void:
 	if _ft_materials.has(key):
 		for mkey in ["warp", "original"]:
 			var m = _ft_materials[key].get(mkey)
-			if m is ShaderMaterial and m != node.material:
-				m.set_shader_param("rotation", rot)
+			# Uchi-based materials name it "texture_rotation" (SetNewRotation
+			# only knows DD's "rotation"), so always write it ourselves.
+			if m is ShaderMaterial:
+				m.set_shader_param(_ft_pattern_rot_param(m), rot)
 
 
 func _bake_pattern_texture_rotation(node: Node2D, basis_t: Transform2D) -> void:
@@ -6710,6 +6712,159 @@ func _ft_decimate_collinear(pts: Array, tol: float) -> Array:
 	return keep
 
 
+# ── Compat Uchideshi universalshader on PATTERNS (Edge Blur Patterns, CMT) ───
+# Uchi's CombinedShader replaces the pattern material with its universalshader
+# (sampler "pattern_tex", "texture_rotation", edge-blur SDF over "vectors").
+# Swapping it for FT's own pattern warp shader lost the texture (white fill)
+# and the edge blur. Instead the bilinear warp is injected INTO its code: the
+# fragment works on the un-warped position, so the texture, the colour
+# pipeline and the edge SDF all follow the distortion.
+const FT_UCHI_PATTERN_HEADER = """uniform vec2 ft_corner_tl;
+uniform vec2 ft_corner_tr;
+uniform vec2 ft_corner_br;
+uniform vec2 ft_corner_bl;
+uniform vec2 ft_orig_min;
+uniform vec2 ft_orig_size;
+varying vec2 ft_v_local;
+float ft_pcr(vec2 a,vec2 b){return a.x*b.y-a.y*b.x;}
+vec2 ft_pinv_bilinear(vec2 p){
+\tvec2 a=ft_corner_tl,b=ft_corner_tr,c=ft_corner_br,d=ft_corner_bl;
+\tvec2 nrm_ctr=(a+b+c+d)*0.25;
+\tfloat nrm_s=max(max(length(b-a),length(d-a)),1e-3);
+\ta=(a-nrm_ctr)/nrm_s;b=(b-nrm_ctr)/nrm_s;c=(c-nrm_ctr)/nrm_s;d=(d-nrm_ctr)/nrm_s;p=(p-nrm_ctr)/nrm_s;
+\tvec2 e=b-a,f=d-a,g=a-b+c-d,h=p-a;
+\tfloat k2=ft_pcr(g,f),k1=ft_pcr(e,f)+ft_pcr(h,g),k0=ft_pcr(h,e);
+\tfloat v;
+\tif(abs(k2)<1e-5){v=-k0/k1;}
+\telse{
+\t\tfloat sq=sqrt(max(k1*k1-4.0*k0*k2,0.0));
+\t\tfloat qq=-0.5*(k1+(k1>=0.0?sq:-sq));
+\t\tfloat v1=qq/k2;
+\t\tfloat v2=abs(qq)>1e-12?k0/qq:v1;
+\t\tv=(v1>=-0.001&&v1<=1.001)?v1:v2;
+\t}
+\tvec2 den=e+g*v;
+\tfloat u=abs(den.x)>abs(den.y)?(h.x-f.x*v)/den.x:(h.y-f.y*v)/den.y;
+\treturn clamp(vec2(u,v),0.0,1.0);
+}
+"""
+const FT_UCHI_PATTERN_FRAGMENT_BODY = """
+\tvec2 ft_op=ft_orig_min+ft_pinv_bilinear(ft_v_local)*ft_orig_size;
+\tvec2 ft_wuv=rotate_uv(ft_op/vec2(textureSize(pattern_tex,0)),texture_rotation);
+\tvec2 ft_rel=ft_op-render_rect_position;
+"""
+
+
+func _ft_is_uchi_pattern_mat(mat) -> bool:
+	# True for Uchi's universalshader (or an FT shader derived from it).
+	if not (mat is ShaderMaterial) or mat.shader == null:
+		return false
+	var c = mat.shader.code
+	return ("sampler2D pattern_tex" in c) and ("is_pattern" in c)
+
+
+func _ft_pattern_tex_param(mat) -> String:
+	# Name of the tiling texture uniform: DD "albedo" / Uchi "pattern_tex".
+	return "pattern_tex" if _ft_is_uchi_pattern_mat(mat) else "albedo"
+
+
+func _ft_pattern_rot_param(mat) -> String:
+	# Name of the texture rotation uniform: DD "rotation" / Uchi "texture_rotation".
+	return "texture_rotation" if _ft_is_uchi_pattern_mat(mat) else "rotation"
+
+
+func _ft_merge_pattern_warp_into_uchi(src_code: String) -> String:
+	# Injects the FT pattern warp into Uchi's universalshader. Returns ""
+	# when the expected structure is missing (caller falls back).
+	var vp = src_code.find("void vertex")
+	var fp = src_code.find("void fragment")
+	if vp < 0 or fp < 0 or fp < vp:
+		return ""
+	if src_code.find("ft_v_local") >= 0 or src_code.find("ft_blur_tile") >= 0:
+		return ""   # already an FT-built shader
+	for tok in ["pattern_tex", "texture_rotation", "rotate_uv", "render_rect_position", "world_uv", "relative_uv"]:
+		if src_code.find(tok) < 0:
+			return ""
+	var head = src_code.substr(0, vp)
+	var vert = src_code.substr(vp, fp - vp)
+	var frag = src_code.substr(fp, src_code.length() - fp)
+	var vb = vert.find("{")
+	var fb = frag.find("{")
+	if vb < 0 or fb < 0:
+		return ""
+	vert = vert.insert(vb + 1, "\n\tft_v_local=VERTEX;")
+	# The fragment reads the un-warped position instead of the varyings.
+	var rx = RegEx.new()
+	if rx.compile("\\bworld_uv\\b") != OK:
+		return ""
+	frag = rx.sub(frag, "ft_wuv", true)
+	if rx.compile("\\brelative_uv\\b") != OK:
+		return ""
+	frag = rx.sub(frag, "ft_rel", true)
+	frag = frag.insert(fb + 1, FT_UCHI_PATTERN_FRAGMENT_BODY)
+	return head + FT_UCHI_PATTERN_HEADER + vert + frag
+
+
+func _ft_get_uchi_pattern_warp_shader(src_code: String, with_blur: bool):
+	# Cached merged shader (Uchi creates a new material per setting change,
+	# but the shader code is always the same).
+	var ck = "pat_" + str(src_code.hash()) + "_" + str(src_code.length()) + ("_blur" if with_blur else "")
+	if _ft_merged_shader_cache.has(ck):
+		return _ft_merged_shader_cache[ck]
+	var code = _ft_merge_pattern_warp_into_uchi(src_code)
+	if with_blur and code != "":
+		var bcode = _ft_inject_tile_blur(code, ["pattern_tex"])
+		if bcode != "":
+			code = bcode
+	var sh = null
+	if code != "":
+		sh = Shader.new()
+		sh.code = code
+	_ft_merged_shader_cache[ck] = sh
+	return sh
+
+
+func _ft_sync_uchi_pattern_vectors(mat: ShaderMaterial, ent: Dictionary, orig, mn: Vector2, src_size: Vector2) -> void:
+	# Edge blur SDF: Uchi bakes the polygon into a texture when the blur is
+	# applied. Feed it the ORIGINAL (un-warped) polygon, in the space the
+	# merged fragment works in, whatever the polygon was at that time.
+	if mat.get_shader_param("has_edge_blur") != true:
+		return
+	var sig = hash(orig)
+	if ent.get("uchi_sig") == sig:
+		return
+	ent["uchi_sig"] = sig
+	var w = 64
+	var h = int(max(1, ceil(float(orig.size()) / float(w))))
+	var img = Image.new()
+	img.create(w, h, false, Image.FORMAT_RGBAF)
+	img.lock()
+	for i in range(orig.size()):
+		img.set_pixel(i % w, i / w, Color(0.0001 * (orig[i].x - mn.x), 0.0001 * (orig[i].y - mn.y), 0.0, 1.0))
+	img.unlock()
+	var tex = ImageTexture.new()
+	tex.create_from_image(img, 0)
+	mat.set_shader_param("vectors", tex)
+	mat.set_shader_param("vectorsTextureWidth", w)
+	mat.set_shader_param("vectorsCount", orig.size())
+	mat.set_shader_param("render_rect_position", mn)
+	mat.set_shader_param("render_rect_size", src_size)
+
+
+func _ft_reset_pattern_material_vanilla(nd: Node2D) -> void:
+	# Uchi's "disable" does not clean a merged FT material (it only resets
+	# its own shader instance): hand the pattern DD's stock material back.
+	var m = ResourceLoader.load("res://materials/Pattern.material", "ShaderMaterial", true)
+	if m is ShaderMaterial:
+		var t = nd.get("_Texture")
+		if t != null:
+			m.set_shader_param("albedo", t)
+		var r = nd.get("_Rotation")
+		if r != null:
+			m.set_shader_param("rotation", r)
+	nd.material = m
+
+
 func _apply_distort_pattern(node: Node2D, world_corners: Array, orig_polygon = null) -> void:
 	var _dbg_key = _ft_node_key(node)
 	_store_orig_polygon(node)
@@ -6807,46 +6962,61 @@ func _apply_distort_pattern(node: Node2D, world_corners: Array, orig_polygon = n
 				has_custom_color = true
 
 		var mat = ShaderMaterial.new()
-		var sh  = Shader.new()
-		var _pcode = PATTERN_DISTORT_SHADER_CUSTOM_COLOR_SRC if has_custom_color else PATTERN_DISTORT_SHADER_SRC
 		var _pblur = _blur_active(node)
-		if _pblur:
-			var _pbc = _ft_inject_tile_blur(_pcode, ["albedo"])
-			if _pbc != "":
-				_pcode = _pbc
-		sh.code = _pcode
-		mat.shader = sh
-		mat.set_meta("_ft_warp", true)
+		# Uchi's universalshader (Edge Blur Patterns / CMT): merge the warp
+		# into its code and keep every one of its uniforms.
+		var uchi_sh = null
+		var uchi_src = src_mat_detect
+		if uchi_src is ShaderMaterial:
+			# Never merge on top of an FT-built material: go back to its source.
+			if uchi_src.has_meta("_ft_blur") and uchi_src.has_meta("_ft_orig_mat"):
+				uchi_src = uchi_src.get_meta("_ft_orig_mat")
+			elif uchi_src.has_meta("_ft_warp") and orig_mat is ShaderMaterial:
+				uchi_src = orig_mat
+		if _ft_is_uchi_pattern_mat(uchi_src):
+			uchi_sh = _ft_get_uchi_pattern_warp_shader(uchi_src.shader.code, _pblur)
+		if uchi_sh != null:
+			mat.shader = uchi_sh
+			mat.set_meta("_ft_warp", true)
+			mat.set_meta("_ft_uchi", true)
+			mat.set_meta("_ft_cmt_fp", _ft_cmt_data_fingerprint(node))
+			_ft_copy_shader_params(uchi_src, mat)
+		else:
+			var sh  = Shader.new()
+			var _pcode = PATTERN_DISTORT_SHADER_CUSTOM_COLOR_SRC if has_custom_color else PATTERN_DISTORT_SHADER_SRC
+			if _pblur:
+				var _pbc = _ft_inject_tile_blur(_pcode, ["albedo"])
+				if _pbc != "":
+					_pcode = _pbc
+			sh.code = _pcode
+			mat.shader = sh
+			mat.set_meta("_ft_warp", true)
 
-		var src_mat = node.material if node.material is ShaderMaterial else orig_mat
-		if src_mat is ShaderMaterial and src_mat.shader != null:
-			# Copie albedo depuis le shader DD
-			var albedo_tex = src_mat.get_shader_param("albedo")
-			if albedo_tex == null and orig_mat is ShaderMaterial and orig_mat != src_mat:
-				albedo_tex = orig_mat.get_shader_param("albedo")
-			if albedo_tex != null:
-				mat.set_shader_param("albedo", albedo_tex)
-				if albedo_tex is Texture:
-					pass
-			else:
-				pass
-			# Copie rotation du tiling (DD calcule rotate_uv dans le fragment)
-			var dd_rot = src_mat.get_shader_param("rotation")
-			if dd_rot == null and orig_mat is ShaderMaterial and orig_mat != src_mat:
-				dd_rot = orig_mat.get_shader_param("rotation")
-			if dd_rot != null:
-				mat.set_shader_param("rotation", dd_rot)
-			# Copie wear (overlay d'usure)
-			var dd_use_wear = src_mat.get_shader_param("use_wear")
-			if dd_use_wear == null and orig_mat is ShaderMaterial and orig_mat != src_mat:
-				dd_use_wear = orig_mat.get_shader_param("use_wear")
-			if dd_use_wear != null:
-				mat.set_shader_param("use_wear", dd_use_wear)
-			var dd_wear = src_mat.get_shader_param("wear")
-			if dd_wear == null and orig_mat is ShaderMaterial and orig_mat != src_mat:
-				dd_wear = orig_mat.get_shader_param("wear")
-			if dd_wear != null:
-				mat.set_shader_param("wear", dd_wear)
+			var src_mat = node.material if node.material is ShaderMaterial else orig_mat
+			if src_mat is ShaderMaterial and src_mat.shader != null:
+				# Copy the tiling texture from the source shader (DD or foreign)
+				var albedo_tex = src_mat.get_shader_param(_ft_pattern_tex_param(src_mat))
+				if albedo_tex == null and orig_mat is ShaderMaterial and orig_mat != src_mat:
+					albedo_tex = orig_mat.get_shader_param(_ft_pattern_tex_param(orig_mat))
+				if albedo_tex != null:
+					mat.set_shader_param("albedo", albedo_tex)
+				# Tiling rotation (DD computes rotate_uv in the fragment)
+				var dd_rot = src_mat.get_shader_param(_ft_pattern_rot_param(src_mat))
+				if dd_rot == null and orig_mat is ShaderMaterial and orig_mat != src_mat:
+					dd_rot = orig_mat.get_shader_param(_ft_pattern_rot_param(orig_mat))
+				if dd_rot != null:
+					mat.set_shader_param("rotation", dd_rot)
+				# Wear overlay
+				var dd_use_wear = src_mat.get_shader_param("use_wear")
+				if dd_use_wear == null and orig_mat is ShaderMaterial and orig_mat != src_mat:
+					dd_use_wear = orig_mat.get_shader_param("use_wear")
+				if dd_use_wear != null:
+					mat.set_shader_param("use_wear", dd_use_wear)
+				var dd_wear = src_mat.get_shader_param("wear")
+				if dd_wear == null and orig_mat is ShaderMaterial and orig_mat != src_mat:
+					dd_wear = orig_mat.get_shader_param("wear")
+				if dd_wear != null:
+					mat.set_shader_param("wear", dd_wear)
 
 		_ft_materials[id] = {"warp": mat, "original": orig_mat, "blur": _pblur, "kind": "pattern"}
 		node.material = mat
@@ -6867,6 +7037,8 @@ func _apply_distort_pattern(node: Node2D, world_corners: Array, orig_polygon = n
 	# coordonnées polygon, PAS en coordonnées monde. Pas de compensation de position.
 	mat.set_shader_param("ft_orig_min", mn)
 	mat.set_shader_param("ft_orig_size", src_size)
+	if mat.has_meta("_ft_uchi"):
+		_ft_sync_uchi_pattern_vectors(mat, _ft_materials[id], orig, mn, src_size)
 
 	# ── Polygon warp (forme + clipping) ──────────────────────────────────
 	# Subdivise les arêtes du polygon pour que la triangulation de Godot
@@ -7389,9 +7561,17 @@ func _restore_distort_from_store(select_active: bool = true) -> void:
 			# Vérifie si le shader est encore sur le node (DD peut le réinitialiser)
 			if _ft_materials.has(key):
 				var expected_mat = _ft_materials[key].get("warp")
-				if nd.material == expected_mat and _ft_materials[key].get("blur", false) == _blur_active(nd):
+				# Merged Uchi material whose config changed WITHOUT a material
+				# swap = Uchi disabled its effect (its guard does not recognise
+				# our merged shader): restart from DD's stock material.
+				var uchi_stale = nd.material == expected_mat and expected_mat is ShaderMaterial \
+						and expected_mat.has_meta("_ft_uchi") \
+						and expected_mat.get_meta("_ft_cmt_fp") != _ft_cmt_data_fingerprint(nd)
+				if uchi_stale:
+					_ft_reset_pattern_material_vanilla(nd)
+				elif nd.material == expected_mat and _ft_materials[key].get("blur", false) == _blur_active(nd):
 					continue  # shader encore en place, état blur inchangé
-				if nd.material == expected_mat:
+				elif nd.material == expected_mat:
 					nd.material = _ft_materials[key].get("original", null)   # blur toggled: rebuild
 				_ft_materials.erase(key)
 			# Ne réinstalle le shader pattern que si PatternShapeTool n'est pas actif.
@@ -7815,7 +7995,7 @@ func _ft_ensure_pattern_blur(nd: Node2D, key: String) -> void:
 		orig = orig.get_meta("_ft_orig_mat") if orig.has_meta("_ft_orig_mat") else null
 	if not (orig is ShaderMaterial) or orig.shader == null:
 		return   # plain colour pattern (no texture): nothing to blur
-	var code = _ft_inject_tile_blur(orig.shader.code, ["albedo"])
+	var code = _ft_inject_tile_blur(orig.shader.code, [_ft_pattern_tex_param(orig)])
 	if code == "":
 		return
 	var mat = ShaderMaterial.new()
@@ -7902,11 +8082,11 @@ func _ft_apply_tile_blur_uniforms(node: Node2D, ent: Dictionary, kind: String) -
 		# Pattern.shader: uv = rotate_uv(VERTEX / size, rotation) -- same
 		# rotation for the direction (albedo texel = 1 local px).
 		var rot = 0.0
-		var rv = mat.get_shader_param("rotation")
+		var rv = mat.get_shader_param(_ft_pattern_rot_param(mat))
 		if rv != null:
 			rot = float(rv)
 		var dr = Vector2(cos(rot) * ld.x + sin(rot) * ld.y, cos(rot) * ld.y - sin(rot) * ld.x)
-		var albedo = mat.get_shader_param("albedo")
+		var albedo = mat.get_shader_param(_ft_pattern_tex_param(mat))
 		var btex = _ft_blur_get_tiled_texture(albedo)
 		var bid = btex.get_instance_id() if btex != null else 0
 		sig = "%.3f|%.3f|%.4f|%.4f|%d" % [p["r"], p["m"], dr.x, dr.y, bid]

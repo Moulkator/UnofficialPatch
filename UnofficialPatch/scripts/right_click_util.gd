@@ -7,8 +7,9 @@
 #   get_context_items(raw) -> Array   — return [{label, icon, action_id}]
 #   on_context_action(action_id, raw) — handle a menu click
 #
-# An item may carry a `submenu` array of items (same shape, minus submenus):
-# the entry then opens a sub-popup instead of firing directly.
+# An item may carry a `submenu` array of items (same shape): the entry then
+# opens a sub-popup instead of firing directly. Submenus nest up to
+# MAX_SUBMENU_DEPTH levels; deeper ones are dropped.
 #
 # Menu layout is decided at registration, not by the providers: register()
 # takes an `order` (position in the menu) and a `group` (providers sharing a
@@ -57,6 +58,7 @@ var _providers := []  # [{provider, order, group, setting, seq}]
 var _context_menu: PopupMenu = null
 var _popup_layer: CanvasLayer = null
 var _item_map := {}   # menu id -> {provider, action_id}
+var _next_id := 0     # next menu item id while building a popup
 var _last_raw = null
 var _register_seq := 0
 var _ext_seen := {}   # external provider ids already logged
@@ -67,6 +69,7 @@ const EXT_PROVIDERS_META := "_up_rcm_providers"
 const EXT_API_VERSION := 1
 const EXT_DEFAULT_ORDER := 1000
 const EXT_SEQ_BASE := 1000000
+const MAX_SUBMENU_DEPTH := 3   # submenu levels below the root menu
 
 
 func initialize() -> void:
@@ -286,7 +289,7 @@ func _on_right_click() -> void:
 				items = p.get_void_context_items()
 		# Sanitized copies: a malformed item from another mod must not abort
 		# the whole menu (a missing Dictionary key is a hard error in GDScript).
-		items = _normalize_items(items, p, true)
+		items = _normalize_items(items, p)
 		if items.size() == 0:
 			continue
 		# Separator between divider groups only, and never leading.
@@ -313,52 +316,44 @@ func _show_popup(items: Array) -> void:
 
 	_context_menu = PopupMenu.new()
 	_item_map = {}
-	var next_id := 0
+	_next_id = 0
+	_fill_menu(_context_menu, items)
 
-	for item in items:
-		if item.get("_sep", false):
-			_context_menu.add_separator()
-			continue
-		var submenu = item.get("submenu", null)
-		if submenu is Array and submenu.size() > 0:
-			var sub = PopupMenu.new()
-			sub.name = "rcu_sub_%d" % next_id
-			for sub_item in submenu:
-				if sub_item.get("_sep", false):
-					sub.add_separator()
-					continue
-				sub.add_item(sub_item.label, next_id)
-				if sub_item.get("icon", null) != null:
-					sub.set_item_icon(sub.get_item_index(next_id), sub_item.icon)
-				if sub_item.get("disabled", false):
-					sub.set_item_disabled(sub.get_item_index(next_id), true)
-				_item_map[next_id] = {provider = item["_provider"], action_id = sub_item.action_id}
-				next_id += 1
-			sub.connect("id_pressed", self, "_on_item_pressed")
-			_context_menu.add_child(sub)
-			# A submenu parent never emits id_pressed, so it needs no mapping.
-			_context_menu.add_submenu_item(item.label, sub.name, next_id)
-			if item.get("icon", null) != null:
-				_context_menu.set_item_icon(_context_menu.get_item_index(next_id), item.icon)
-			# A disabled submenu parent stays listed but does not open.
-			if item.get("disabled", false):
-				_context_menu.set_item_disabled(_context_menu.get_item_index(next_id), true)
-			next_id += 1
-			continue
-		_context_menu.add_item(item.label, next_id)
-		if item.get("icon", null) != null:
-			_context_menu.set_item_icon(_context_menu.get_item_index(next_id), item.icon)
-		if item.get("disabled", false):
-			_context_menu.set_item_disabled(_context_menu.get_item_index(next_id), true)
-		_item_map[next_id] = {provider = item["_provider"], action_id = item.action_id}
-		next_id += 1
-
-	_context_menu.connect("id_pressed", self, "_on_item_pressed")
 	_context_menu.connect("popup_hide", self, "_on_popup_closed")
 
 	_get_popup_layer().add_child(_context_menu)
 	var mouse_pos = _g.World.get_tree().root.get_mouse_position()
 	_context_menu.popup(Rect2(mouse_pos, Vector2(1, 1)))
+
+
+# Fills `menu` with normalized items, recursing into `submenu` arrays. Ids
+# are unique across the whole tree (_next_id), so one _item_map serves every
+# level; every PopupMenu routes id_pressed to the same handler.
+func _fill_menu(menu: PopupMenu, items: Array) -> void:
+	for item in items:
+		if item.get("_sep", false):
+			menu.add_separator()
+			continue
+		var id := _next_id
+		_next_id += 1
+		var submenu = item.get("submenu", null)
+		if submenu is Array and submenu.size() > 0:
+			var sub = PopupMenu.new()
+			sub.name = "rcu_sub_%d" % id
+			_fill_menu(sub, submenu)
+			menu.add_child(sub)
+			# A submenu parent never emits id_pressed, so it needs no mapping.
+			menu.add_submenu_item(item.label, sub.name, id)
+		else:
+			menu.add_item(item.label, id)
+			_item_map[id] = {provider = item["_provider"], action_id = item.action_id}
+		var idx := menu.get_item_index(id)
+		if item.get("icon", null) != null:
+			menu.set_item_icon(idx, item.icon)
+		# A disabled submenu parent stays listed but does not open.
+		if item.get("disabled", false):
+			menu.set_item_disabled(idx, true)
+	menu.connect("id_pressed", self, "_on_item_pressed")
 
 
 func _on_item_pressed(id: int) -> void:
@@ -431,7 +426,7 @@ func _external_entries() -> Array:
 
 # Returns clean {label, icon, action_id, disabled, _provider[, submenu]} / separator
 # items. Accepts the internal `_sep` and the public `separator` spelling.
-func _normalize_items(items, provider, allow_submenu: bool) -> Array:
+func _normalize_items(items, provider, depth: int = 0) -> Array:
 	var out := []
 	if not (items is Array):
 		return out
@@ -456,8 +451,8 @@ func _normalize_items(items, provider, allow_submenu: bool) -> Array:
 			disabled = (true if item.get("disabled", false) else false),
 			_provider = provider,
 		}
-		if allow_submenu:
-			var sub = _normalize_items(item.get("submenu"), provider, false)
+		if depth < MAX_SUBMENU_DEPTH:
+			var sub = _normalize_items(item.get("submenu"), provider, depth + 1)
 			if sub.size() > 0:
 				clean["submenu"] = sub
 		out.append(clean)

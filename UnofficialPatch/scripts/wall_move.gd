@@ -39,6 +39,27 @@ var _pending_wall_reselect = null
 const DRAG_THRESHOLD     = 5.0
 const SELECTABLE_WALL    = 1  # DD SelectableType: Wall
 
+# ── Nudge Tool (third-party mod) compatibility ─────────────────────────────
+# Nudge Tool moves selected things through global_position and skips walls
+# (a wall's geometry lives in Points, not in its node position). We move the
+# selected walls ourselves, on the same input actions. Nothing happens when
+# Nudge Tool is not installed (its input actions do not exist).
+const NUDGE_ACTIONS = ["nudge_left", "nudge_right", "nudge_up", "nudge_down"]
+const NUDGE_DIRS    = [Vector2(-1, 0), Vector2(1, 0), Vector2(0, -1), Vector2(0, 1)]
+# SelectableTypes Nudge Tool moves by itself:
+# PortalFree, Object, Pathway, Light, PatternShape, Roof.
+const NUDGE_TYPES   = [2, 4, 5, 6, 7, 8]
+var _nudge_active   := false
+var _nudge_none     := false   # keys held but no wall selected: wait for release
+var _nudge_walls    := []
+var _nudge_nodes    := []      # other selected things moved by Nudge Tool (undo)
+var _nudge_ref      = null     # one of them, used as a clock (see _nudge_follow_ref)
+var _nudge_ref_pos  := Vector2.ZERO
+var _nudge_before   = null
+var _nudge_moved    := false
+var _nudge_cooldown := 0.0
+var _nudge_mod      = null     # Nudge Tool script instance (configured steps)
+
 
 func initialize():
 	_install_listener()
@@ -60,6 +81,8 @@ func cleanup() -> void:
 	_drag_group_nodes = {}
 	_left_pressed = false
 	_drag_threshold_passed = false
+	_reset_nudge()
+	_nudge_mod = null
 	print("[WallMove] Cleaned up")
 
 
@@ -67,7 +90,7 @@ func _install_listener():
 	_listener = Node.new()
 	_listener.name = "WallMoveListener"
 	var s = GDScript.new()
-	s.source_code = "extends Node\nvar handler = null\nfunc _input(e):\n\tif handler != null:\n\t\thandler._on_input(e)\nfunc _process(d):\n\tif handler != null:\n\t\thandler._on_process(d)\n"
+	s.source_code = "extends Node\nvar handler = null\nfunc _input(e):\n\tif handler != null:\n\t\thandler._on_input(e)\nfunc _process(d):\n\tif handler != null:\n\t\thandler._on_process(d)\nfunc _ready():\n\tif VisualServer.has_signal(\"frame_pre_draw\"):\n\t\tVisualServer.connect(\"frame_pre_draw\", self, \"_on_frame_pre_draw\")\nfunc _on_frame_pre_draw():\n\tif handler != null:\n\t\thandler._on_frame_pre_draw()\n"
 	s.reload()
 	_listener.set_script(s)
 	_listener.handler = self
@@ -88,6 +111,12 @@ func _on_input(event):
 	# Block all wall move interaction when free transform is active on a portal
 	if _is_ft_on_portal():
 		return
+
+	# Nudge: open the session on the key press itself, i.e. before Nudge Tool
+	# moves anything this frame (undo snapshot + reference position).
+	if event is InputEventKey and event.pressed and not _nudge_active \
+			and not _nudge_none and _nudge_pressed() and _nudge_allowed():
+		_begin_nudge()
 
 	# Tracker le bouton gauche
 	if event is InputEventMouseButton and event.button_index == BUTTON_LEFT:
@@ -894,7 +923,10 @@ func _on_process(_delta):
 	if not _is_select_tool_active():
 		if _dragging:
 			_end_drag()
+		if _nudge_active:
+			_end_nudge()
 		return
+	_handle_nudge(_delta)
 	# Curseur drag quand hover wall (pas en drag, pas sur un portal, pas en ft sur portal)
 	if not _dragging:
 		if not _is_ft_on_portal() and overlay_tool != null and is_instance_valid(overlay_tool) and overlay_tool._hover_wall != null:
@@ -904,6 +936,234 @@ func _on_process(_delta):
 				_reset_cursor()
 		else:
 			_reset_cursor()
+
+
+# ──────────────────── NUDGE TOOL COMPATIBILITY ────────────────────
+
+func _nudge_pressed() -> bool:
+	for a in NUDGE_ACTIONS:
+		if InputMap.has_action(a) and Input.is_action_pressed(a):
+			return true
+	return false
+
+
+# Same conditions as Nudge Tool (no focused control, so typing in a text box
+# never nudges), plus: no drag / transform of any kind in progress.
+func _nudge_allowed() -> bool:
+	if _g == null or _g.Editor == null:
+		return false
+	if not _is_select_tool_active() or _dragging:
+		return false
+	if Input.is_mouse_button_pressed(BUTTON_LEFT):
+		return false
+	var toolset = _g.Editor.get("Toolset")
+	if toolset != null and is_instance_valid(toolset) \
+			and toolset.get_focus_owner() != null:
+		return false
+	if _dd_transform_mode() > 0 or _dsw_box_dragging() or _is_ft_on_portal():
+		return false
+	return true
+
+
+func _handle_nudge(delta: float) -> void:
+	if _nudge_cooldown > 0.0:
+		_nudge_cooldown -= delta
+	# First, catch up with whatever Nudge Tool did since the last frame, so
+	# its last step is not lost when the key is released right after it.
+	if _nudge_active:
+		_nudge_follow_ref()
+
+	var pressed = _nudge_pressed()
+	if not pressed:
+		_nudge_none = false
+	if not pressed or not _nudge_allowed():
+		if _nudge_active:
+			_end_nudge()
+		return
+	if _nudge_none:
+		return
+	if not _nudge_active:
+		_begin_nudge()
+		if not _nudge_active:
+			return
+
+	# Mixed selection: Nudge Tool is the clock, handled by _nudge_follow_ref.
+	if _nudge_ref != null:
+		return
+	if _nudge_cooldown > 0.0:
+		return
+
+	# Walls only: own timing, with Nudge Tool's configured values.
+	var step = 2.0
+	var super_step = 16.0
+	var uber_step = 128.0
+	var delay = 0.175
+	var mod = _get_nudge_mod()
+	if mod != null:
+		if mod.get("nudge") != null: step = float(mod.get("nudge"))
+		if mod.get("super_nudge") != null: super_step = float(mod.get("super_nudge"))
+		if mod.get("uber_nudge") != null: uber_step = float(mod.get("uber_nudge"))
+		if mod.get("delay_time") != null: delay = float(mod.get("delay_time"))
+	if Input.is_key_pressed(KEY_SHIFT) and Input.is_key_pressed(KEY_CONTROL):
+		step = uber_step
+	elif Input.is_key_pressed(KEY_SHIFT):
+		step = super_step
+
+	var move = Vector2.ZERO
+	for i in range(NUDGE_ACTIONS.size()):
+		if InputMap.has_action(NUDGE_ACTIONS[i]) and Input.is_action_pressed(NUDGE_ACTIONS[i]):
+			move += NUDGE_DIRS[i] * step
+	if move != Vector2.ZERO:
+		_nudge_walls_by(move)
+		_nudge_cooldown = delay
+
+
+func _begin_nudge() -> void:
+	var st = _get_select_tool()
+	if st == null:
+		return
+	var sel = st.get("Selectables")
+	if sel == null or not (sel is Dictionary):
+		return
+	_nudge_walls = []
+	_nudge_nodes = []
+	_nudge_ref = null
+	for thing in sel:
+		if thing == null or not is_instance_valid(thing):
+			continue
+		var type = int(sel[thing])
+		if type == SELECTABLE_WALL:
+			# Same restriction as the drag: no FloorShape walls (Type != 1).
+			var wtype = thing.get("Type")
+			if _is_wall_node(thing) and (wtype == null or wtype == 1):
+				_nudge_walls.append(thing)
+		elif type in NUDGE_TYPES and thing is Node2D:
+			_nudge_nodes.append(thing)
+	if _nudge_walls.size() == 0:
+		_nudge_nodes = []
+		_nudge_none = true
+		return
+	if _nudge_nodes.size() > 0:
+		_nudge_ref = _nudge_nodes[0]
+		_nudge_ref_pos = _nudge_ref.global_position
+	_nudge_before = _snapshot_nudge_state()
+	_nudge_moved = false
+	_nudge_cooldown = 0.0
+	_nudge_active = true
+
+
+# When the selection also holds things Nudge Tool moves by itself (a prefab
+# with walls and props, typically), we do not run a second timer next to
+# its own: the two would drift apart on a long key hold and leave the walls
+# one step away from the props. We watch one of those things instead and
+# apply to the walls exactly the displacement it received.
+func _nudge_follow_ref() -> void:
+	if _nudge_ref == null:
+		return
+	if not is_instance_valid(_nudge_ref):
+		_nudge_ref = null
+		return
+	var pos = _nudge_ref.global_position
+	var d = pos - _nudge_ref_pos
+	if d.length_squared() < 0.0001:
+		return
+	_nudge_ref_pos = pos
+	_nudge_walls_by(d)
+
+
+# Nudge Tool calls SelectTool.EnableTransformBox(true) on every step. In a
+# mixed selection the box belongs to DragSelectWalls, which only hides DD's
+# native one again on its next _process: depending on the update order, DD's
+# box was drawn for one frame. frame_pre_draw runs after every _process and
+# every timer of the frame, so hiding it here means it is never rendered.
+func _on_frame_pre_draw() -> void:
+	if _destroyed or not _nudge_active or _nudge_ref == null:
+		return
+	if not _dsw_owns_box():
+		return
+	var st = _get_select_tool()
+	if st != null and st.has_method("EnableTransformBox"):
+		st.EnableTransformBox(false)
+
+
+func _nudge_walls_by(delta: Vector2) -> void:
+	for wall in _nudge_walls:
+		if not is_instance_valid(wall):
+			continue
+		var pts = wall.get("Points")
+		if pts == null:
+			continue
+		var new_pts = []
+		for p in pts:
+			new_pts.append(p + delta)
+		_set_wall_points(wall, new_pts)
+		_move_children_map(_snapshot_wall_children(wall), delta)
+		# Anchored portals are skipped by Nudge Tool: they follow their wall.
+		var portals = wall.get("Portals")
+		if portals != null:
+			for portal in portals:
+				if is_instance_valid(portal):
+					portal.position += delta
+		if wall.has_method("RemakeLines"):
+			wall.call("RemakeLines")
+		elif wall.has_method("RemakeLinesWhenAllPortalsReady"):
+			wall.call("RemakeLinesWhenAllPortalsReady")
+		_nudge_moved = true
+	_refresh_dd_transform_box()
+
+
+# One undo record per key hold, covering the walls and the things Nudge Tool
+# moved alongside them (it records no history of its own).
+func _end_nudge() -> void:
+	if _nudge_moved and _nudge_before != null:
+		_record_group_move(_nudge_before, _snapshot_nudge_state())
+		if overlay_tool != null and is_instance_valid(overlay_tool):
+			overlay_tool.invalidate_wall_hover()
+	_reset_nudge()
+
+
+func _reset_nudge() -> void:
+	_nudge_active = false
+	_nudge_none = false
+	_nudge_walls = []
+	_nudge_nodes = []
+	_nudge_ref = null
+	_nudge_before = null
+	_nudge_moved = false
+
+
+func _snapshot_nudge_state() -> Array:
+	var states := []
+	for wall in _nudge_walls:
+		if is_instance_valid(wall):
+			states.append(_snapshot_wall_state(wall))
+	for node in _nudge_nodes:
+		if is_instance_valid(node) and node.has_meta("node_id"):
+			states.append({"node_id": node.get_meta("node_id"), "position": node.position})
+	return states
+
+
+# Nudge Tool's GDScript instance, to read the step values set in its UI.
+# Mod tools are C# wrappers exposing get_ScriptInstance(); we recognise this
+# one by its variables rather than by a tool name we cannot be sure of.
+func _get_nudge_mod():
+	if _nudge_mod != null and is_instance_valid(_nudge_mod):
+		return _nudge_mod
+	_nudge_mod = null
+	if _g == null or _g.Editor == null:
+		return null
+	var tools = _g.Editor.get("Tools")
+	if tools == null or not (tools is Dictionary):
+		return null
+	for key in tools:
+		var t = tools[key]
+		if t == null or not is_instance_valid(t) or not t.has_method("get_ScriptInstance"):
+			continue
+		var inst = t.get_ScriptInstance()
+		if inst != null and inst.get("uber_nudge") != null and inst.get("super_nudge") != null:
+			_nudge_mod = inst
+			return inst
+	return null
 
 
 func _is_mouse_on_portal(wall) -> bool:
