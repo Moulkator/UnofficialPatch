@@ -223,6 +223,24 @@ func _snapshot_selection(tool_name: String) -> void:
 		_saved_sel[tool_name] = texs
 
 
+func note_external_pick(tool_name: String, texs: Array) -> void:
+	# Public (called by eyedropper.gd): the tool's asset was just set
+	# programmatically. Selection snapshots only follow user clicks in the
+	# grid, so without this the reapply pass after the tool switch would
+	# restore the previously clicked asset over the picked one (highlight in
+	# Show: All, and the tool texture itself in Show: Favorites / Hidden).
+	var valid = []
+	for t in texs:
+		if t != null and is_instance_valid(t) and t is Texture and t.resource_path != "":
+			valid.append(t)
+	if valid.size() > 0:
+		_saved_sel[tool_name] = valid
+	else:
+		# Nothing matchable: drop the stale snapshot rather than restore it.
+		_saved_sel.erase(tool_name)
+	_sel_dirty = false
+
+
 func _hook_clear_button() -> void:
 	# Wire DD's native trash button (right of the object search bar) once —
 	# re-wired if the node is ever recreated.

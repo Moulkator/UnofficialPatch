@@ -5239,6 +5239,10 @@ func _hidden_update():
 			_maintain_hidden_view(key)
 		else:
 			_maintain_normal_filter(key)
+		# Subset overlays (Hidden view, and the Normal view of non-object
+		# panels) are not covered by the Favorites selection sync in update().
+		if mode != _MODE_FAV and _panels[key].get("hidden_mode", false):
+			_sync_subset_overlay_selection(key)
 		# Count refresh — skipped when a filter above already refreshed it.
 		var _il = _panels[key].get("item_list")
 		var _lc = _il.get_item_count() if is_instance_valid(_il) else 0
@@ -5389,6 +5393,11 @@ func reapply_panel_mode(key: String, restore_textures = null) -> bool:
 	# list currently holds only the single texture DD restored on tool entry,
 	# which would overwrite the good multi-selection saved when leaving All.
 	panel["mode"] = _MODE_ALL
+	# The caller's selection is the authoritative current one (it includes an
+	# eyedropper pick): keep it for the later return to All as well, instead of
+	# a stale snapshot from before the tool switch.
+	if key == "object" and restore_textures is Array and restore_textures.size() > 0:
+		panel["saved_all_selection"] = restore_textures.duplicate()
 	var fb = panel.get("fav_btn")
 	if fb != null and is_instance_valid(fb) and fb.pressed:
 		fb.pressed = false  # emits toggled -> tears down the Favorites overlay state
@@ -5490,6 +5499,57 @@ func _set_panel_mode(key: String, mode: int, skip_selection_snapshot: bool = fal
 		# results — re-apply the kept search for the Object/Scatter tools.
 		_reapply_object_search()
 	_update_mode_button_label(key)
+
+
+func _sync_subset_overlay_selection(key: String) -> void:
+	# Mirror the native list's selection into the subset overlay. Overlay
+	# clicks are forwarded to the native list, but programmatic native picks
+	# (eyedropper SelectTexture, DD's LibraryMemory restore, asset_cycle) never
+	# reach the overlay, which would keep highlighting the previous asset.
+	# Cheap when idle: one string signature per visible overlay per frame; the
+	# O(N) index mapping only runs when either selection actually changed.
+	var panel = _panels[key]
+	var il = panel.get("item_list")
+	var ovl = panel.get("overlay_list")
+	if not is_instance_valid(il) or not is_instance_valid(ovl):
+		return
+	if not ovl.is_visible_in_tree():
+		return
+	var sel = il.get_selected_items()
+	var cur = ovl.get_selected_items()
+	var ocount = ovl.get_item_count()
+	var sig = str(sel) + "|" + str(cur) + "|" + str(ocount)
+	if panel.get("subset_sel_sig", "") == sig:
+		return
+	var fav_map = panel.get("fav_to_dd_index", [])
+	var want = {}
+	for s in sel:
+		want[s] = true
+	var desired = []
+	if want.size() > 0:
+		var lim = int(min(fav_map.size(), ocount))
+		for fi in range(lim):
+			if want.has(fav_map[fi]):
+				desired.append(fi)
+				if desired.size() >= want.size():
+					break
+	# Already matching (e.g. the user just clicked the overlay, which forwarded
+	# to the native list): leave it alone so the scroll position doesn't jump.
+	var same = desired.size() == cur.size()
+	if same:
+		for i in range(desired.size()):
+			if desired[i] != cur[i]:
+				same = false
+				break
+	if not same:
+		ovl.set_block_signals(true)
+		ovl.unselect_all()
+		for fi in desired:
+			ovl.select(fi, false)
+		ovl.set_block_signals(false)
+		if desired.size() > 0:
+			ovl.ensure_current_is_visible()
+	panel["subset_sel_sig"] = str(sel) + "|" + str(ovl.get_selected_items()) + "|" + str(ocount)
 
 
 # --- Hidden view (mode = Hidden) : overlay of only the hidden items --------

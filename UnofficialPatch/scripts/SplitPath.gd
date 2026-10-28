@@ -6,6 +6,14 @@ var last_vertices_size = 0
 var store_vertices_size = 0
 var frame_count = 0
 const MIN_FRAME = 12
+# Max distance (world px) between the cursor and the path centre line
+const MAX_SPLIT_DISTANCE = 60.0
+# Frames to wait after the key press before splitting. If the vertex count
+# changed meanwhile, Dungeondraft deleted a vertex and the split is cancelled.
+const SPLIT_DELAY_FRAMES = 2
+var _pending_frames = 0
+var _pending_size = 0
+var _pending_mouse = Vector2.ZERO
 const COMBINED_DATA_STORE = "UchideshiNodeData"
 
 # Logging Functions
@@ -32,58 +40,91 @@ func outputlog(msg,level=0):
 ##
 #########################################################################################################
 
-# Function to find the split index
+# Function to find the split index: the index of the edit point that starts
+# the segment under the cursor. Returns -1 when the cursor is too far.
 func _find_split_index(pathway, mouseposition):
 
 	outputlog("_find_split_index",2)
 
-	# Check if the mouseposition is null
 	if mouseposition == null:
 		return -1
 
-	var smallest_distance = 9999.0
-	var distance = 99999.0
-	var split_index = -1
-	var projected_loc: Vector2
-	var num = pathway.GlobalEditPoints.size()
-	var relative_edge: Vector2
-	var projection_onto_edge: Vector2
-	var minimum_distance_from_mouseposition = 50
-	var minimum_distance_from_edge = 20
-
-	# For each point on the path, look for the vertex before the split point
-	for _i in num-1:
-		# Project the mouse position onto the edge between this vertex and the next one, this should be the yellow dot when the distance is the smallest
-
-		# Find the vector describing edge between this vertex and the next vertex
-		relative_edge = pathway.GlobalEditPoints[(_i + 1) % num] - pathway.GlobalEditPoints[_i]
-
-		# Find the projection of the mouseposition onto that vector relative to this vertex
-		projection_onto_edge = (mouseposition - pathway.GlobalEditPoints[_i]).project(relative_edge)
-		# Find the projection in world space, ie by adding back the current vertex vector
-		projected_loc = projection_onto_edge + pathway.GlobalEditPoints[_i]
-		# Find the distance between the projected point and the actual mouse position, note this is the distance that the mouse point is away from extended edge between the vertices
-		distance = (projected_loc - mouseposition).length()
-
-		# Check whether the projection is actually on the line between this vertex and the next one. Note we are checking the length and whether the angle is 0 or PI.
-		if projection_onto_edge.length() <=  relative_edge.length() && abs(projection_onto_edge.angle_to(relative_edge)) < 0.01:
-			
-			# Check whether the distance is the smallest one, noting it is a combination of the projection and the distance that gives us the right value
-			if distance < smallest_distance:
-				# Update the smallest distance and the split_index reference
-				smallest_distance = distance
-				split_index = _i
-	
-	outputlog("split_index: " + str(split_index) + " smallest_distance: " + str(smallest_distance))
-	# If split_index is -1 (which it should never be) or if the distance is greater than 20 pixels.
-	# Note this condition exists because the backspace action also deletes a vertex and the mod can not determine this as the vertex is gone at the time of execution
-	if split_index < 0 || smallest_distance > 60:
+	var pts = pathway.GlobalEditPoints
+	var num = pts.size()
+	if num < 2:
 		return -1
 
-	if pathway.GlobalEditPoints[split_index].distance_to(mouseposition) > minimum_distance_from_mouseposition:
-		if pathway.GlobalEditPoints[(split_index + 1) % num].distance_to(mouseposition) > minimum_distance_from_mouseposition:
-			return split_index
-	return -1
+	# Accept anything on the visible width of the path, with a minimum margin
+	var max_distance = max(MAX_SPLIT_DISTANCE, pathway.width * 0.5 * abs(pathway.scale.x))
+
+	# First try the rendered (smoothed) curve, which is what the user sees
+	var result = _find_segment_on_curve(pathway, pts, mouseposition)
+	# Otherwise fall back on the straight segments between the edit points
+	if result == null:
+		result = _find_segment_on_chords(pathway, pts, mouseposition)
+
+	outputlog("split_index: " + str(result[0]) + " smallest_distance: " + str(result[1]))
+
+	if result[0] < 0 || result[1] > max_distance:
+		return -1
+	return result[0]
+
+# Nearest segment measured on the straight lines between the edit points,
+# including the closing segment of a loop. Returns [index, distance].
+func _find_segment_on_chords(pathway, pts, mouseposition) -> Array:
+
+	var num = pts.size()
+	var edges = num if pathway.Loop else num - 1
+	var best_index = -1
+	var best_distance = INF
+
+	for _i in edges:
+		var closest = Geometry.get_closest_point_to_segment_2d(mouseposition, pts[_i], pts[(_i + 1) % num])
+		var distance = closest.distance_to(mouseposition)
+		if distance < best_distance:
+			best_distance = distance
+			best_index = _i
+
+	return [best_index, best_distance]
+
+# Nearest segment measured on the rendered curve. Each rendered point is
+# attributed to an edit segment by walking the curve and advancing whenever
+# it passes through the next edit point. Returns [index, distance], or null
+# if the rendered points can not be matched to the edit points.
+func _find_segment_on_curve(pathway, pts, mouseposition):
+
+	var curve = pathway.points
+	var num = pts.size()
+	if curve.size() < 2:
+		return null
+
+	var xform = pathway.global_transform
+	var previous = xform.xform(curve[0])
+	if previous.distance_to(pts[0]) > 1.0:
+		return null
+
+	var edit_index = 0
+	var best_index = -1
+	var best_distance = INF
+
+	for _k in range(1, curve.size()):
+		var current = xform.xform(curve[_k])
+		var distance = Geometry.get_closest_point_to_segment_2d(mouseposition, previous, current).distance_to(mouseposition)
+		if distance < best_distance:
+			best_distance = distance
+			best_index = edit_index
+		if edit_index + 1 < num && current.distance_to(pts[edit_index + 1]) <= 1.0:
+			edit_index += 1
+		previous = current
+
+	# Every edit point must have been met, otherwise the mapping is unreliable
+	if edit_index != num - 1:
+		return null
+	# An open path has no segment starting at its last point
+	if best_index > num - 2 && not pathway.Loop:
+		best_index = num - 2
+
+	return [best_index, best_distance]
 
 # Function to split a path into two
 func _split_path(pathway, mouseposition, history_record):
@@ -114,7 +155,7 @@ func _split_path(pathway, mouseposition, history_record):
 	
 	# If we have found a valid split point then according to the latest value
 	# Also validate that the pathway size is the same as it was a few frames ago which avoids the problem with deleting vertices
-	if split_index > -1 && split_index < pathway.GlobalEditPoints.size() && last_vertices_size == pathway.GlobalEditPoints.size():
+	if split_index > -1 && split_index < pathway.GlobalEditPoints.size() && (history_record != null || last_vertices_size == pathway.GlobalEditPoints.size()):
 		# Store the existing path edit points for the history record.
 		# Force a deep copy into a plain Array to freeze the snapshot — the
 		# record's undo() rebuilds a PoolVector2Array from this on demand.
@@ -137,7 +178,7 @@ func _split_path(pathway, mouseposition, history_record):
 		# For non-looping paths
 		else:
 			# Check if the split is actually on the first or last edge, in which case, just delete the first or last vertex
-			if split_index == 0 || split_index == num - 1:
+			if split_index == 0 || split_index >= num - 2:
 				# Copy the edit points
 				for _i in num:
 					old_path_points.append(pathway.GlobalEditPoints[_i])
@@ -388,35 +429,57 @@ func get_data(node_id):
 ##
 #########################################################################################################
 
+# True when a text field has the keyboard focus, so the shortcut must be ignored
+func _text_has_focus() -> bool:
+	var focus = Global.Editor.Tools["PathTool"].get_EditPoints().get_focus_owner()
+	return focus is LineEdit || focus is TextEdit
+
+# True when the path tool is editing the points of a path
+func _is_editing_path() -> bool:
+	if Global.Editor.ActiveToolName != "PathTool":
+		return false
+	if not Global.Editor.Tools["PathTool"].get_EditPoints().pressed:
+		return false
+	return Global.WorldUI.Vertices != null
+
 # this method is automatically called every frame. delta is a float in seconds. can be removed from script.
 func update(delta: float):
 
-	# If we are in the path tool
-	if Global.Editor.ActiveToolName == "PathTool":
-		# If EditPoints is active
-		if Global.Editor.Tools["PathTool"].get_EditPoints().pressed:
-			# If we are editing a path
-			if Global.WorldUI.Vertices != null:
-				# If the vertices size is not the same as the stored version
-				if Global.WorldUI.Vertices.size() != store_vertices_size:
-					# Set the store value to current vertices size
-					store_vertices_size = Global.WorldUI.Vertices.size()
-					frame_count = 0
-				else:
-					# Increment frame count
-					frame_count += 1
-				
-				# If the frame count has reached a certain value then write the store_vertices into the last_vertices_size value
-				if frame_count > MIN_FRAME && last_vertices_size != store_vertices_size:
-					outputlog("writing new last vertices value: " + str(store_vertices_size))
-					# Write it into the last vertices size
-					last_vertices_size = store_vertices_size
-					
-				# Check for a key press of backspace, noting just pressed is a bit quirky
-				if Input.is_action_just_pressed(backspace_split_action):
+	if not _is_editing_path():
+		_pending_frames = 0
+		return
 
-					# Split the path, finding the path using the vertices which is inefficient
-					_split_path(find_pathway_from_vertices(), Global.WorldUI.MousePosition, null)
+	var vertices_size = Global.WorldUI.Vertices.size()
+
+	# If the vertices size is not the same as the stored version
+	if vertices_size != store_vertices_size:
+		store_vertices_size = vertices_size
+		frame_count = 0
+	else:
+		frame_count += 1
+
+	# If the frame count has reached a certain value then write the store_vertices into the last_vertices_size value
+	if frame_count > MIN_FRAME && last_vertices_size != store_vertices_size:
+		outputlog("writing new last vertices value: " + str(store_vertices_size))
+		last_vertices_size = store_vertices_size
+
+	# A split is waiting: run it unless Dungeondraft deleted a vertex meanwhile
+	if _pending_frames > 0:
+		_pending_frames -= 1
+		if vertices_size != _pending_size:
+			outputlog("vertex deleted, split cancelled")
+			_pending_frames = 0
+		elif _pending_frames == 0:
+			# Split the path, finding the path using the vertices which is inefficient
+			_split_path(find_pathway_from_vertices(), _pending_mouse, null)
+		return
+
+	# Check for a key press of backspace / delete
+	if Input.is_action_just_pressed(backspace_split_action) && not _text_has_focus():
+		if vertices_size == last_vertices_size:
+			_pending_mouse = Global.WorldUI.MousePosition
+			_pending_size = vertices_size
+			_pending_frames = SPLIT_DELAY_FRAMES
 
 #########################################################################################################
 ##

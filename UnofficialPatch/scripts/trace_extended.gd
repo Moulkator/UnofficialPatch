@@ -12,6 +12,12 @@
 #   - "Trace Layer": z-index slider to place the trace image behind or
 #     between map elements (terrain, walls, roofs, etc.).
 #     Hides the standalone "Layered Trace Image" mod's UI if present.
+#   - "Above Lights": places the trace image above (unlit) or below (lit)
+#     Dungeondraft's deferred lighting pass, identically on the map and at
+#     export. DD lights the map by capturing the screen (LightPassBBC) and
+#     redrawing it through DeferredLighting.shader, so everything drawn
+#     before that capture is lit and everything drawn after is not. When ON,
+#     the Layer slider is hidden (the trace sits above the lighting).
 
 var _g
 var ui_util
@@ -69,6 +75,18 @@ var _layer_spinbox   = null
 var _layer_z         := 900    # default: on top of everything (above Roofs@800)
 var _syncing_layer   := false
 const DEFAULT_LAYER_Z := 900
+const LAYER_MIN := -501
+const LAYER_MAX := 1000
+const CANVAS_Z_MAX := 4096
+const CANVAS_Z_MIN := -4096
+
+# Lighting (affected / unaffected by DD's deferred lighting pass)
+var _lit             := true   # true = drawn below the lighting pass
+var _lit_toggle      = null
+var _layer_lbl       = null
+var _layer_row       = null
+var _layer_reset_btn = null
+var _lighting_z_cache = null   # lighting pass z relative to its Level node
 
 # Rotation
 var _rotation_slider  = null
@@ -259,6 +277,8 @@ func update(_delta: float) -> void:
 		_needs_restore = true
 		_restore_deadline = OS.get_ticks_msec() + RESTORE_TIMEOUT
 		_layer_z = DEFAULT_LAYER_Z
+		_lit = true
+		_lighting_z_cache = null
 		_blur_amount = 0.0
 		_blend_mode = 0
 		_blur_material = null
@@ -314,7 +334,7 @@ func update(_delta: float) -> void:
 	# Re-apply layer z-index if Dungeondraft reset it (e.g. visibility toggle)
 	if not _restoring:
 		var _ti = _g.World.TraceImage if _g.World != null else null
-		if _ti != null and is_instance_valid(_ti) and _ti.z_index != _layer_z:
+		if _ti != null and is_instance_valid(_ti) and (_ti.z_index != _effective_z() or _ti.z_as_relative):
 			_apply_layer_z()
 		# Re-apply FX (blur/blend) if Dungeondraft reset material or texture
 		if _ti != null and is_instance_valid(_ti):
@@ -628,14 +648,24 @@ func _add_ui() -> void:
 	parent.move_child(blend_lbl, sep.get_index() + 1)
 	parent.move_child(blend_row, blend_lbl.get_index() + 1)
 
+	# ── Above Lights toggle (hides Layer when ON) ──
+	_lit_toggle = CheckButton.new()
+	_lit_toggle.text = "Above Lights"
+	_lit_toggle.hint_tooltip = "When ON, the trace image is drawn above lights and\nambient light, so they don't tint it (on the map and at\nexport). The Layer slider is hidden.\nWhen OFF, lighting tints the trace image and the Layer\nis capped just below the lighting pass."
+	_lit_toggle.pressed = not _lit
+	_lit_toggle.connect("toggled", self, "_toggle_undo_wrap", ["_on_lit_toggled"])
+	parent.add_child(_lit_toggle)
+
 	var layer_lbl = Label.new()
 	layer_lbl.text = "Layer"
 	parent.add_child(layer_lbl)
+	_layer_lbl = layer_lbl
 
 	var layer_row = HBoxContainer.new()
+	_layer_row = layer_row
 	var l_slider = HSlider.new()
-	l_slider.min_value = -501
-	l_slider.max_value = 1000
+	l_slider.min_value = LAYER_MIN
+	l_slider.max_value = LAYER_MAX
 	l_slider.step = 1
 	l_slider.value = _layer_z
 	l_slider.size_flags_horizontal = Control.SIZE_EXPAND_FILL
@@ -646,8 +676,8 @@ func _add_ui() -> void:
 	_attach_slider_undo(l_slider)
 
 	var l_spinbox = SpinBox.new()
-	l_spinbox.min_value = -501
-	l_spinbox.max_value = 1000
+	l_spinbox.min_value = LAYER_MIN
+	l_spinbox.max_value = LAYER_MAX
 	l_spinbox.step = 1
 	l_spinbox.value = _layer_z
 	l_spinbox.rect_min_size.x = 75
@@ -666,8 +696,10 @@ func _add_ui() -> void:
 		layer_reset.text = "R"
 	layer_reset.connect("pressed", self, "_button_undo_wrap", ["_on_layer_reset"])
 	layer_row.add_child(layer_reset)
+	_layer_reset_btn = layer_reset
 
 	parent.add_child(layer_row)
+	_refresh_layer_ui_state()
 
 	# Move the "The trace image can be toggled..." note to the very end
 	for child in parent.get_children():
@@ -1205,8 +1237,8 @@ func _apply_layer_z() -> void:
 	var trace_img = _g.World.TraceImage
 	if trace_img == null or not is_instance_valid(trace_img):
 		return
-	trace_img.call("set_z_index", _layer_z)
 	trace_img.call("set_z_as_relative", false)
+	trace_img.call("set_z_index", _effective_z())
 
 
 func _on_layer_changed(value) -> void:
@@ -1226,10 +1258,103 @@ func _on_layer_reset() -> void:
 
 
 func _sync_layer_ui() -> void:
+	var was_syncing = _syncing_layer
+	_syncing_layer = true
 	if _layer_slider != null and is_instance_valid(_layer_slider):
 		_layer_slider.value = _layer_z
 	if _layer_spinbox != null and is_instance_valid(_layer_spinbox):
 		_layer_spinbox.value = _layer_z
+	_syncing_layer = was_syncing
+
+
+# ── Lighting (deferred lighting pass) ───────────────────────────────────
+
+func _get_current_level():
+	if _g.World == null or not is_instance_valid(_g.World):
+		return null
+	if _g.World.has_method("GetCurrentLevel"):
+		return _g.World.GetCurrentLevel()
+	return _g.World.get("Level")
+
+
+# Sum of z_index from node up to (excluding) stop, honouring z_as_relative.
+func _rel_z(node, stop) -> int:
+	var z := 0
+	var n = node
+	while n != null and n != stop:
+		if n is Node2D:
+			z += n.z_index
+			if not n.z_as_relative:
+				return z
+		n = n.get_parent()
+	return z
+
+
+# z of the lighting pass (screen capture + deferred quad) relative to its
+# Level node. Identical for every level (same prefab), so cached per world.
+func _get_lighting_rel_z():
+	if _lighting_z_cache != null:
+		return _lighting_z_cache
+	var level = _get_current_level()
+	if level == null or not is_instance_valid(level):
+		return null
+	var zs := []
+	for prop in ["LightPassBBC", "LightPassRender"]:
+		var node = level.get(prop)
+		if node != null and is_instance_valid(node):
+			zs.append(_rel_z(node, level))
+	if zs.empty():
+		return null
+	var m = zs[0]
+	for v in zs:
+		if v < m:
+			m = v
+	_lighting_z_cache = int(m)
+	return _lighting_z_cache
+
+
+# z actually applied to the trace sprite (levels sit at z 0 while editing).
+func _effective_z() -> int:
+	var lz = _get_lighting_rel_z()
+	if lz == null:
+		return _layer_z
+	if _lit:
+		return int(clamp(min(_layer_z, lz - 1), CANVAS_Z_MIN, CANVAS_Z_MAX))
+	return int(clamp(lz + 1, CANVAS_Z_MIN, CANVAS_Z_MAX))
+
+
+# "Above Lights" toggle: pressed = NOT lit.
+func _on_lit_toggled(pressed: bool) -> void:
+	_lit = not pressed
+	_refresh_layer_ui_state()
+	_apply_layer_z()
+	if not _restoring:
+		_save_scale(_scale_ctrl.value if _scale_ctrl != null and is_instance_valid(_scale_ctrl) else 1.0)
+
+
+# Hide the Layer controls when above lights, and cap them below the
+# lighting pass when lit.
+func _refresh_layer_ui_state() -> void:
+	var cap = LAYER_MAX
+	var lz = _get_lighting_rel_z()
+	if lz != null:
+		cap = int(min(LAYER_MAX, lz - 1))
+	var was_syncing = _syncing_layer
+	_syncing_layer = true
+	for c in [_layer_slider, _layer_spinbox]:
+		if c != null and is_instance_valid(c):
+			c.max_value = cap
+			c.value = _layer_z
+	_syncing_layer = was_syncing
+	if not _lit and _layer_spinbox != null and is_instance_valid(_layer_spinbox):
+		var le = _layer_spinbox.get_line_edit()
+		if le != null and le.has_focus():
+			le.release_focus()
+	for n in [_layer_lbl, _layer_row]:
+		if n != null and is_instance_valid(n):
+			n.visible = _lit
+	if _lit_toggle != null and is_instance_valid(_lit_toggle):
+		_lit_toggle.set_pressed_no_signal(not _lit)
 
 
 # ── Blur ────────────────────────────────────────────────────────────────
@@ -1526,6 +1651,7 @@ func _save_scale(val: float) -> void:
 		state["stretch_x"] = _stretch_scale_x
 		state["stretch_y"] = _stretch_scale_y
 	state["layer_z"] = _layer_z
+	state["lit"] = _lit
 	state["blur"] = _blur_amount
 	state["blend"] = _blend_mode
 	state["rotation"] = _rotation_deg
@@ -1559,6 +1685,7 @@ func _persist_to_modmapdata() -> void:
 		state["stretch_x"] = _stretch_scale_x
 		state["stretch_y"] = _stretch_scale_y
 	state["layer_z"] = _layer_z
+	state["lit"] = _lit
 	state["blur"] = _blur_amount
 	state["blend"] = _blend_mode
 	state["rotation"] = _rotation_deg
@@ -1606,8 +1733,15 @@ func _try_restore() -> void:
 
 	if saved.has("layer_z"):
 		_layer_z = int(saved["layer_z"])
-		_sync_layer_ui()
-		_apply_layer_z()
+	if saved.has("lit"):
+		_lit = bool(saved["lit"])
+	else:
+		# Maps saved before this option: keep how the trace looked while
+		# editing (lit only if it sat below the lighting pass).
+		var lz = _get_lighting_rel_z()
+		_lit = lz == null or _layer_z < lz
+	_refresh_layer_ui_state()
+	_apply_layer_z()
 
 	if saved.has("blur"):
 		_blur_amount = float(saved["blur"])
@@ -1816,6 +1950,7 @@ func _snapshot_state() -> Dictionary:
 		"blur_amount": _blur_amount,
 		"blend_mode": _blend_mode,
 		"layer_z": _layer_z,
+		"lit": _lit,
 		"stretched": _stretched,
 		"stretch_x": _stretch_scale_x,
 		"stretch_y": _stretch_scale_y,
@@ -1860,6 +1995,7 @@ func _apply_state(state) -> void:
 	_blur_amount = state.get("blur_amount", 0.0)
 	_blend_mode = state.get("blend_mode", 0)
 	_layer_z = state.get("layer_z", DEFAULT_LAYER_Z)
+	_lit = state.get("lit", true)
 	# Apply directly to the sprite — this is the source of truth.
 	if _g.World != null and is_instance_valid(_g.World):
 		var trace_img = _g.World.TraceImage
@@ -1899,6 +2035,7 @@ func _apply_state(state) -> void:
 	_sync_blur_ui()
 	_sync_blend_ui()
 	_sync_layer_ui()
+	_refresh_layer_ui_state()
 	_update_wh_sliders()
 	# Reapply the blur shader effect (shader uniform may need update).
 	_apply_blur()

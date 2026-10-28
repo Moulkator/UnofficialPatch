@@ -157,6 +157,18 @@ func _enforce_layer() -> void:
 	lm.select(idx)
 
 
+func _notify_search_persist(tool_name: String, tex) -> void:
+	# search_persist re-applies its per-tool selection snapshot shortly after a
+	# switch to the Object tool. That snapshot only tracks user clicks in the
+	# library, so hand it the picked texture -- otherwise the previously
+	# clicked asset is restored over the eyedropped one.
+	if _main == null or not is_instance_valid(_main):
+		return
+	var sp = _main.get("search_persist")
+	if sp != null and sp.has_method("note_external_pick"):
+		sp.note_external_pick(tool_name, [tex])
+
+
 func _do_wall_switch() -> void:
 	_select_tool.ClearTransformSelection()
 	Input.set_custom_mouse_cursor(null, Input.CURSOR_ARROW)
@@ -338,6 +350,7 @@ func _on_input(event: InputEvent) -> void:
 					obj_tool.call("PromoteCustomColor")
 			_select_tool.ClearTransformSelection()
 			Input.set_default_cursor_shape(Input.CURSOR_ARROW)
+			_notify_search_persist("ObjectTool", thing.Texture)
 			_g.Editor.Toolset.Quickswitch("ObjectTool")
 			_apply_layer(obj_tool, thing)
 			picked = true

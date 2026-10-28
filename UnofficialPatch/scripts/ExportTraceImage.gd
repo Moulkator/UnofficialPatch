@@ -48,8 +48,7 @@ func on_source_level_changed(index: int):
 			var level = _g.World.levels[index]
 			trace_sprite.get_parent().remove_child(trace_sprite)
 			get_trace_parent(level).add_child(trace_sprite)
-			if _g.World.TraceImage != null:
-				trace_sprite.z_index = _g.World.TraceImage.z_index + get_trace_z_offset(level)
+			apply_trace_sprite_z(level)
 
 # Function to capture visibility of the trace image changing
 func trace_image_visibility_changed():
@@ -90,10 +89,10 @@ func on_close_export_window():
 	show_hide_traceimage(export_trace_image_button.pressed, true)
 	delete_trace_sprite()
 
-# Detecte si le format d'export selectionne est Universal VTT (.dd2vtt).
-# Le bouton de format est l'OptionButton "ExportModeOptions" (items :
-# PNG / JPEG / WEBP / Universal VTT, puis formats de mods). On teste par
-# texte pour rester robuste si l'ordre change.
+# True when the selected export format is Universal VTT (.dd2vtt).
+# The format picker is the "ExportModeOptions" OptionButton (PNG / JPEG /
+# WEBP / Universal VTT, then mod formats). Matched by text so it keeps
+# working if the order changes.
 func is_uvtt_export_selected() -> bool:
 	var export_dialog = _g.Editor.Windows["Export"]
 	if export_dialog == null:
@@ -105,28 +104,92 @@ func is_uvtt_export_selected() -> bool:
 		return false
 	return mode_opt.get_item_text(mode_opt.selected) == "Universal VTT"
 
-# Nœud parent du trace sprite.
-# En image (PNG/JPG/WEBP) : sous Objects, comme a l'origine.
-# En Universal VTT : sous le nœud du NIVEAU directement. Objects est itere
-# par Exporter.ExportObjectsLOS() avec foreach (Prop prop in
-# Objects.GetChildren()) ; un Sprite y serait casté en Prop ->
-# InvalidCastException -> le bake JSON plante et DD laisse un
-# "<nom>.dd2vtt.png" sans .dd2vtt. Le nœud du niveau est rendu (le calque
-# part donc bien dans l'image embarquee du .dd2vtt) mais n'est PAS
-# serialise par le bake.
+# Parent node of the trace sprite.
+# Image formats (PNG/JPG/WEBP): under Objects, as originally.
+# Universal VTT: directly under the LEVEL node. Exporter.ExportObjectsLOS()
+# iterates Objects with foreach (Prop prop in Objects.GetChildren()); a
+# Sprite there would be cast to Prop -> InvalidCastException -> the JSON
+# bake fails and DD leaves a "<name>.dd2vtt.png" without the .dd2vtt. The
+# level node is rendered (so the trace lands in the embedded image) but is
+# NOT serialized by the bake.
 func get_trace_parent(level):
 	if is_uvtt_export_selected():
 		return level
 	return level.Objects
 
-# Decalage de z selon le parent, pour conserver le meme calque qu'en mode
-# image : sous le niveau, on ajoute le z_index du nœud Objects.
-func get_trace_z_offset(level) -> int:
-	if is_uvtt_export_selected():
-		var obj = level.Objects
-		if obj != null:
-			return int(obj.z_index)
-	return 0
+# ── Lighting-aware z ──────────────────────────────────────────────────
+# DD lights a level by capturing the screen (LightPassBBC) and redrawing it
+# through DeferredLighting.shader: whatever is drawn before the capture is
+# lit, whatever comes after is not. During export the source level sits at
+# z -2000, so the sprite uses an ABSOLUTE z computed from the live nodes to
+# land on the same side of the lighting pass as on the map.
+
+const CANVAS_Z_MAX = 4096
+const CANVAS_Z_MIN = -4096
+
+# Sum of z_index from node up to (excluding) stop, honouring z_as_relative.
+func _rel_z(node, stop) -> int:
+	var z := 0
+	var n = node
+	while n != null and n != stop:
+		if n is Node2D:
+			z += n.z_index
+			if not n.z_as_relative:
+				return z
+		n = n.get_parent()
+	return z
+
+# Absolute z of a node.
+func _abs_z(node) -> int:
+	return _rel_z(node, null)
+
+# z of the lighting pass relative to its Level node, or null.
+func _lighting_rel_z(level):
+	if level == null:
+		return null
+	var best = null
+	for prop in ["LightPassBBC", "LightPassRender"]:
+		var node = level.get(prop)
+		if node != null and is_instance_valid(node):
+			var z = _rel_z(node, level)
+			if best == null or z < best:
+				best = z
+	return best
+
+# Lighting option set by trace_extended (saved in ModMapData). Fallback when
+# absent: lit if the trace sits below the lighting pass on the map.
+func _trace_is_lit(level) -> bool:
+	if _g.get("ModMapData") != null and _g.ModMapData is Dictionary:
+		var st = _g.ModMapData.get("_trace_extended")
+		if st is Dictionary and st.has("lit"):
+			return bool(st["lit"])
+	var lz = _lighting_rel_z(level)
+	if lz == null or _g.World.TraceImage == null:
+		return true
+	return _g.World.TraceImage.z_index < lz
+
+func apply_trace_sprite_z(level) -> void:
+	if trace_sprite == null or _g.World.TraceImage == null:
+		return
+	trace_sprite.z_as_relative = false
+	var level_z = _abs_z(level)
+	var trace_z = int(_g.World.TraceImage.z_index)
+	var lz = _lighting_rel_z(level)
+	var z
+	if lz == null:
+		z = level_z + trace_z
+	elif _trace_is_lit(level):
+		# Same layer as on the map, kept below the source level's lighting.
+		z = level_z + int(min(trace_z, lz - 1))
+	else:
+		# Above every lighting pass (source at -2000, overlay at 0) and above
+		# ExportFX (brightness/focus redraw of the captured screen).
+		z = lz + 1
+		var fx = _g.World.get("ExportFX")
+		if fx != null and is_instance_valid(fx):
+			z = int(max(z, _abs_z(fx) + 1))
+	trace_sprite.z_index = int(clamp(z, CANVAS_Z_MIN, CANVAS_Z_MAX))
+	outputlog("trace_sprite z_index set to: " + str(trace_sprite.z_index), 2)
 
 # Function to create a trace sprite as a visible copy of the Trace Image
 func create_trace_sprite():
@@ -162,21 +225,17 @@ func create_trace_sprite():
 	else:
 		outputlog("create new trace image",2)
 		trace_sprite = Sprite.new()
-		# Add it to the current level (Objects en image, nœud du niveau en UVTT)
+		# Add it to the current level (Objects for images, level node for UVTT)
 		target_parent.add_child(trace_sprite)
 
 	trace_sprite.texture = _g.World.TraceImage.texture
 	trace_sprite.position = _g.World.TraceImage.position
 	trace_sprite.scale = _g.World.TraceImage.scale
 	trace_sprite.rotation = _g.World.TraceImage.rotation
-	# Use the TraceImage's current z_index (set by trace_extended layer slider,
-	# or default), compense selon le parent pour garder le meme calque.
-	trace_sprite.z_index = _g.World.TraceImage.z_index + get_trace_z_offset(level)
+	# Layer + lighting option from trace_extended, as an absolute z.
+	apply_trace_sprite_z(level)
 	# Copy material (carries the combined blur + blend-mode shader if active).
-	# Blend modes read SCREEN_TEXTURE, so the sprite must draw above the baked
-	# map (its z_index already places it there) for the composite to be correct.
 	trace_sprite.material = _g.World.TraceImage.material
-	outputlog("trace_sprite z_index set to: " + str(trace_sprite.z_index), 2)
 	
 	# Set the opacity to TraceImage opacity
 	trace_sprite.set_modulate(Color(1.0,1.0,1.0,_g.Editor.Tools["TraceImage"].Opacity.value))
@@ -241,8 +300,8 @@ func start() -> void:
 
 	# If _Lib is installed, use ModConfigApi directly without registering via
 	# emit_signal (crashes when _g is not yet injected by UnofficialPatch).
-	# NOTE: pas d'enregistrement UpdateChecker ici — l'enregistrement du suite
-	# est fait une seule fois dans Main.gd.
+	# NOTE: no UpdateChecker registration here — the suite registers once in
+	# Main.gd.
 	if Engine.has_signal("_lib_register_mod"):
 		make_lib_configs()
 
@@ -259,7 +318,7 @@ func start() -> void:
 	source_level_optionbutton = export_dialog.find_node("SourceLevelOptions")
 	if source_level_optionbutton != null:
 		source_level_optionbutton.connect("item_selected", self, "on_source_level_changed")
-	# Ne pas ajouter le bouton si deja present (doublon de mod)
+	# Don't add the button if it already exists (duplicate mod)
 	var valign = export_dialog.find_node("VAlign")
 	if valign != null:
 		for child in valign.get_children():
