@@ -49,6 +49,27 @@
 # but still listed). They get their own divider group and default to
 # order 1000 (after the patch entries, which use 10..60).
 # Shift + right-click shows each top-level entry's order next to its label.
+#
+# ── The menu in the other tools (1.7.5) ─────────────────────────────────────
+# "_up_rcm_host" also carries tool_menu = true: external providers may then
+# implement get_tool_context_items(context) -> Array, called on a right click
+# on the map in any built-in tool other than SelectTool (never in mod tools,
+# which may use the right click themselves). Where the tool leaves the right
+# click unused, a plain right click opens the menu; where it uses it (Object,
+# Scatter, Prefab, Terrain, freestanding Portal, Light and Pattern with their
+# rotation settings), Ctrl + right click does. Never while something is being
+# drawn or a curve edited. `context` is a Dictionary:
+#   tool        String   active tool name (Editor.ActiveToolName)
+#   busy        bool     always false here (the menu never opens while busy)
+#   gesture     String   "click" or "ctrl_click"
+#   position    Vector2  the click on the map (WorldUI.MousePosition)
+#   ui_position Vector2  the click in the editor's UI (Toolset coordinates)
+#   hovered     Node     the object (Prop) under the mouse, by its sprite box,
+#                        or null; objects only
+# on_context_action(action_id, context) then gets the context instead of the
+# selection. Entries are those of the Select Tool's menu; an entry with
+# direct = true that is the menu's only entry runs at once without a menu.
+# Dungeondraft 1.3.0.0 offers the same natively.
 
 var _g
 var ui_util
@@ -62,6 +83,8 @@ var _next_id := 0     # next menu item id while building a popup
 var _last_raw = null
 var _register_seq := 0
 var _ext_seen := {}   # external provider ids already logged
+var main_ref = null   # weakref to Main: the curve edits and arc tool it holds
+var _listener = null  # input node that sees right clicks before the tools
 
 
 const EXT_HOST_META := "_up_rcm_host"
@@ -70,13 +93,53 @@ const EXT_API_VERSION := 1
 const EXT_DEFAULT_ORDER := 1000
 const EXT_SEQ_BASE := 1000000
 const MAX_SUBMENU_DEPTH := 3   # submenu levels below the root menu
+const LISTENER_META := "_up_rcm_listener"
+const TOOL_MENU_SETTING := "rcm_other_tools"
+# What each built-in tool does with a right click on the map:
+#   free     nothing: a plain right click opens the menu
+#   drawing  ends the line being drawn: free while nothing is drawn
+#   uses     turns or toggles something: Ctrl + right click opens the menu
+#   portal / light / pattern: "uses" when that rotation applies, else free
+const TOOL_RIGHT_CLICK := {
+	"TextTool": "free", "FloorShapeTool": "free", "CaveBrush": "free", "WaterBrush": "free",
+	"MaterialBrush": "free", "Environment": "free", "Generator": "free", "MapSettings": "free",
+	"LevelSettings": "free", "LayerSettings": "free", "TraceImage": "free",
+	"WallTool": "drawing", "PathTool": "drawing", "RoofTool": "drawing",
+	"ObjectTool": "uses", "ScatterTool": "uses", "PrefabTool": "uses", "TerrainBrush": "uses",
+	"PortalTool": "portal", "LightTool": "light", "PatternShapeTool": "pattern",
+}
+# Main's scripts with a right click of their own while active (_state != 0)
+const BUSY_SCRIPTS := ["path_curve_edit", "wall_curve_edit", "pattern_curve_edit", "arc_draw"]
 
 
 func initialize() -> void:
 	# Public API: advertise the menu for this map session (see header).
 	if _g != null and _g.get("World") != null and is_instance_valid(_g.World):
-		Engine.set_meta(EXT_HOST_META, {world = _g.World, version = EXT_API_VERSION})
+		Engine.set_meta(EXT_HOST_META, {world = _g.World, version = EXT_API_VERSION, tool_menu = true})
+	_make_listener()
 	print("[RightClickUtil] Initialized with ", _providers.size(), " provider(s)")
+
+
+# The listener lives on the tree root, which outlives the map: the one of the
+# previous map is freed here, as the other input listeners of the patch do.
+func _make_listener() -> void:
+	if Engine.has_meta(LISTENER_META):
+		var old = Engine.get_meta(LISTENER_META)
+		if old != null and is_instance_valid(old):
+			old.handler = null
+			old.queue_free()
+	if _g == null or _g.get("Editor") == null or not is_instance_valid(_g.Editor):
+		return
+	var node = Node.new()
+	node.name = "RightClickToolMenuListener"
+	var s = GDScript.new()
+	s.source_code = "extends Node\nvar handler = null\nfunc _input(e):\n\tif handler == null: return\n\tif handler._on_input(e):\n\t\tget_tree().set_input_as_handled()\n"
+	s.reload()
+	node.set_script(s)
+	node.handler = self
+	Engine.set_meta(LISTENER_META, node)
+	_g.Editor.get_tree().get_root().call_deferred("add_child", node)
+	_listener = node
 
 
 # order  : position in the menu (ascending). Convention in Main.gd:
@@ -135,6 +198,12 @@ func update(_delta: float) -> void:
 	if right_now and not _right_was_pressed:
 		_on_right_click()
 	_right_was_pressed = right_now
+	# Input goes to the root's last child first: kept last, the listener sees a
+	# Ctrl + right click before the rotations of the patch take it.
+	if _listener != null and is_instance_valid(_listener) and _listener.is_inside_tree():
+		var parent = _listener.get_parent()
+		if _listener.get_index() != parent.get_child_count() - 1:
+			parent.move_child(_listener, parent.get_child_count() - 1)
 
 
 const BLOCK_WINDOWS_META := "_up_block_windows"
@@ -309,10 +378,210 @@ func _on_right_click() -> void:
 	_show_popup(all_items)
 
 
+# ── The menu in the other tools ──────────────────────────────────────────────
+
+# A right click, before the tools get it. True when it was taken from the tool.
+func _on_input(event) -> bool:
+	if _open_tool_menu(event):
+		return true
+	return _blocks_idle_finish(event)
+
+
+# True when the menu opened.
+func _open_tool_menu(event) -> bool:
+	if not (event is InputEventMouseButton) or not event.pressed or event.button_index != BUTTON_RIGHT:
+		return false
+	# Shift and Alt turn things back in the tools; the menu leaves them alone
+	if event.shift or event.alt or event.meta:
+		return false
+	if _g == null or not _setting_enabled(TOOL_MENU_SETTING):
+		return false
+	var editor = _g.get("Editor")
+	if editor == null or not is_instance_valid(editor):
+		return false
+	var tool_name = editor.get("ActiveToolName")
+	if not (tool_name is String) or not TOOL_RIGHT_CLICK.has(tool_name):
+		return false
+	if _g.ModMapData is Dictionary and _g.ModMapData.get("_free_transform_active", false):
+		return false
+	if editor.get("SuppressTool") == true:
+		return false
+	if _listener == null or not is_instance_valid(_listener):
+		return false
+	if ui_util != null and ui_util.is_mouse_over_ui(_listener):
+		return false
+	if is_mouse_over_blocking_window() or _is_mouse_in_text_edit():
+		return false
+	var tools = editor.get("Tools")
+	var active_tool = tools.get(tool_name) if tools is Dictionary else null
+	if active_tool == null or not is_instance_valid(active_tool) or _tool_busy(active_tool):
+		return false
+	var ctrl: bool = event.control
+	if not ctrl and _tool_uses_right_click(tool_name, active_tool):
+		return false
+	var context := {
+		"tool": tool_name,
+		"busy": false,
+		"gesture": ("ctrl_click" if ctrl else "click"),
+		"position": _world_mouse(),
+		"ui_position": _ui_mouse(editor),
+		"hovered": null,
+	}
+	return _show_tool_menu(context)
+
+
+# Dungeondraft 1.2.0.1 ends the wall, or the manual roof, being drawn on a right
+# click even when none is: it then puts a first point under the mouse, and the
+# next click draws a wall from there. With nothing to end, the click is kept from
+# the tool. (Enter does the same in the Wall tool, but Dungeondraft reads it from
+# the key state, which no input listener can hold back.)
+func _blocks_idle_finish(event) -> bool:
+	if not (event is InputEventMouseButton) or not event.pressed or event.button_index != BUTTON_RIGHT:
+		return false
+	if _g == null:
+		return false
+	var editor = _g.get("Editor")
+	if editor == null or not is_instance_valid(editor) or editor.get("SuppressTool") == true:
+		return false
+	var tool_name = editor.get("ActiveToolName")
+	if tool_name != "WallTool" and tool_name != "RoofTool":
+		return false
+	var tools = editor.get("Tools")
+	var active_tool = tools.get(tool_name) if tools is Dictionary else null
+	if active_tool == null or not is_instance_valid(active_tool) or _tool_busy(active_tool):
+		return false
+	if tool_name == "RoofTool" and int(active_tool.get("Mode")) != 1:
+		return false
+	var edit_points = active_tool.get("EditPoints")
+	if edit_points != null and is_instance_valid(edit_points) and edit_points.pressed:
+		return false
+	if _g.ModMapData is Dictionary and _g.ModMapData.get("_free_transform_active", false):
+		return false
+	if _listener == null or not is_instance_valid(_listener):
+		return false
+	if ui_util != null and ui_util.is_mouse_over_ui(_listener):
+		return false
+	return true
+
+
+func _tool_uses_right_click(tool_name: String, active_tool) -> bool:
+	match TOOL_RIGHT_CLICK.get(tool_name, "uses"):
+		"free", "drawing":
+			return false
+		"portal":
+			return active_tool.get("Freestanding") == true
+		"light":
+			return _setting_enabled("light_tool_object_like")
+		"pattern":
+			return _setting_enabled("pattern_right_click_rotation")
+	return true
+
+
+# A line or shape being drawn, a stroke, a curve being edited, an arc: the
+# right click belongs to the tool or to the patch then.
+func _tool_busy(active_tool) -> bool:
+	if active_tool.get("isDrawing") == true:
+		return true
+	var main = main_ref.get_ref() if main_ref is WeakRef else null
+	if main == null:
+		return false
+	for key in BUSY_SCRIPTS:
+		var script = main.get(key)
+		if script != null and is_instance_valid(script):
+			var state = script.get("_state")
+			if (typeof(state) == TYPE_INT) and state != 0:
+				return true
+	return false
+
+
+func _world_mouse() -> Vector2:
+	if _g.get("WorldUI") != null and is_instance_valid(_g.WorldUI):
+		var p = _g.WorldUI.get("MousePosition")
+		if p is Vector2:
+			return p
+	return Vector2.ZERO
+
+
+func _ui_mouse(editor) -> Vector2:
+	var toolset = editor.get("Toolset")
+	if toolset != null and is_instance_valid(toolset) and toolset is Control:
+		return toolset.get_global_mouse_position()
+	return _g.World.get_tree().root.get_mouse_position()
+
+
+func _show_tool_menu(context: Dictionary) -> bool:
+	var entries := []
+	for e in _external_entries():
+		if e.provider.has_method("get_tool_context_items"):
+			entries.append(e)
+	if entries.empty():
+		return false
+	entries.sort_custom(self, "_sort_entries")
+	# looked for only when a mod could use it: it goes through every object
+	context["hovered"] = _object_under_mouse(context.position)
+	var all_items := []
+	var last_group := ""
+	for e in entries:
+		var items = _normalize_items(e.provider.get_tool_context_items(context), e.provider)
+		if items.size() == 0:
+			continue
+		var gkey := str(e.group)
+		if all_items.size() > 0 and gkey != last_group:
+			all_items.append({label = "", icon = null, action_id = "", _sep = true})
+		last_group = gkey
+		for item in items:
+			all_items.append(item)
+	if all_items.size() == 0:
+		return false
+	_last_raw = context
+	_show_popup(all_items)
+	return true
+
+
+# The topmost object whose sprite box holds the point (turned, scaled and
+# mirrored with it), by layer, then by drawing order.
+func _object_under_mouse(world_pos: Vector2):
+	var world = _g.get("World")
+	if world == null or not is_instance_valid(world) or not world.has_method("GetCurrentLevel"):
+		return null
+	var level = world.GetCurrentLevel()
+	var objects = level.get("Objects") if level != null else null
+	if objects == null or not is_instance_valid(objects):
+		return null
+	# the asset in hand is not under the mouse, it follows it
+	var editor = _g.get("Editor")
+	var active = editor.get("ActiveTool") if editor != null and is_instance_valid(editor) else null
+	var preview = active.get("Preview") if active != null and is_instance_valid(active) else null
+	var best = null
+	var best_z := 0
+	for prop in objects.get_children():
+		if not (prop is Node2D) or not prop.visible or prop == preview:
+			continue
+		if prop.has_meta("preview") and prop.get_meta("preview") == true:
+			continue
+		var sprite = prop.get("Sprite")
+		if sprite == null or not is_instance_valid(sprite) or sprite.texture == null:
+			continue
+		var local = sprite.get_global_transform().affine_inverse().xform(world_pos)
+		if not sprite.get_rect().has_point(local):
+			continue
+		if best == null or prop.z_index >= best_z:
+			best = prop
+			best_z = prop.z_index
+	return best
+
+
 func _show_popup(items: Array) -> void:
 	if _context_menu and is_instance_valid(_context_menu):
 		_context_menu.queue_free()
 		_context_menu = null
+	# a single entry asked to run at once (a mod opening its own window)
+	if items.size() == 1 and not items[0].get("_sep", false) and not items[0].has("submenu") and not items[0].get("disabled", false) and items[0].get("direct", false):
+		var only = items[0]
+		var p = only["_provider"]
+		if p != null and is_instance_valid(p) and p.has_method("on_context_action"):
+			p.on_context_action(only.action_id, _last_raw)
+		return
 
 	_context_menu = PopupMenu.new()
 	_item_map = {}
@@ -449,6 +718,7 @@ func _normalize_items(items, provider, depth: int = 0) -> Array:
 			icon = icon,
 			action_id = item.get("action_id", ""),
 			disabled = (true if item.get("disabled", false) else false),
+			direct = (true if item.get("direct", false) else false),
 			_provider = provider,
 		}
 		if depth < MAX_SUBMENU_DEPTH:

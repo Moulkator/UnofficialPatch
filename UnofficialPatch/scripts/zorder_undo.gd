@@ -200,7 +200,33 @@ func _do_native_with_record(native_method: String) -> void:
 		return
 	_snapshot_selection()
 	select_tool.call(native_method)
+	_keep_relative_order(native_method == "BringToFront")
 	_record_if_changed()
+
+
+# Vanilla moves the selected things one by one in the order they were
+# selected: to the front, the last one selected ended on top; to the back, the
+# order was reversed. They are put back in the order they were drawn in among
+# themselves, at the front or the back of their parent.
+func _keep_relative_order(front: bool) -> void:
+	var groups := {}
+	for e in _pending:
+		var thing = e["wr"].get_ref()
+		var parent = e["pwr"].get_ref()
+		if thing == null or not is_instance_valid(thing) or parent == null or thing.get_parent() != parent:
+			continue
+		if not groups.has(parent):
+			groups[parent] = []
+		groups[parent].append({"thing": thing, "idx": e["old"]})
+	for parent in groups:
+		var items: Array = groups[parent]
+		items.sort_custom(self, "_cmp_idx")
+		if front:
+			for t in items:
+				parent.move_child(t["thing"], parent.get_child_count() - 1)
+		else:
+			for i in range(items.size() - 1, -1, -1):
+				parent.move_child(items[i]["thing"], 0)
 
 
 func _record_if_changed() -> void:

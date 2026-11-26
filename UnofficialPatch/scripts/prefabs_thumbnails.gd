@@ -68,7 +68,7 @@ var _right_click_idx := -1
 var _search_bar : LineEdit = null
 var _search_text := ""
 var _search_overlay : ItemList = null
-# _filtered_to_original : Array[int] -- index overlay -> index dans _item_list DD
+# _filtered_to_original : Array[int] -- overlay index -> index in DD's _item_list
 var _filtered_to_original := []
 var _prefetch_done := false
 var _prefetch_running := false
@@ -76,8 +76,8 @@ var _display_mode : int = MODE_LIST_THUMB
 const PREFS_PATH = "user://UnofficialPatch/prefabs_thumbnails_prefs.json"
 var _mode_toolbar : HBoxContainer = null
 var _original_theme = null
-# Cache de la texture d'outline pour les PatternShape (default_border.png).
-# Chargee paresseusement au premier appel via _get_outline_texture().
+# Cached outline texture for PatternShapes (default_border.png).
+# Lazily loaded on first call through _get_outline_texture().
 var _cached_outline_texture : Texture = null
 
 # UI Rescaler integration. The UI Rescaler mod publishes its Asset
@@ -147,13 +147,13 @@ func _setup() -> void:
 	# replace it with ours. We call OnSelectPrefab manually only when safe.
 	if _item_list != null and is_instance_valid(_item_list):
 		_hook_item_list_interception()
-	# Le clic droit est gere via polling dans update()
-	# Charger les thumbnails du set initial si le panel est deja visible
+	# Right-click is handled via polling in update()
+	# Load the initial set's thumbnails if the panel is already visible
 	_panel.connect("visibility_changed", self, "_on_panel_visibility_changed")
-	# Declencher le chargement initial via un timer (yield ne fonctionne pas dans _setup)
+	# Trigger the initial load via a timer (yield doesn't work in _setup)
 	var t = _g.World.get_tree().create_timer(0.5)
 	t.connect("timeout", self, "_load_initial_set")
-	# Noeud holder isole pour les Viewports de rendu -- hors de _g.World
+	# Isolated holder node for render Viewports -- outside _g.World
 	# Cross-session guard: the tree root persists across map reloads, so a
 	# holder built by a previous mod instance is still parented there. Free it
 	# before creating ours, otherwise its render Viewports pile up every reload.
@@ -167,7 +167,7 @@ func _setup() -> void:
 	_panel.get_tree().root.add_child(_vp_holder)
 	print("[PrefabsThumbs] Ready -- %d sets indexed" % _prefab_index.size())
 	call_deferred("_discover_prefab_tool_methods")
-	# Lancer la generation en arriere-plan pour tous les sets
+	# Start background generation for all sets
 	var pt = _g.World.get_tree().create_timer(1.0)
 	pt.connect("timeout", self, "_start_prefetch")
 
@@ -204,7 +204,7 @@ func _index_prefab_root(root: String) -> void:
 
 func _on_set_selected(index: int) -> void:
 	_current_set_name = _set_option.get_item_text(index)
-	# Reindexer le set courant pour detecter les nouveaux prefabs
+	# Reindex the current set to detect new prefabs
 	_reindex_current_set()
 	var set_key_sel = _find_set_key(_current_set_name)
 	_apply_missing_status_to_list(set_key_sel)
@@ -231,7 +231,7 @@ func _start_prefetch() -> void:
 
 func _prefetch_all() -> void:
 	var sizes = [THUMB_SIZE, THUMB_SIZE_MD, -THUMB_SIZE_LG]
-	var sets_snapshot = _prefab_index.duplicate(true)  # snapshot pour eviter modif pendant iteration
+	var sets_snapshot = _prefab_index.duplicate(true)  # snapshot to avoid changes during iteration
 	var total = 0
 	var skipped = 0
 	for set_key in sets_snapshot.keys():
@@ -247,12 +247,12 @@ func _prefetch_all() -> void:
 		if skipped > 0:
 			print("[PrefabsThumbs] Prefetch: skipped %d prefabs with missing assets, nothing to generate" % skipped)
 		return
-	print("[PrefabsThumbs] Prefetch: %d thumbnails a generer (skipped %d prefabs with missing assets)..." % [total, skipped])
+	print("[PrefabsThumbs] Prefetch: %d thumbnails to generate (skipped %d prefabs with missing assets)..." % [total, skipped])
 	var done = 0
 	for thumb_size in sizes:
 		for set_key in sets_snapshot.keys():
 			for prefab_name in sets_snapshot[set_key].keys():
-				# Verifier que le contexte est toujours valide
+				# Make sure the context is still valid
 				if _vp_holder == null or not is_instance_valid(_vp_holder):
 					_prefetch_running = false
 					return
@@ -273,7 +273,7 @@ func _prefetch_all() -> void:
 					yield(_vp_holder.get_tree(), "idle_frame")
 	_prefetch_done = true
 	_prefetch_running = false
-	print("[PrefabsThumbs] Prefetch termine: %d thumbnails en cache" % _thumb_cache.size())
+	print("[PrefabsThumbs] Prefetch done: %d thumbnails cached" % _thumb_cache.size())
 
 
 func _load_initial_set() -> void:
@@ -378,7 +378,7 @@ func _apply_thumbnails() -> void:
 			_item_list.fixed_icon_size = Vector2(0, 0)
 			_item_list.max_columns = 1
 			_item_list.same_column_width = true
-			# Largeur = panel entier moins la scrollbar (~14px)
+			# Width = full panel minus the scrollbar (~14px)
 			var list_w = int(_item_list.rect_size.x) - 14
 			if list_w < 32: list_w = 200
 			_item_list.fixed_column_width = list_w
@@ -393,8 +393,8 @@ func _apply_thumbnails() -> void:
 	_apply_missing_status_to_list(set_key)
 	count = _item_list.get_item_count()
 	for i in range(count):
-		# Toujours garder le texte -- DD l'utilise pour placer le prefab
-		# Recuperer le vrai nom (tooltip = backup si deja in tooltip)
+		# Always keep the text -- DD uses it to place the prefab
+		# Retrieve the real name (tooltip = backup if already stored there)
 		var item_name = _item_list.get_item_text(i)
 		if item_name == "":
 			item_name = _item_list.get_item_tooltip(i)
@@ -414,7 +414,7 @@ func _apply_thumbnails() -> void:
 	# Apply missing status: already done before thumbnail generation
 	# Sync our clone list with the updated original
 	_sync_clone_list()
-	# Rafraichir l'overlay si une recherche est active
+	# Refresh the overlay if a search is active
 	if _search_text != "":
 		_apply_search_filter()
 
@@ -446,7 +446,7 @@ func _get_thumb_size() -> int:
 		MODE_GRID_MD:
 			return int(round(THUMB_SIZE_MD * s))
 		MODE_GRID_LG:
-			return -int(round(THUMB_SIZE_LG * s))  # negatif = mode adaptatif
+			return -int(round(THUMB_SIZE_LG * s))  # negative = adaptive mode
 		_:
 			return int(round(THUMB_SIZE * s))
 
@@ -460,14 +460,14 @@ func _make_mode_icon(mode: int) -> ImageTexture:
 	img.lock()
 	match mode:
 		MODE_LIST:
-			# 5 lignes texte espacees sur 40px
+			# 5 evenly spaced text lines over 40px
 			for row in [3, 10, 17, 24, 31]:
 				for x in range(3, 37):
 					img.set_pixel(x, row,     fg)
 					img.set_pixel(x, row + 1, fg)
 					img.set_pixel(x, row + 2, fg)
 		MODE_LIST_THUMB:
-			# 3 rangees : carre 9x9 + 2 lignes texte
+			# 3 rows: 9x9 square + 2 text lines
 			for row in [3, 15, 27]:
 				for y in range(row, row + 9):
 					for x in range(3, 12):
@@ -479,21 +479,21 @@ func _make_mode_icon(mode: int) -> ImageTexture:
 					img.set_pixel(x, row + 6, fg)
 					img.set_pixel(x, row + 7, fg)
 		MODE_GRID_SM:
-			# 3x3 carres 9x9 avec gap de 2
+			# 3x3 squares of 9x9 with a 2px gap
 			for row in [3, 14, 25]:
 				for col in [3, 14, 25]:
 					for y in range(row, row + 9):
 						for x in range(col, col + 9):
 							img.set_pixel(x, y, fg)
 		MODE_GRID_MD:
-			# 2x2 carres 16x16 avec gap de 4
+			# 2x2 squares of 16x16 with a 4px gap
 			for row in [3, 21]:
 				for col in [3, 21]:
 					for y in range(row, row + 16):
 						for x in range(col, col + 16):
 							img.set_pixel(x, y, fg)
 		MODE_GRID_LG:
-			# 1 grand carre 34x34 avec bordure + interieur grise
+			# 1 large 34x34 square with border + greyed interior
 			for y in range(3, 37):
 				for x in range(3, 37):
 					if x == 3 or x == 36 or y == 3 or y == 36:
@@ -517,11 +517,11 @@ func _build_mode_toolbar() -> void:
 	_mode_toolbar = toolbar
 
 	var buttons = [
-		[MODE_LIST,       "Liste texte uniquement"],
-		[MODE_LIST_THUMB, "Liste avec thumbnails"],
-		[MODE_GRID_SM,    "Grille petite"],
-		[MODE_GRID_MD,    "Grille moyenne"],
-		[MODE_GRID_LG,    "Grille grande (pleine largeur)"],
+		[MODE_LIST,       "Text-only list"],
+		[MODE_LIST_THUMB, "List with thumbnails"],
+		[MODE_GRID_SM,    "Small grid"],
+		[MODE_GRID_MD,    "Medium grid"],
+		[MODE_GRID_LG,    "Large grid (full width)"],
 	]
 
 	for btn_data in buttons:
@@ -534,11 +534,11 @@ func _build_mode_toolbar() -> void:
 		btn.expand_icon = true
 		btn.icon = _make_mode_icon(btn_data[0])
 		btn.set_meta("mode", btn_data[0])
-		# Clic droit = definir comme mode par defaut
+		# Selected mode is saved as the default mode
 		btn.connect("pressed", self, "_on_mode_button_pressed", [btn])
 		toolbar.add_child(btn)
 
-	# Inserer toolbar + search bar juste avant itemList dans son parent
+	# Insert toolbar + search bar right before itemList in its parent
 	var parent = _item_list.get_parent()
 	if parent == null:
 		print("[PrefabsThumbs] toolbar: itemList has no parent!")
@@ -547,7 +547,7 @@ func _build_mode_toolbar() -> void:
 	print("[PrefabsThumbs] toolbar: inserting at idx=%d in parent=%s" % [idx, parent.get_class()])
 	parent.add_child(toolbar)
 	parent.move_child(toolbar, idx)
-	# Search bar (label + field dans un HBox)
+	# Search bar (label + field in an HBox)
 	var search_hbox = HBoxContainer.new()
 	search_hbox.rect_min_size = Vector2(0, 28)
 	search_hbox.size_flags_horizontal = Control.SIZE_EXPAND_FILL
@@ -581,13 +581,13 @@ func _on_mode_button_pressed(btn: Button) -> void:
 		_apply_mode_list()
 		_scroll_to_selected()
 		return
-	# Restaurer les textes si on revenait du mode grille
+	# Restore texts when coming back from grid mode
 	for i in range(_item_list.get_item_count()):
 		var tip = _item_list.get_item_tooltip(i)
 		if tip != "" and _item_list.get_item_text(i) == "":
 			_item_list.set_item_text(i, tip)
 	_apply_thumbnails()
-	# Scroll apres un court delai pour laisser le layout se recalculer
+	# Scroll after a short delay to let the layout recompute
 	var t = _g.World.get_tree().create_timer(0.1)
 	t.connect("timeout", self, "_scroll_to_selected")
 
@@ -608,7 +608,7 @@ func _on_right_click() -> void:
 	if not rect.has_point(mouse_pos) and not overlay_rect.has_point(mouse_pos):
 		return
 	var local_pos = mouse_pos - rect.position
-	# Si l'overlay de recherche est actif, travailler dessus
+	# If the search overlay is active, work on it instead
 	var click_list = _item_list
 	if _search_overlay != null and is_instance_valid(_search_overlay) and _search_overlay.visible:
 		var srect = _search_overlay.get_global_rect()
@@ -618,7 +618,7 @@ func _on_right_click() -> void:
 	var idx = click_list.get_item_at_position(local_pos, true)
 	if idx < 0:
 		return
-	# Convertir en index DD si on est sur l'overlay
+	# Convert to DD index when on the overlay
 	var dd_idx = idx
 	if click_list == _search_overlay and idx < _filtered_to_original.size():
 		dd_idx = _filtered_to_original[idx]
@@ -639,7 +639,7 @@ func _on_prefab_ctx_pressed(id: int) -> void:
 		var pt = _g.Editor.Tools.get("PrefabTool")
 		if pt == null:
 			return
-		# Selectionner l'item sous la souris avant de Forget
+		# Select the item under the mouse before Forget
 		if _right_click_idx >= 0 and is_instance_valid(_item_list):
 			_item_list.select(_right_click_idx)
 			_item_list.emit_signal("item_selected", _right_click_idx)
@@ -655,10 +655,12 @@ func _on_search_changed(text: String) -> void:
 func _apply_search_filter() -> void:
 	if not is_instance_valid(_item_list):
 		return
-	# Creer l'overlay si besoin
+	# Create the overlay if needed
 	if _search_overlay == null or not is_instance_valid(_search_overlay):
 		var overlay = ItemList.new()
 		overlay.name = "SearchOverlay"
+		# as the list it covers (prefabs_fix): letters must not pick a prefab
+		overlay.focus_mode = Control.FOCUS_NONE
 		overlay.size_flags_horizontal = _item_list.size_flags_horizontal
 		overlay.size_flags_vertical = _item_list.size_flags_vertical
 		overlay.rect_min_size = _item_list.rect_min_size
@@ -666,13 +668,13 @@ func _apply_search_filter() -> void:
 		_item_list.get_parent().move_child(overlay, _item_list.get_index() + 1)
 		overlay.connect("item_selected", self, "_on_search_overlay_selected")
 		_search_overlay = overlay
-	# Pas de filtre : afficher la liste DD normale
+	# No filter: show the normal DD list
 	if _search_text == "":
 		_item_list.visible = true
 		_search_overlay.visible = false
 		_filtered_to_original.clear()
 		return
-	# Construire l'overlay filtre
+	# Build the filtered overlay
 	_search_overlay.max_columns    = _item_list.max_columns
 	_search_overlay.icon_mode      = _item_list.icon_mode
 	_search_overlay.fixed_icon_size = _item_list.fixed_icon_size
@@ -1184,7 +1186,7 @@ func _load_prefs() -> void:
 			var data = parsed.result
 			if data.has("default_mode"):
 				_display_mode = int(data["default_mode"])
-				print("[PrefabsThumbs] Mode par defaut charge: %d" % _display_mode)
+				print("[PrefabsThumbs] Default mode loaded: %d" % _display_mode)
 
 
 func _update_mode_buttons() -> void:
@@ -1248,7 +1250,7 @@ func _render_prefab_data(data: Dictionary, thumb_size: int = THUMB_SIZE):
 	var bb = max_pos - min_pos
 	if bb.x < 1: bb.x = 1
 	if bb.y < 1: bb.y = 1
-	# Mode adaptatif (thumb_size=-1) : respecter le ratio bounding box
+	# Adaptive mode (thumb_size < 0): keep the bounding box aspect ratio
 	var vp_w : int
 	var vp_h : int
 	var sf : float
@@ -1307,7 +1309,7 @@ func _render_prefab_data(data: Dictionary, thumb_size: int = THUMB_SIZE):
 		return null
 	if thumb_size >= 0:
 		img.resize(thumb_size, thumb_size, Image.INTERPOLATE_LANCZOS)
-	# Mode adaptatif : pas de resize, garder les proportions naturelles
+	# Adaptive mode: no resize, keep natural proportions
 	var result = ImageTexture.new()
 	result.create_from_image(img)
 	return result
@@ -1332,8 +1334,8 @@ func _collect_bb_shapes(shapes: Array, out: Array) -> void:
 		var rot = float(shape.get("shape_rotation", 0))
 		var cs = cos(rot)
 		var sn = sin(rot)
-		# Doit matcher la formule de _build_shape_nodes : world = origin + rotate(p * scale)
-		# sinon BB fausse pour les patterns rotated/resized -> mauvais centrage
+		# Must match the _build_shape_nodes formula: world = origin + rotate(p * scale)
+		# otherwise the BB is wrong for rotated/resized patterns -> bad centering
 		for p in _parse_pool_vector2(shape.get("points", "")):
 			var s = p * scale
 			out.append(origin + Vector2(s.x * cs - s.y * sn, s.x * sn + s.y * cs))
@@ -1346,8 +1348,8 @@ func _collect_bb_paths(paths: Array, out: Array) -> void:
 		var rot = float(path.get("rotation", 0))
 		var cs = cos(rot)
 		var sn = sin(rot)
-		# Plafonner le padding width a 64 pour eviter que les grands paths (ex: shadow width=396)
-		# ne decalent massivement le bounding box
+		# Cap the width padding at 64 so large paths (e.g. shadow width=396)
+		# don't shift the bounding box massively
 		var w = min(float(path.get("width", 32)) * 0.5, 64.0)
 		for p in _parse_pool_vector2(path.get("edit_points", "")):
 			var s = p * scale
@@ -1356,9 +1358,9 @@ func _collect_bb_paths(paths: Array, out: Array) -> void:
 			out.append(world + Vector2(w, w))
 
 
-# Les walls viennent de la section "walls" ajoutee par le sous-mod prefab_walls
-# (DD ne serialise pas les walls dans ses prefabs). Format : points en
-# PoolVector2Array serialise, couleur en tableau [r,g,b,a], portails imbriques.
+# Walls come from the "walls" section added by the prefab_walls sub-mod
+# (DD doesn't serialize walls in its prefabs). Format: points as a
+# serialized PoolVector2Array, color as an [r,g,b,a] array, nested portals.
 func _collect_bb_walls(walls: Array, out: Array) -> void:
 	for wall in walls:
 		if not (wall is Dictionary):
@@ -1407,8 +1409,8 @@ func _build_wall_nodes(walls: Array, data: Dictionary, sf: float, offset: Vector
 		line.antialiased = false
 		var wall_color = _parse_wall_color(wall.get("color", null))
 		line.default_color = wall_color
-		# categorie 1 (comme les paths) mais src_idx decale : a layer egal un
-		# wall passe au-dessus d'un path et reste sous les objects.
+		# Category 1 (like paths) but with an offset src_idx: at equal layer a
+		# wall draws above a path and stays below objects.
 		out.append({"node": line, "layer": layer, "category": 1, "src_idx": 20000 + i})
 		_build_wall_portal_nodes(wall, layer, sf, offset, out, i)
 
@@ -1436,9 +1438,9 @@ func _build_wall_portal_nodes(wall: Dictionary, layer: int, sf: float, offset: V
 		out.append({"node": sprite, "layer": layer, "category": 1, "src_idx": 30000 + wall_idx * 100 + j})
 
 
-# Les walls DD se dessinent au-dessus des sols et sous les objets. Comme le tri
-# est fait d'abord sur le layer, on cale les walls sur le plus haut layer de
-# sol/path present, sans depasser le plus bas layer d'objet.
+# DD walls draw above floors and below objects. Since sorting is done on the
+# layer first, walls are pinned to the highest floor/path layer present,
+# without exceeding the lowest object layer.
 func _wall_render_layer(data: Dictionary) -> int:
 	var ground = -2147483648
 	for section in ["pattern_shapes", "pathways"]:
@@ -1475,16 +1477,16 @@ func _build_object_nodes(objects: Array, sf: float, offset: Vector2, out: Array)
 		var sprite = Sprite.new()
 		sprite.texture = tex
 		sprite.position = _parse_vector2(obj.get("position", "Vector2( 0, 0 )")) * sf + offset
-		# Le mirror est gere via flip_h/flip_v (flip UV) plutot que scale negatif
-		# (flip geometrique). DD utilise des flips UV, et bien que mathematiquement
-		# equivalents, Godot peut produire des artefacts visuels avec scale
-		# negatif (culling, ordre d'application des transforms). On force scale
-		# a abs() et on applique le flip via les proprietes du Sprite :
-		# - mirror=true OU scale.x<0 -> flip_h (flip horizontal)
-		# - scale.y<0 -> flip_v (flip vertical)
-		# Important : traiter scale.y<0 comme flip_h donnait une rotation 180°
-		# parasite (flip_h + flip_v = rotation 180°), ce qui rendait certains
-		# sprites a l'envers dans les thumbnails.
+		# Mirroring is handled via flip_h/flip_v (UV flip) rather than negative
+		# scale (geometric flip). DD uses UV flips, and although mathematically
+		# equivalent, Godot can produce visual artifacts with negative scale
+		# (culling, transform application order). We force scale to abs() and
+		# apply the flip via the Sprite properties:
+		# - mirror=true OR scale.x<0 -> flip_h (horizontal flip)
+		# - scale.y<0 -> flip_v (vertical flip)
+		# Important: treating scale.y<0 as flip_h produced a spurious 180°
+		# rotation (flip_h + flip_v = 180° rotation), which rendered some
+		# sprites upside down in thumbnails.
 		var raw_scale = _parse_vector2(obj.get("scale", "Vector2( 1, 1 )"))
 		var flip_h = bool(obj.get("mirror", false)) or raw_scale.x < 0.0
 		var flip_v = raw_scale.y < 0.0
@@ -1515,7 +1517,7 @@ func _build_shape_nodes(shapes: Array, sf: float, offset: Vector2, out: Array) -
 		var poly = Polygon2D.new()
 		var transformed = PoolVector2Array()
 		for p in points:
-			# Appliquer scale puis rotation autour de l'origin, puis transformer en viewport
+			# Apply scale then rotation around the origin, then transform to viewport
 			var s = p * scale
 			var rotated = Vector2(s.x * cs - s.y * sn, s.x * sn + s.y * cs)
 			transformed.append((origin + rotated) * sf + offset)
@@ -1524,15 +1526,15 @@ func _build_shape_nodes(shapes: Array, sf: float, offset: Vector2, out: Array) -
 		var tex = _safe_load_texture(shape.get("texture", ""))
 		if tex != null:
 			poly.texture = tex
-			# texture_scale en world units : taille texture / (scale monde * sf)
-			# Les vertices sont en espace viewport (world * sf)
-			# Pour que la texture tile a la meme frequence qu'en world space :
+			# texture_scale in world units: texture size / (world scale * sf)
+			# Vertices are in viewport space (world * sf)
+			# For the texture to tile at the same frequency as in world space:
 			# texture_scale = tex_size * sf
 			poly.texture_scale = Vector2(18.0, 18.0)
 		out.append({"node": poly, "layer": int(shape.get("layer", 100)), "category": 0, "src_idx": i})
-		# Si outline activee, ajouter un Line2D ferme par-dessus avec la texture
-		# d'outline tilable (default_border.png). Meme layer/categorie que le
-		# poly mais src_idx superieur pour qu'il soit dessine au-dessus.
+		# If outline is enabled, add a closed Line2D on top using the tileable
+		# outline texture (default_border.png). Same layer/category as the
+		# poly but a higher src_idx so it's drawn above.
 		if bool(shape.get("outline", false)):
 			var outline_tex = _get_outline_texture()
 			if outline_tex != null and transformed.size() >= 2:
@@ -1540,7 +1542,7 @@ func _build_shape_nodes(shapes: Array, sf: float, offset: Vector2, out: Array) -
 				var pts = PoolVector2Array()
 				for p in transformed:
 					pts.append(p)
-				# Fermer la boucle
+				# Close the loop
 				pts.append(transformed[0])
 				line.points = pts
 				line.texture = outline_tex
@@ -1551,9 +1553,9 @@ func _build_shape_nodes(shapes: Array, sf: float, offset: Vector2, out: Array) -
 
 
 func _get_outline_texture() -> Texture:
-	# Charge paresseusement default_border.png depuis res:///.import comme
-	# pattern_fix.gd. La texture est tilable et destinee a etre utilisee comme
-	# bordure de PatternShape (Line2D.LINE_TEXTURE_TILE).
+	# Lazily loads default_border.png from res:///.import, like
+	# pattern_fix.gd. The texture is tileable and meant to be used as a
+	# PatternShape border (Line2D.LINE_TEXTURE_TILE).
 	if _cached_outline_texture != null:
 		return _cached_outline_texture
 	var candidates = ["default_border.png", "narrow_line.png", "thick_line.png"]
@@ -1613,13 +1615,12 @@ func _build_path_nodes(paths: Array, sf: float, offset: Vector2, out: Array) -> 
 
 
 func _build_roof_nodes(roofs: Array, sf: float, offset: Vector2, out: Array) -> void:
-	# Un roof est defini par une ligne de crete (`points`) extrudee
-	# perpendiculairement de `width` unites *de chaque cote* (total = 2 * width),
-	# selon l'observation visuelle du rendu DD. On construit un Polygon2D qui
-	# suit la perpendiculaire moyennee aux jointures pour gerer correctement les
-	# ridges en plusieurs segments (toitures non droites). Pas de champ `layer`
-	# dans le JSON : on utilise une categorie dediee (3) pour rendre les roofs
-	# au-dessus de tout le reste.
+	# A roof is defined by a ridge line (`points`) extruded perpendicularly
+	# by `width` units *on each side* (total = 2 * width), based on visual
+	# observation of DD's rendering. We build a Polygon2D that follows the
+	# perpendicular averaged at joints to correctly handle multi-segment
+	# ridges (non-straight roofs). No `layer` field in the JSON: we use a
+	# dedicated category (3) to render roofs above everything else.
 	for i in range(roofs.size()):
 		var roof = roofs[i]
 		var origin = _parse_vector2(roof.get("position", "Vector2( 0, 0 )"))
@@ -1630,15 +1631,15 @@ func _build_roof_nodes(roofs: Array, sf: float, offset: Vector2, out: Array) -> 
 		var points = _parse_pool_vector2(roof.get("points", ""))
 		if points.size() < 2:
 			continue
-		# Ridge en espace viewport
+		# Ridge in viewport space
 		var ridge = PoolVector2Array()
 		for p in points:
 			var s = p * scale
 			var rotated = Vector2(s.x * cs - s.y * sn, s.x * sn + s.y * cs)
 			ridge.append((origin + rotated) * sf + offset)
 		var extrusion = float(roof.get("width", 320)) * sf
-		# Bords haut et bas : on calcule la perpendiculaire a chaque point
-		# (moyennee aux jointures pour eviter les pics aux coins)
+		# Top and bottom edges: compute the perpendicular at each point
+		# (averaged at joints to avoid spikes at corners)
 		var top_pts = PoolVector2Array()
 		var bot_pts = PoolVector2Array()
 		for j in range(ridge.size()):
@@ -1661,7 +1662,7 @@ func _build_roof_nodes(roofs: Array, sf: float, offset: Vector2, out: Array) -> 
 					perp = p1
 			top_pts.append(ridge[j] + perp * extrusion)
 			bot_pts.append(ridge[j] - perp * extrusion)
-		# Polygon ferme : top forward + bottom backward
+		# Closed polygon: top forward + bottom backward
 		var poly_pts = PoolVector2Array()
 		for p in top_pts:
 			poly_pts.append(p)
@@ -1674,8 +1675,8 @@ func _build_roof_nodes(roofs: Array, sf: float, offset: Vector2, out: Array) -> 
 			poly.texture = tex
 			poly.texture_scale = Vector2(18.0, 18.0)
 		poly.color = Color(1, 1, 1, 1)
-		# Categorie 3 : rendu apres objects (qui sont en 2) pour matcher DD ou
-		# les roofs sont au-dessus du reste de la scene.
+		# Category 3: rendered after objects (category 2) to match DD where
+		# roofs sit above the rest of the scene.
 		out.append({"node": poly, "layer": 1000, "category": 3, "src_idx": i})
 
 
@@ -1686,8 +1687,8 @@ func _collect_bb_roofs(roofs: Array, out: Array) -> void:
 		var rot = float(roof.get("rotation", 0))
 		var cs = cos(rot)
 		var sn = sin(rot)
-		# Marge = `width` sur chaque cote (extrusion totale = 2 * width).
-		# Plafond a 320 pour eviter qu'un roof tres large ne decale le BB.
+		# Margin = `width` on each side (total extrusion = 2 * width).
+		# Capped at 320 so a very wide roof doesn't shift the BB.
 		var w = min(float(roof.get("width", 320)), 320.0)
 		for p in _parse_pool_vector2(roof.get("points", "")):
 			var s = p * scale
@@ -1697,12 +1698,12 @@ func _collect_bb_roofs(roofs: Array, out: Array) -> void:
 
 
 func _sort_by_layer(a: Dictionary, b: Dictionary) -> bool:
-	# Tri primaire par layer (croissant), puis par categorie pour matcher
-	# l'ordre de rendu DD a layer egal : pattern (0) < path (1) < object (2).
-	# Tie-break final : ordre source JSON (premier object dans le JSON = dessine
-	# en premier = au-dessous). C'est l'ordre naturel d'ajout des enfants a un
-	# Node2D Godot, et il correspond a ce que DD affiche en placement.
-	# Necessaire car sort_custom de Godot 3 n'est pas stable.
+	# Primary sort by layer (ascending), then by category to match DD's
+	# render order at equal layer: pattern (0) < path (1) < object (2).
+	# Final tie-break: JSON source order (first object in the JSON = drawn
+	# first = underneath). That's the natural child order of a Godot Node2D,
+	# and it matches what DD shows when placing.
+	# Required because Godot 3's sort_custom is not stable.
 	if a["layer"] != b["layer"]:
 		return a["layer"] < b["layer"]
 	if a["category"] != b["category"]:
@@ -1713,17 +1714,17 @@ func _sort_by_layer(a: Dictionary, b: Dictionary) -> bool:
 func _safe_load_texture(res_path: String) -> Texture:
 	if res_path == "":
 		return null
-	# Paths vanilla (res://textures/) : on passe EXCLUSIVEMENT par ResourceLoader,
-	# qui lit le .stex compile via le systeme d'import. Image.load tenterait de
-	# lire le PNG brut, qui n'est PAS inclus dans data.pck (seul le .stex l'est) :
-	# cela genere un flot d'erreurs ImageLoader::load_image impossibles a
-	# intercepter depuis GDScript.
+	# Vanilla paths (res://textures/): go EXCLUSIVELY through ResourceLoader,
+	# which reads the compiled .stex via the import system. Image.load would
+	# try to read the raw PNG, which is NOT included in data.pck (only the
+	# .stex is): that produces a flood of ImageLoader::load_image errors that
+	# can't be intercepted from GDScript.
 	if res_path.begins_with("res://textures/"):
 		if ResourceLoader.exists(res_path):
 			return ResourceLoader.load(res_path, "Texture", true)
 		return null
-	# Paths de packs (res://packs/, user://packs/) : ces textures sont mountees
-	# via load_packed SANS metadata d'import. Image.load lit le fichier brut.
+	# Pack paths (res://packs/, user://packs/): these textures are mounted
+	# via load_packed WITHOUT import metadata. Image.load reads the raw file.
 	var lower = res_path.to_lower()
 	if lower.ends_with(".webp") or lower.ends_with(".png") \
 			or lower.ends_with(".jpg") or lower.ends_with(".jpeg") \
@@ -1733,7 +1734,7 @@ func _safe_load_texture(res_path: String) -> Texture:
 			var tex = ImageTexture.new()
 			tex.create_from_image(img)
 			return tex
-		# Fall through au ResourceLoader si Image.load echoue
+		# Fall through to ResourceLoader if Image.load fails
 	if ResourceLoader.exists(res_path):
 		return ResourceLoader.load(res_path, "Texture", true)
 	return null

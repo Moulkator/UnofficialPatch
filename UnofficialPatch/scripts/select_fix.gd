@@ -20,6 +20,22 @@ var _had_selection = false
 var _context_containers = []
 var _align = null
 var _was_in_select_tool = false
+var _last_tool_name = ""
+
+
+# Vanilla bug: X (Select tool, then back) returns to Toolset.PreviousTool,
+# which only the tools of a toolbar set when left: leaving the Prefab or Text
+# tool for the Select tool kept an older tool, so X never went back to them.
+# The tool left for the Select tool is remembered here, whichever it is.
+func _remember_previous_tool() -> void:
+	var name = _active_tool_name()
+	if name == _last_tool_name:
+		return
+	if name == "SelectTool" and _last_tool_name != "" and _last_tool_name != "SelectTool":
+		var toolset = _g.Editor.get("Toolset") if _g != null and _g.Editor != null else null
+		if toolset != null and is_instance_valid(toolset):
+			toolset.set("PreviousTool", _last_tool_name)
+	_last_tool_name = name
 
 
 func initialize():
@@ -29,6 +45,7 @@ func initialize():
 
 
 func update(delta):
+	_remember_previous_tool()
 	if _select_panel == null:
 		return
 	

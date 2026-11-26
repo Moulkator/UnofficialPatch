@@ -1815,9 +1815,7 @@ func _build_path_highlight_material(line):
 	var src = line.material
 	if src is ShaderMaterial and src.shader != null and src != _path_material:
 		var mat = src.duplicate()
-		var inj = Shader.new()
-		inj.code = _inject_path_tint(src.shader.code)
-		mat.shader = inj
+		mat.shader = _cached_injected(_path_inj_cache, src.shader, "_inject_path_tint")
 		mat.set_shader_param("_ov_ptint", Vector3(_path_color.r, _path_color.g, _path_color.b))
 		mat.set_shader_param("_ov_popacity", _path_opacity)
 		return mat
@@ -2131,7 +2129,7 @@ func _pattern_solid_at(shape, mouse_world) -> bool:
 		# Pattern uni (icone "Null", Material null) : rendu plein.
 		return _pattern_color_alpha(shape) > 0.1
 	# Colorables : l'alpha de rendu vient de la couleur, pas de la texture.
-	if mat.shader.code.find("redness") != -1:
+	if _is_colorable_shader(mat.shader):
 		return _pattern_color_alpha(shape) > 0.1
 	var tex = mat.get_shader_param("albedo")
 	if tex == null:
@@ -2245,15 +2243,65 @@ func _build_pattern_overlay_material(shape):
 		# on remplace ensuite le shader par sa version brighten — les params dont
 		# le nom est inchange restent appliques.
 		var mat = src.duplicate()
-		var inj = Shader.new()
-		inj.code = _inject_brighten(src.shader.code)
-		mat.shader = inj
+		# Shader qui embarque deja le brighten (uniformes ovl_*, ex. toits Roof
+		# Builder) : on le garde tel quel -> aucune compilation, pas d'a-coup.
+		if not _has_builtin_overlay(src.shader):
+			mat.shader = _cached_injected(_pattern_inj_cache, src.shader, "_inject_brighten")
 		return mat
 	var sh = Shader.new()
 	sh.code = _PATTERN_OVERLAY_FALLBACK_SHADER
 	var m = ShaderMaterial.new()
 	m.shader = sh
 	return m
+
+
+# Shaders injectes, en cache par shader source (cle : instance_id ; on garde le
+# Shader source pour verifier qu'il est toujours le meme objet, et la taille de
+# son code pour detecter une edition). Recreer un Shader a chaque survol forcait
+# une recompilation complete : sur un gros shader (ex. toits Roof Builder), cela
+# faisait ramer le Select Tool a chaque pattern survole.
+var _pattern_inj_cache = {}
+var _path_inj_cache = {}
+# Shader source -> vrai si c'est un shader colorable (PatternCustomColor). Evite de
+# relire tout le code du shader a chaque mouvement de souris.
+var _colorable_cache = {}
+
+
+func _cached_injected(cache: Dictionary, src_shader: Shader, inject_fn: String) -> Shader:
+	var id = src_shader.get_instance_id()
+	var code = src_shader.code
+	var e = cache.get(id)
+	if e != null and is_instance_valid(e[0]) and e[0] == src_shader and e[1] == code.length() and e[2] == code.hash():
+		return e[3]
+	var inj = Shader.new()
+	inj.code = call(inject_fn, code)
+	cache[id] = [src_shader, code.length(), code.hash(), inj]
+	return inj
+
+
+# Shader source -> vrai s'il declare les uniformes ovl_tint / ovl_opacity (brighten
+# integre, desactive tant que ovl_opacity = 0).
+var _builtin_ov_cache = {}
+
+
+func _has_builtin_overlay(sh: Shader) -> bool:
+	var id = sh.get_instance_id()
+	var e = _builtin_ov_cache.get(id)
+	if e != null and is_instance_valid(e[0]) and e[0] == sh:
+		return e[1]
+	var r = sh.code.find("uniform float ovl_opacity") != -1
+	_builtin_ov_cache[id] = [sh, r]
+	return r
+
+
+func _is_colorable_shader(sh: Shader) -> bool:
+	var id = sh.get_instance_id()
+	var e = _colorable_cache.get(id)
+	if e != null and is_instance_valid(e[0]) and e[0] == sh:
+		return e[1]
+	var r = sh.code.find("redness") != -1
+	_colorable_cache[id] = [sh, r]
+	return r
 
 
 # Injecte l'etape brighten dans le code d'un shader pattern DD : ajoute les
@@ -2279,8 +2327,13 @@ func _update_pattern_overlay_params() -> void:
 		return
 	var m = _pattern_overlay.material
 	if m is ShaderMaterial:
-		m.set_shader_param("_ov_tint", Vector3(_pattern_color.r, _pattern_color.g, _pattern_color.b))
-		m.set_shader_param("_ov_opacity", _pattern_opacity)
+		var tint = Vector3(_pattern_color.r, _pattern_color.g, _pattern_color.b)
+		if m.shader != null and _has_builtin_overlay(m.shader):
+			m.set_shader_param("ovl_tint", tint)
+			m.set_shader_param("ovl_opacity", _pattern_opacity)
+		else:
+			m.set_shader_param("_ov_tint", tint)
+			m.set_shader_param("_ov_opacity", _pattern_opacity)
 
 
 func _clear_pattern_highlight():

@@ -1874,6 +1874,8 @@ var _prefab_capture_snapped = Vector2.ZERO
 var _prefab_capture_centroid = Vector2.ZERO
 var _prefab_capture_count = 0
 var _prefab_capture_token = 0
+# centre of the transformed preview's bounds, from the raw mouse (null: unknown)
+var _prefab_center_offset = null
 var _prefab_last_list_idx = -1
 var _prefab_mouse_offsets = {}     # nid -> Vector2 (node.position - mouse_world, captured once)
 var _prefab_base_rotations = {}    # nid -> float
@@ -1971,6 +1973,7 @@ func _publish_prefab_transform():
 		"capture_centroid": _prefab_capture_centroid,
 		"capture_count": _prefab_capture_count,
 		"token": _prefab_capture_token,
+		"center_offset": _prefab_center_offset,
 	})
 
 
@@ -2063,6 +2066,30 @@ func _late_apply_prefab_transform():
 		node.position = mouse + base_offset.rotated(_prefab_rotation) * _prefab_scale_factor
 		node.rotation = _prefab_base_rotations[nid] + _prefab_rotation
 		node.scale = _prefab_base_scales[nid] * _prefab_scale_factor
+	_snap_transformed_prefab(preview, mouse)
+
+
+# DD centres an untransformed preview's bounds on WorldUI.SnappedPosition (the
+# mouse itself when Snap is off). The rotated or scaled preview is placed from
+# the raw mouse above, so without this it no longer snapped: its bounds are
+# moved back onto the snapped position. The centre's offset from the mouse is
+# published for prefab_walls, whose ghost walls must move the same way.
+func _snap_transformed_prefab(preview, mouse: Vector2) -> void:
+	var level = _g.World.GetCurrentLevel() if _g.World and is_instance_valid(_g.World) else null
+	if level == null:
+		return
+	var rect: Rect2 = level.GetSelectionRect(preview)
+	var center = rect.position + rect.size * 0.5
+	var offset = center - mouse
+	if _prefab_center_offset == null or not offset.is_equal_approx(_prefab_center_offset):
+		_prefab_center_offset = offset
+		_publish_prefab_transform()
+	var shift = _prefab_snapped_position() - center
+	if shift == Vector2.ZERO:
+		return
+	for node in preview.keys():
+		if is_instance_valid(node) and node is Node2D and _prefab_mouse_offsets.has(node.get_instance_id()):
+			node.position += shift
 
 
 func _apply_prefab_transform():
@@ -2073,6 +2100,7 @@ func _apply_prefab_transform():
 func _prefab_reset_transform():
 	_prefab_rotation = 0.0
 	_prefab_scale_factor = 1.0
+	_prefab_center_offset = null
 	_publish_prefab_transform()
 	_prefab_last_list_idx = -1
 	_prefab_mouse_offsets.clear()

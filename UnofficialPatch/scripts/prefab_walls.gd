@@ -115,6 +115,7 @@ var _tf_capture_mouse := Vector2.ZERO
 var _tf_capture_snapped := Vector2.ZERO
 var _tf_capture_centroid := Vector2.ZERO
 var _tf_capture_count := 0
+var _tf_center_offset = null  # see asset_cycle._snap_transformed_prefab
 var _ghost_lines := []      # [{node, base_local}]
 var _ghost_portals := []    # [{node, base_local}]
 var _ghost_applied_scale := 1.0
@@ -1075,6 +1076,7 @@ func _read_transform_state() -> void:
 	_tf_capture_snapped = state.get("capture_snapped", Vector2.ZERO)
 	_tf_capture_centroid = state.get("capture_centroid", Vector2.ZERO)
 	_tf_capture_count = int(state.get("capture_count", 0))
+	_tf_center_offset = state.get("center_offset", null)
 	_tf_active = (_tf_rotation != 0.0 or _tf_scale != 1.0)
 
 
@@ -1103,7 +1105,13 @@ func _ghost_origin() -> Vector2:
 	if _ghost_data != null and _tf_capture_count > 0 \
 			and _tf_capture_count == int(_ghost_data["preview_count"]):
 		reference = _tf_capture_centroid - (_ghost_data["preview_centroid"] - _ghost_data["anchor"])
-	return _world_mouse_position() + (reference - _tf_capture_mouse).rotated(_tf_rotation) * _tf_scale
+	var mouse = _world_mouse_position()
+	var origin = mouse + (reference - _tf_capture_mouse).rotated(_tf_rotation) * _tf_scale
+	# asset_cycle moves the transformed preview so its bounds are centred on
+	# SnappedPosition again, as DD does untransformed: the walls move with it.
+	if _tf_center_offset is Vector2:
+		origin += _snapped_position() - (mouse + _tf_center_offset)
+	return origin
 
 
 # Must match asset_cycle's _get_mouse_world_position(): the raw, unsnapped mouse

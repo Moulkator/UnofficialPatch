@@ -4,6 +4,7 @@
 # Fix 1: Box-select dedup
 # Fix 2: Copy-paste prefab_id
 # Fix 3: Unplaced prefab preview saved to map (v9)
+# Fix 4: Prefabs follow the Snap Every Half Grid preference
 #
 #   Covers: Ctrl+S, SAVE button, MENU Save/Save As, UnsavedChanges dialog,
 #   AND autosave backups (user://backups/).
@@ -175,6 +176,43 @@ func _on_process(_delta) -> void:
 		if _backup_scan_counter >= BACKUP_SCAN_INTERVAL:
 			_backup_scan_counter = 0
 			_scan_for_new_backups()
+
+	# Fix 4
+	_apply_half_snap()
+
+
+# -- Fix 4 -------------------------------------------
+# Vanilla bug: only the building tools set the half snap of the Snap Every
+# Half Grid preference, so prefabs always snapped to whole cells.
+# Global.Preferences is unreachable from GDScript: the preference is read
+# from user://config.ini (as DD saves it) when the PrefabTool is chosen and
+# when the Preferences window closes.
+var _half_snap_pref := false
+var _half_snap_tool := ""
+var _prefs_window_was_visible := false
+
+func _apply_half_snap() -> void:
+	var editor = _g.Editor
+	if editor == null or not is_instance_valid(editor):
+		return
+	var prefs_win = editor.get_node_or_null("Windows/Preferences")
+	var prefs_visible = prefs_win != null and prefs_win.visible
+	var prefs_closed = _prefs_window_was_visible and not prefs_visible
+	_prefs_window_was_visible = prefs_visible
+	var tool_name = str(editor.get("ActiveToolName"))
+	var entered = tool_name != _half_snap_tool
+	_half_snap_tool = tool_name
+	if tool_name != "PrefabTool":
+		return
+	if entered or prefs_closed:
+		var cfg = ConfigFile.new()
+		_half_snap_pref = cfg.load("user://config.ini") == OK and bool(cfg.get_value("Preferences", "half_grid_snap", false))
+	var world = _g.World
+	if world == null or not is_instance_valid(world):
+		return
+	var ui = world.get("UI")
+	if ui != null and is_instance_valid(ui) and ui.get("UseHalfSnap") != _half_snap_pref:
+		ui.set("UseHalfSnap", _half_snap_pref)
 
 
 # -- Fix 1 -------------------------------------------
@@ -626,6 +664,12 @@ func _discover_prefab_tool_panel() -> void:
 	if panel == null:
 		print("[PrefabsFix] PrefabTool panel=null")
 		return
+	# Vanilla bug: with the list focused, typing a letter selected the first
+	# prefab starting with it (ItemList type-to-search) and put it in hand.
+	# Without keyboard focus, clicks still select, letters do nothing.
+	var item_list = panel.get("itemList")
+	if item_list is ItemList:
+		item_list.focus_mode = Control.FOCUS_NONE
 	var set_option = panel.get("setOption")
 	if set_option is OptionButton:
 		if not set_option.is_connected("item_selected", self, "_on_prefab_set_selected"):

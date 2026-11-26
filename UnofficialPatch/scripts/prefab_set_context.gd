@@ -5,6 +5,9 @@
 # Right-click works both on the dropdown button (acts on the current set) and
 # on an entry of the open dropdown list (acts on that entry).
 #
+# The mouse wheel over the closed dropdown goes to the next or previous set,
+# as in Dungeondraft 1.3.0.0. Shift+wheel stays asset_cycle's.
+#
 # - Rename: a small dialog with a text field (Enter confirms). The folder is
 #   renamed on disk and DD's Master.Prefabs is refreshed through its own
 #   (static) LoadPrefabs(), so the renamed set is usable right away.
@@ -77,6 +80,10 @@ func _setup() -> void:
 	var tools = _g.Editor.get("Tools")
 	if tools is Dictionary:
 		_prefab_tool = tools.get("PrefabTool")
+	if not _set_option.is_connected("gui_input", self, "_on_set_gui_input"):
+		_set_option.connect("gui_input", self, "_on_set_gui_input")
+	if _set_option.hint_tooltip == "":
+		_set_option.hint_tooltip = "Wheel to change set. Right-click to rename or hide it."
 	if not _panel.is_connected("visibility_changed", self, "_on_panel_visibility_changed"):
 		_panel.connect("visibility_changed", self, "_on_panel_visibility_changed")
 	call_deferred("_apply_filter")
@@ -95,6 +102,23 @@ func update(delta) -> void:
 		if _panel != null and is_instance_valid(_panel) and _panel.is_visible_in_tree():
 			if _dropdown_needs_filter():
 				_apply_filter()
+
+
+# The wheel alone steps through the sets, stopping at the first and the last.
+# Accepted so the tool panel does not scroll under the menu.
+func _on_set_gui_input(event) -> void:
+	if not (event is InputEventMouseButton) or event.shift or event.control or event.alt:
+		return
+	if event.button_index != BUTTON_WHEEL_UP and event.button_index != BUTTON_WHEEL_DOWN:
+		return
+	_set_option.accept_event()
+	if not event.pressed or _set_option.get_item_count() < 2:
+		return
+	var step = 1 if event.button_index == BUTTON_WHEEL_DOWN else -1
+	var index = int(clamp(_set_option.selected + step, 0, _set_option.get_item_count() - 1))
+	if index != _set_option.selected:
+		_set_option.select(index)
+		_set_option.emit_signal("item_selected", index)
 
 
 func _on_panel_visibility_changed() -> void:
