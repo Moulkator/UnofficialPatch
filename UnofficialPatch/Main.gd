@@ -729,6 +729,10 @@ func start() -> void:
 			"Shows Copy, Cut, Paste, Paste in Place and Delete.",
 			true)
 		mod_settings.register_toggle(
+			"rcm_other_tools", "right_click_menu", "Other Tools (Mods)",
+			"Lets mods add a right-click menu in the other tools.\nWhere a tool already uses the right click (Object, Scatter,\nPrefab, Terrain...), Ctrl + right click opens it.\nShows only when a mod adds entries.",
+			true)
+		mod_settings.register_toggle(
 			"prefab_walls", "other_tools", "Prefab Tool - Walls & Portals",
 			"Lets prefabs carry walls (and the portals anchored to\nthem), which vanilla DD silently drops.\nSelected walls are written into the prefab file, a ghost\npreview follows the cursor next to DD's own preview, and\nthe real walls are created on click.\nMixed prefabs undo in two steps: walls first, then the\nassets handled by DD.",
 			true)
@@ -1318,6 +1322,8 @@ func start() -> void:
 		right_click_util = RightClickUtilScript.new()
 		right_click_util._g = Global
 		right_click_util.ui_util = ui_util
+		# weak: Main holds the util, which only peeks at Main's curve edits
+		right_click_util.main_ref = weakref(self)
 		# Menu order and divider groups (see right_click_util.register):
 		# favorites | free transform | prefabs + groups | rotate | clipboard
 		if favorites != null:

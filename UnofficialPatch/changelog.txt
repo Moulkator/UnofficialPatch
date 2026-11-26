@@ -1,5 +1,18 @@
 UNOFFICIAL PATCH
 
+1.7.5
+- Added the mouse wheel over the Set menu of the Prefab Tool to change set
+- Fixed lag using the overlay feature with the Roof Builder mod (needs Roof Builder 1.3.1)
+- Fixed prefab tooltips appearing in french
+- Fixed vanilla bug where the right click starting a wall (or a manual roof) when none was being drawn
+- Fixed vanilla bug where prefabs ignored the Snap Every Half Grid preference
+- Fixed vanilla bug where typing a letter with the prefab list focused picked a prefab
+- Fixed vanilla bug where Bring to Front / Send to Back mixed up the order of the selected assets
+- Fixed vanilla bug where the Select Tool shortcut (X) could not switch back to the Prefab Tool or the Text Tool
+- Fixed prefabs no longer snapping to the grid once rotated or scaled during placement
+- Restored the Water Tool fixes that were missing (water animation toggle, cursor hidden in the color picker, overflowing water around islands)
+- Right-click API: mods can now add entries to a right-click menu in every tool, not only the Select Tool (get_tool_context_items in right_click_util.gd). Where a tool already uses the right click, Ctrl + right click opens it
+
 1.7.4
 - Fixed a conflict between the Eyedropper feature and the Favorites feature
 - Fixed various cases of Split Path not working
